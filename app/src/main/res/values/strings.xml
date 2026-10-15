@@ -1,0 +1,17 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <string name="app_name">caxar VK diabatya</string>
+    <string name="settings">Настройки</string>
+    <string name="vk_token_title">Токен VK</string>
+    <string name="vk_token_summary">Ваш токен доступа VK API</string>
+    <string name="vk_chat_id_title">Chat ID</string>
+    <string name="vk_chat_id_summary">ID чата для отправки сообщений</string>
+    <string name="units_title">Единицы измерения</string>
+    <string name="units_summary">ммоль/л или мг/дл</string>
+    <string name="poll_interval_title">Частота обновления</string>
+    <string name="poll_interval_summary">Как часто опрашивать xDrip+</string>
+    <string name="start_service">Запустить сервис</string>
+    <string name="stop_service">Остановить сервис</string>
+    <string name="open_settings">Настройки</string>
+    <string name="status">Статус</string>
+</resources>

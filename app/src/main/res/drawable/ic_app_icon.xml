@@ -1,0 +1,44 @@
+<?xml version="1.0" encoding="utf-8"?>
+<vector xmlns:android="http://schemas.android.com/apk/res/android"
+    android:width="108dp"
+    android:height="108dp"
+    android:viewportWidth="108"
+    android:viewportHeight="108">
+
+    <!-- White stripe (top) -->
+    <path
+        android:fillColor="#FFFFFF"
+        android:pathData="M0,0h108v36h-108z" />
+
+    <!-- Blue stripe (middle) -->
+    <path
+        android:fillColor="#0039A6"
+        android:pathData="M0,36h108v36h-108z" />
+
+    <!-- Red stripe (bottom) -->
+    <path
+        android:fillColor="#D52B1E"
+        android:pathData="M0,72h108v36h-108z" />
+
+    <!-- Sugar cube shape -->
+    <path
+        android:fillColor="#F5F5F5"
+        android:strokeColor="#D0D0D0"
+        android:strokeWidth="2"
+        android:pathData="M20,25 L55,25 L55,70 L20,70 Z" />
+
+    <!-- Sugar cube top face -->
+    <path
+        android:fillColor="#FFFFFF"
+        android:strokeColor="#D0D0D0"
+        android:strokeWidth="2"
+        android:pathData="M20,25 L45,8 L80,25 L55,42 Z" />
+
+    <!-- Sugar cube right face -->
+    <path
+        android:fillColor="#E8E8E8"
+        android:strokeColor="#D0D0D0"
+        android:strokeWidth="2"
+        android:pathData="M55,42 L80,25 L80,70 L55,87 Z" />
+
+</vector>

@@ -1,0 +1,21 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <string-array name="units_entries">
+        <item>ммоль/л</item>
+        <item>мг/дл</item>
+    </string-array>
+    <string-array name="units_values">
+        <item>mmol</item>
+        <item>mgdl</item>
+    </string-array>
+    <string-array name="poll_interval_entries">
+        <item>1 минута</item>
+        <item>5 минут</item>
+        <item>10 минут</item>
+    </string-array>
+    <string-array name="poll_interval_values">
+        <item>60000</item>
+        <item>300000</item>
+        <item>600000</item>
+    </string-array>
+</resources>

@@ -1,0 +1,101 @@
+<?xml version="1.0" encoding="utf-8"?>
+<PreferenceScreen xmlns:android="http://schemas.android.com/apk/res/android"
+    xmlns:app="http://schemas.android.com/apk/res-auto">
+
+    <EditTextPreference
+        android:key="vk_token"
+        android:title="@string/vk_token_title"
+        android:summary="@string/vk_token_summary"
+        android:inputType="text"
+        app:isPreferenceVisible="true" />
+
+    <Preference
+        android:key="import_token"
+        android:title="Импорт токена из файла"
+        android:summary="Выбрать .txt файл с токеном"
+        app:isPreferenceVisible="true" />
+
+    <EditTextPreference
+        android:key="device_name"
+        android:title="Имя устройства"
+        android:summary="Имя для идентификации в чате (например: Мой телефон)"
+        android:inputType="text"
+        app:isPreferenceVisible="true" />
+
+    <Preference
+        android:key="select_chat"
+        android:title="Выбрать беседу"
+        android:summary="Нажмите для выбора беседы из списка"
+        app:isPreferenceVisible="true" />
+
+    <ListPreference
+        android:key="units"
+        android:title="@string/units_title"
+        android:summary="@string/units_summary"
+        android:entries="@array/units_entries"
+        android:entryValues="@array/units_values"
+        android:defaultValue="mmol"
+        app:isPreferenceVisible="true" />
+
+    <ListPreference
+        android:key="poll_interval"
+        android:title="Частота обновления"
+        android:summary="@string/poll_interval_summary"
+        android:entries="@array/poll_interval_entries"
+        android:entryValues="@array/poll_interval_values"
+        android:defaultValue="300000"
+        app:isPreferenceVisible="true" />
+
+    <!-- Тревожные сообщения -->
+    <SwitchPreference
+        android:key="alert_enabled"
+        android:title="Тревожные сообщения"
+        android:summary="Включить отправку в отдельный чат при выходе за диапазон"
+        android:defaultValue="false"
+        app:isPreferenceVisible="true" />
+
+    <EditTextPreference
+        android:key="alert_min_bg"
+        android:title="Нижний порог сахара"
+        android:summary="Минимальное значение сахара (например: 4.1)"
+        android:inputType="numberDecimal"
+        android:defaultValue="4.1"
+        app:isPreferenceVisible="true" />
+
+    <EditTextPreference
+        android:key="alert_max_bg"
+        android:title="Верхний порог сахара"
+        android:summary="Максимальное значение сахара (например: 12.2)"
+        android:inputType="numberDecimal"
+        android:defaultValue="12.2"
+        app:isPreferenceVisible="true" />
+
+    <Preference
+        android:key="select_alert_chat"
+        android:title="Выбрать тревожный чат"
+        android:summary="Нажмите для выбора беседы для тревожных сообщений"
+        app:isPreferenceVisible="true" />
+
+    <!-- Отображение данных в чате -->
+    <SwitchPreference
+        android:key="show_iob"
+        android:title="Показывать активный инсулин (IoB)"
+        android:summary="Отображать расчётный остаток инсулина в сообщениях"
+        android:defaultValue="false"
+        app:isPreferenceVisible="true" />
+
+    <SwitchPreference
+        android:key="show_cob"
+        android:title="Показывать активные углеводы (CoB)"
+        android:summary="Отображать расчётный остаток углеводов в сообщениях"
+        android:defaultValue="false"
+        app:isPreferenceVisible="true" />
+
+    <SwitchPreference
+        android:key="show_treatments"
+        android:title="Уведомлять о вводе инсулина/углеводов"
+        android:summary="Отправлять отдельные сообщения при вводе терапии"
+        android:defaultValue="false"
+        app:isPreferenceVisible="true" />
+
+</PreferenceScreen>

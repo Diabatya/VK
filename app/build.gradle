@@ -1,0 +1,39 @@
+plugins {
+    id 'com.android.application'
+}
+
+android {
+    namespace 'com.example.xdrip2vk'
+    compileSdk 34
+
+    defaultConfig {
+        applicationId "com.example.xdrip2vk"
+        minSdk 26
+        targetSdk 34
+        versionCode 27
+        versionName "4.3"
+    }
+
+    buildTypes {
+        release {
+            minifyEnabled false
+            proguardFiles getDefaultProguardFile('proguard-android-optimize.txt'), 'proguard-rules.pro'
+        }
+    }
+    
+    compileOptions {
+        sourceCompatibility JavaVersion.VERSION_1_8
+        targetCompatibility JavaVersion.VERSION_1_8
+    }
+}
+
+dependencies {
+    implementation 'androidx.appcompat:appcompat:1.6.1'
+    implementation 'com.google.android.material:material:1.10.0'
+    implementation 'androidx.preference:preference:1.2.1'
+    implementation 'androidx.security:security-crypto:1.0.0'
+}
+
+tasks.withType(JavaCompile) {
+    options.compilerArgs += "-Xlint:deprecation"
+}
