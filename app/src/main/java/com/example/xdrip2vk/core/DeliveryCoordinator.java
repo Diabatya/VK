@@ -1,0 +1,359 @@
+package com.example.xdrip2vk.core;
+
+import org.json.JSONArray;
+import org.json.JSONException;
+import org.json.JSONObject;
+
+import java.security.SecureRandom;
+import java.util.ArrayList;
+import java.util.Collections;
+import java.util.Comparator;
+import java.util.LinkedHashSet;
+import java.util.List;
+
+/**
+ * Координатор доставки: принимает показания и события терапии из всех входных
+ * каналов, дедуплицирует их, ставит логические сообщения в персистентный outbox
+ * и подтверждает обработку только после успешной отправки.
+ *
+ * Состояние целиком сериализуется (save()/load()) и переживает перезапуск процесса.
+ * Весь доступ к экземпляру должен быть сериализован (в приложении — через
+ * единственный HandlerThread сервиса).
+ */
+public final class DeliveryCoordinator {
+
+    public static final long TREATMENT_MAX_AGE_MS = 6 * 60 * 60 * 1000L; // 6 часов
+    private static final int SEEN_IDS_CAP = 500;
+    private static final int STATE_VERSION = 1;
+
+    public enum Source {AUTO, MANUAL}
+
+    public enum ReadingOutcome {ACCEPTED, DUPLICATE, STALE, FUTURE, INVALID}
+
+    public interface Sender {
+        SendResult send(String peerId, String text, int randomId);
+    }
+
+    /** Фабрика текстов сообщений; реализуется на стороне сервиса (нужны настройки/UI-строки). */
+    public interface Messages {
+        String regular(SgvReading r);
+
+        String alert(SgvReading r, AlertThresholds.Level level);
+
+        String treatment(TreatmentEvent e, boolean insulinPart);
+    }
+
+    /** Снимок конфигурации на момент обработки — не читается повторно внутри вызова. */
+    public static final class Config {
+        public final String normalPeer;
+        public final String alertPeer;
+        public final boolean alertsEnabled;
+        public final boolean configured; // токен+чат заданы — есть смысл ставить в очередь
+        public final AlertThresholds thresholds;
+        public final int tokenHash;
+
+        public Config(String normalPeer, String alertPeer, boolean alertsEnabled,
+                      boolean configured, AlertThresholds thresholds, int tokenHash) {
+            this.normalPeer = normalPeer == null ? "" : normalPeer;
+            this.alertPeer = alertPeer == null ? "" : alertPeer;
+            this.alertsEnabled = alertsEnabled;
+            this.configured = configured;
+            this.thresholds = thresholds;
+            this.tokenHash = tokenHash;
+        }
+    }
+
+    public static final class Summary {
+        public int sent;
+        public int retried;
+        public int authFailures;
+        public int permanent;
+        public int expired;
+
+        public boolean hasPendingFailures() {
+            return retried > 0 || authFailures > 0 || permanent > 0;
+        }
+    }
+
+    private final Outbox outbox = new Outbox();
+    private long lastSeenBgMs;
+    private boolean treatmentsInitialized;
+    private final LinkedHashSet<String> seenTreatmentIds = new LinkedHashSet<>();
+    private boolean authFailed;
+    private int authFailedTokenHash;
+    private final SecureRandom random = new SecureRandom();
+
+    // ---------- SGV ----------
+
+    public ReadingOutcome onReading(SgvReading r, Source src, Config cfg, Messages msgs, long now) {
+        ReadingGate.Verdict v = ReadingGate.check(r.timestampMs, now);
+        if (v == ReadingGate.Verdict.INVALID) {
+            return ReadingOutcome.INVALID;
+        }
+        if (v == ReadingGate.Verdict.FUTURE) {
+            return ReadingOutcome.FUTURE;
+        }
+        if (r.timestampMs <= lastSeenBgMs) {
+            // Повтор того же показания через другой канал — не новое событие.
+            // Если сообщение ещё в очереди, повтор обработает drain().
+            if (src == Source.MANUAL && v == ReadingGate.Verdict.FRESH
+                    && cfg.configured && !cfg.normalPeer.isEmpty()
+                    && !outbox.hasPendingForPrefix("bg:" + r.timestampMs)) {
+                // Ручная отправка доставленного показания — новое логическое сообщение
+                enqueue(new PendingMessage(
+                        "bg:" + r.timestampMs + ":m:" + now,
+                        cfg.normalPeer, msgs.regular(r), newRandomId(),
+                        r.timestampMs + ReadingGate.MAX_AGE_MS));
+                return ReadingOutcome.ACCEPTED;
+            }
+            // Для устаревшего повтора возвращаем реальный вердикт — информативнее DUPLICATE
+            return v == ReadingGate.Verdict.FRESH ? ReadingOutcome.DUPLICATE : ReadingOutcome.STALE;
+        }
+        // Фиксируем watermark даже для устаревшего показания: ещё более старые
+        // данные при следующих опросах не должны считаться новыми.
+        lastSeenBgMs = r.timestampMs;
+        if (v == ReadingGate.Verdict.STALE) {
+            return ReadingOutcome.STALE;
+        }
+        if (!cfg.configured || cfg.normalPeer.isEmpty()) {
+            return ReadingOutcome.ACCEPTED; // запомнили, но отправлять некуда
+        }
+
+        long expires = r.timestampMs + ReadingGate.MAX_AGE_MS;
+        if (src == Source.MANUAL) {
+            // Ручная отправка всегда создаёт новое логическое сообщение,
+            // если это показание уже не ждёт в очереди.
+            if (!outbox.hasPendingForPrefix("bg:" + r.timestampMs)) {
+                enqueue(new PendingMessage(
+                        "bg:" + r.timestampMs + ":m:" + now,
+                        cfg.normalPeer, msgs.regular(r), newRandomId(), expires));
+            }
+        } else {
+            enqueue(new PendingMessage(
+                    "bg:" + r.timestampMs,
+                    cfg.normalPeer, msgs.regular(r), newRandomId(), expires));
+        }
+
+        if (cfg.alertsEnabled && !cfg.alertPeer.isEmpty()) {
+            AlertThresholds.Level level = cfg.thresholds.classify(r.sgvMgdl);
+            if (level != AlertThresholds.Level.NORMAL) {
+                enqueue(new PendingMessage(
+                        "alert:" + r.timestampMs,
+                        cfg.alertPeer, msgs.alert(r, level), newRandomId(), expires));
+            }
+        }
+        return ReadingOutcome.ACCEPTED;
+    }
+
+    // ---------- Терапия ----------
+
+    /**
+     * Обрабатывает свежую порцию событий терапии. Первый вызов после установки
+     * новой схемы учёта только инициализирует состояние: всё уже существующее
+     * помечается как просмотренное и НЕ отправляется.
+     * @return число поставленных в очередь частей сообщений.
+     */
+    public int onTreatments(List<TreatmentEvent> events, Config cfg, Messages msgs,
+                            boolean enabled, long now) {
+        if (events == null) {
+            events = Collections.emptyList();
+        }
+        if (!treatmentsInitialized) {
+            treatmentsInitialized = true;
+            for (TreatmentEvent e : events) {
+                markSeen(e.id);
+            }
+            return 0;
+        }
+        List<TreatmentEvent> sorted = new ArrayList<>(events);
+        Collections.sort(sorted, new Comparator<TreatmentEvent>() {
+            @Override
+            public int compare(TreatmentEvent a, TreatmentEvent b) {
+                return Long.compare(a.createdAtMs, b.createdAtMs);
+            }
+        });
+
+        int added = 0;
+        boolean canSend = enabled && cfg.configured && !cfg.normalPeer.isEmpty();
+        for (TreatmentEvent e : sorted) {
+            if (e.id.isEmpty() || seenTreatmentIds.contains(e.id)) {
+                continue;
+            }
+            markSeen(e.id);
+            if (!canSend) {
+                continue;
+            }
+            boolean tooOld = e.createdAtMs > 0 && now - e.createdAtMs > TREATMENT_MAX_AGE_MS;
+            if (tooOld) {
+                continue;
+            }
+            long expires = (e.createdAtMs > 0 ? e.createdAtMs : now) + TREATMENT_MAX_AGE_MS;
+            if (e.hasInsulin()) {
+                if (enqueue(new PendingMessage("treat:" + e.id + ":ins",
+                        cfg.normalPeer, msgs.treatment(e, true), newRandomId(), expires))) {
+                    added++;
+                }
+            }
+            if (e.hasCarbs()) {
+                if (enqueue(new PendingMessage("treat:" + e.id + ":carb",
+                        cfg.normalPeer, msgs.treatment(e, false), newRandomId(), expires))) {
+                    added++;
+                }
+            }
+        }
+        return added;
+    }
+
+    // ---------- Доставка ----------
+
+    /**
+     * Попытка доставить все готовые сообщения. Каждое сообщение независимо:
+     * успех одного не подтверждает другие. Ошибка авторизации помечает сообщение
+     * терминальным и блокирует повторы до смены токена.
+     */
+    public Summary drain(Sender sender, int tokenHash, long now) {
+        if (authFailed && tokenHash != authFailedTokenHash) {
+            authFailed = false; // токен сменился — пробуем снова
+        }
+        Summary s = new Summary();
+        s.expired += outbox.removeExpired(now);
+
+        for (PendingMessage m : new ArrayList<>(outbox.all())) {
+            if (m.terminal || m.expiresAtMs <= now || m.notBeforeMs > now) {
+                continue;
+            }
+            if (authFailed) {
+                continue; // авторизация сломана — повторы бессмысленны
+            }
+            SendResult res;
+            try {
+                res = sender.send(m.peerId, m.text, m.randomId);
+            } catch (Exception e) {
+                res = SendResult.RETRYABLE;
+            }
+            if (res == null) {
+                res = SendResult.RETRYABLE;
+            }
+            switch (res) {
+                case SENT:
+                    outbox.onSent(m.key);
+                    s.sent++;
+                    break;
+                case RETRYABLE:
+                    outbox.onRetry(m.key, now);
+                    s.retried++;
+                    break;
+                case AUTH_FAILED:
+                    outbox.onTerminal(m.key, "auth");
+                    authFailed = true;
+                    authFailedTokenHash = tokenHash;
+                    s.authFailures++;
+                    break;
+                case PERMANENT:
+                default:
+                    outbox.onTerminal(m.key, "api");
+                    s.permanent++;
+                    break;
+            }
+        }
+        s.expired += outbox.removeExpired(now);
+        return s;
+    }
+
+    public long nextDueAt(long now) {
+        return outbox.nextDueAt(now);
+    }
+
+    public boolean hasDue(long now) {
+        return outbox.hasDue(now);
+    }
+
+    public int pendingCount() {
+        return outbox.pendingCount(false);
+    }
+
+    public List<PendingMessage> pendingMessages() {
+        return outbox.all();
+    }
+
+    public boolean isAuthFailed() {
+        return authFailed;
+    }
+
+    public long getLastSeenBgMs() {
+        return lastSeenBgMs;
+    }
+
+    public boolean isTreatmentSeen(String id) {
+        return seenTreatmentIds.contains(id);
+    }
+
+    // ---------- Персистентность ----------
+
+    public String save() {
+        try {
+            JSONObject o = new JSONObject();
+            o.put("v", STATE_VERSION);
+            o.put("lastSeenBgMs", lastSeenBgMs);
+            o.put("treatInit", treatmentsInitialized);
+            o.put("authFailed", authFailed);
+            o.put("authTokenHash", authFailedTokenHash);
+            JSONArray ids = new JSONArray();
+            for (String id : seenTreatmentIds) {
+                ids.put(id);
+            }
+            o.put("seenTreat", ids);
+            o.put("outbox", outbox.toJson());
+            return o.toString();
+        } catch (JSONException e) {
+            return "";
+        }
+    }
+
+    public static DeliveryCoordinator load(String json) {
+        DeliveryCoordinator c = new DeliveryCoordinator();
+        if (json == null || json.isEmpty()) {
+            return c;
+        }
+        try {
+            JSONObject o = new JSONObject(json);
+            c.lastSeenBgMs = o.optLong("lastSeenBgMs", 0);
+            c.treatmentsInitialized = o.optBoolean("treatInit", false);
+            c.authFailed = o.optBoolean("authFailed", false);
+            c.authFailedTokenHash = o.optInt("authTokenHash", 0);
+            JSONArray ids = o.optJSONArray("seenTreat");
+            if (ids != null) {
+                for (int i = 0; i < ids.length(); i++) {
+                    c.markSeen(ids.optString(i, ""));
+                }
+            }
+            Outbox box = Outbox.fromJson(o.optJSONObject("outbox"));
+            for (PendingMessage m : box.all()) {
+                c.outbox.enqueueIfAbsent(m);
+            }
+        } catch (JSONException e) {
+            return new DeliveryCoordinator();
+        }
+        return c;
+    }
+
+    private boolean enqueue(PendingMessage m) {
+        return outbox.enqueueIfAbsent(m);
+    }
+
+    private void markSeen(String id) {
+        if (id == null || id.isEmpty()) {
+            return;
+        }
+        seenTreatmentIds.add(id);
+        while (seenTreatmentIds.size() > SEEN_IDS_CAP) {
+            String oldest = seenTreatmentIds.iterator().next();
+            seenTreatmentIds.remove(oldest);
+        }
+    }
+
+    private int newRandomId() {
+        int id = random.nextInt();
+        return id == 0 ? 1 : id;
+    }
+}

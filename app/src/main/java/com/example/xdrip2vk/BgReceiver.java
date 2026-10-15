@@ -6,6 +6,7 @@ import android.content.Intent;
 import android.content.SharedPreferences;
 import android.os.PowerManager;
 import androidx.preference.PreferenceManager;
+import com.example.xdrip2vk.core.TimeFields;
 
 public class BgReceiver extends BroadcastReceiver {
     private static final String TAG = "BgReceiver";
@@ -44,21 +45,30 @@ public class BgReceiver extends BroadcastReceiver {
             }
 
             long timestamp = extractTimestamp(intent);
+            if (timestamp <= 0) {
+                Logger.w(TAG, "Время в broadcast от xDrip+ отсутствует или некорректно, сообщение проигнорировано");
+                return;
+            }
             Logger.d(TAG, "Извлечено время из broadcast: " + timestamp);
 
-            // Сохраняем данные в SharedPreferences для сервиса
+            String direction = extractDirection(intent);
+
+            // Сохраняем данные в SharedPreferences для сервиса и UI
             SharedPreferences prefs = PreferenceManager.getDefaultSharedPreferences(context);
             SharedPreferences.Editor editor = prefs.edit();
             editor.putLong("last_bg_timestamp", timestamp);
             editor.putFloat("last_bg_value", (float) bgValue);
+            editor.putString("last_bg_direction", direction);
             editor.apply();
             Logger.d(TAG, "Данные от xDrip+ сохранены в настройки приложения");
 
-            // Запускаем сервис с пометкой manual_send
+            // Автоматическое обновление: НЕ считается ручной принудительной отправкой —
+            // сервис применяет обычную дедупликацию по времени показания.
             Intent serviceIntent = new Intent(context, VkSenderService.class);
-            serviceIntent.putExtra("manual_send", true);
+            serviceIntent.putExtra("auto_update", true);
             serviceIntent.putExtra("bg_value", bgValue);
             serviceIntent.putExtra("timestamp", timestamp);
+            serviceIntent.putExtra("direction", direction);
             context.startForegroundService(serviceIntent);
             Logger.d(TAG, "Сервис запущен для отправки свежих данных от xDrip+ в ВК");
         } finally {
@@ -119,17 +129,53 @@ public class BgReceiver extends BroadcastReceiver {
             "com.eveningoutpost.dexdrip.Extras.Time",
             "timestamp",
             "time",
-            "timestamp_seconds"
+            "timestamp_seconds",
+            "date"
         };
-        
+
+        android.os.Bundle extras = intent.getExtras();
+        if (extras == null) {
+            return -1;
+        }
         for (String key : keys) {
-            if (intent.hasExtra(key)) {
-                long value = intent.getLongExtra(key, System.currentTimeMillis());
-                Logger.d(TAG, "Найден параметр времени: " + key + " = " + value);
-                return value;
+            if (extras.containsKey(key)) {
+                Object raw = extras.get(key);
+                long value = TimeFields.toEpochMs(raw);
+                if (value > 0) {
+                    Logger.d(TAG, "Найден параметр времени: " + key + " = " + raw + " → " + value);
+                    return value;
+                }
+                Logger.w(TAG, "Параметр времени '" + key + "' некорректен: " + raw);
             }
         }
-        Logger.w(TAG, "Время не найдено в broadcast от xDrip+, используем текущее время");
-        return System.currentTimeMillis();
+        Logger.w(TAG, "Время не найдено в broadcast от xDrip+");
+        return -1;
+    }
+
+    private String extractDirection(Intent intent) {
+        String[] keys = {
+            "direction",
+            "slopeName",
+            "slope_name",
+            "slopeArrow",
+            "delta_name",
+            "com.eveningoutpost.dexdrip.Extras.SlopeArrow",
+            "com.eveningoutpost.dexdrip.Extras.Direction"
+        };
+
+        android.os.Bundle extras = intent.getExtras();
+        if (extras == null) {
+            return "";
+        }
+        for (String key : keys) {
+            if (extras.containsKey(key)) {
+                Object raw = extras.get(key);
+                if (raw instanceof String && !((String) raw).isEmpty()) {
+                    Logger.d(TAG, "Найден параметр тренда: " + key + " = " + raw);
+                    return (String) raw;
+                }
+            }
+        }
+        return "";
     }
 }

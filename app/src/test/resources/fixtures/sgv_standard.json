@@ -1,0 +1,25 @@
+[
+  {
+    "_id": "fixture-sgv-0002",
+    "device": "fixture-collector",
+    "dateString": "2024-05-10T10:15:00.000+0000",
+    "sysTime": "2024-05-10T10:15:00.000+0000",
+    "date": 1715336100000,
+    "sgv": 120,
+    "delta": -0.5,
+    "direction": "Flat",
+    "noise": 1,
+    "filtered": 119000,
+    "unfiltered": 121000,
+    "rssi": 100,
+    "type": "sgv",
+    "units_hint": "mgdl"
+  },
+  {
+    "_id": "fixture-sgv-0001",
+    "date": 1715335800000,
+    "sgv": 118,
+    "direction": "Flat",
+    "type": "sgv"
+  }
+]

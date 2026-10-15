@@ -156,12 +156,18 @@ public class MainActivity extends AppCompatActivity {
 
             lastUpdateTime = lastTimestamp;
 
-            // Цветовая индикация по диапазону
+            // Цветовая индикация по диапазону.
+            // Пороги в настройках — ммоль/л, внутреннее значение — мг/дл:
+            // сравнение всегда в мг/дл независимо от единиц отображения.
             try {
-                double minBg = Double.parseDouble(prefs.getString("alert_min_bg", "4.1"));
-                double maxBg = Double.parseDouble(prefs.getString("alert_max_bg", "12.2"));
-                double bgValue = "mmol".equals(units) ? displayValue : lastBg;
-                if (bgValue < minBg || bgValue > maxBg) {
+                com.example.xdrip2vk.core.AlertThresholds thresholds =
+                        com.example.xdrip2vk.core.AlertThresholds.parseMmol(
+                                prefs.getString("alert_min_bg",
+                                        com.example.xdrip2vk.core.AlertThresholds.DEFAULT_MIN_STR),
+                                prefs.getString("alert_max_bg",
+                                        com.example.xdrip2vk.core.AlertThresholds.DEFAULT_MAX_STR));
+                if (thresholds.classify(lastBg)
+                        != com.example.xdrip2vk.core.AlertThresholds.Level.NORMAL) {
                     bgCardContent.setBackgroundResource(R.drawable.bg_gradient_alert);
                 } else {
                     bgCardContent.setBackgroundResource(R.drawable.bg_gradient);
@@ -220,8 +226,10 @@ public class MainActivity extends AppCompatActivity {
         if (lastBg > 0 && lastTimestamp > 0 && dataAge <= MAX_DATA_AGE) {
             Intent intent = new Intent(this, VkSenderService.class);
             intent.putExtra("manual_send", true);
-            intent.putExtra("bg_value", lastBg);
+            // Контракт: bg_value — double в мг/дл, timestamp — epoch мс
+            intent.putExtra("bg_value", (double) lastBg);
             intent.putExtra("timestamp", lastTimestamp);
+            intent.putExtra("direction", prefs.getString("last_bg_direction", ""));
             startService(intent);
             chipStatus.setText("Отправка...");
         } else if (lastBg > 0 && lastTimestamp > 0) {

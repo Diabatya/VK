@@ -1,5 +1,7 @@
 package com.example.xdrip2vk;
 
+import com.example.xdrip2vk.core.SendResult;
+
 import org.json.JSONException;
 import org.json.JSONObject;
 import java.io.BufferedReader;
@@ -10,7 +12,6 @@ import java.net.HttpURLConnection;
 import java.net.URL;
 import java.net.URLEncoder;
 import java.nio.charset.StandardCharsets;
-import java.security.SecureRandom;
 import java.util.HashMap;
 import java.util.Map;
 
@@ -22,27 +23,90 @@ public class VkApi {
     private static final int CONNECT_TIMEOUT = 10000;
     private static final int READ_TIMEOUT = 10000;
 
-    public static boolean sendMessage(String token, String chatId, String message) {
+    private static final class RawResponse {
+        final int httpCode;
+        final String body;
+
+        RawResponse(int httpCode, String body) {
+            this.httpCode = httpCode;
+            this.body = body;
+        }
+    }
+
+    /**
+     * Отправка сообщения со стабильным random_id.
+     * Один и тот же random_id при повторе не создаёт дубль на стороне VK —
+     * безопасно при потере ответа после принятия сообщения сервером.
+     */
+    public static SendResult sendMessage(String token, String chatId, String message, int randomId) {
         if (token == null || token.isEmpty() || chatId == null || chatId.isEmpty()) {
             Logger.e(TAG, "Токен или ID чата не заданы");
-            return false;
+            return SendResult.PERMANENT;
         }
 
-        SecureRandom random = new SecureRandom();
         Map<String, String> params = new HashMap<>();
         params.put("peer_id", chatId);
         params.put("message", message);
-        params.put("random_id", String.valueOf(random.nextInt()));
+        params.put("random_id", String.valueOf(randomId));
 
-        String response = request("messages.send", token, params);
-        boolean success = isSuccess(response);
-        if (!success) {
-            Logger.e(TAG, "Ошибка отправки сообщения ВК: " + response);
+        RawResponse response = requestRaw("messages.send", token, params);
+        SendResult result = classify(
+                response == null ? -1 : response.httpCode,
+                response == null ? null : response.body);
+        if (result != SendResult.SENT) {
+            Logger.e(TAG, "Ошибка отправки сообщения ВК (" + result + "): "
+                    + (response == null ? "нет ответа" : response.body));
         }
-        return success;
+        return result;
+    }
+
+    /** Классификация ответа: сетевая ошибка отличается от ошибки авторизации и ошибки API. */
+    static SendResult classify(int httpCode, String body) {
+        if (httpCode == -1) {
+            return SendResult.RETRYABLE; // исключение/таймаут — временная сетевая ошибка
+        }
+        if (httpCode == 401 || httpCode == 403) {
+            return SendResult.AUTH_FAILED;
+        }
+        if (httpCode >= 500 || httpCode <= 0) {
+            return SendResult.RETRYABLE;
+        }
+        if (body == null || body.isEmpty()) {
+            return SendResult.RETRYABLE;
+        }
+        try {
+            JSONObject json = new JSONObject(body);
+            if (json.has("response")) {
+                return SendResult.SENT;
+            }
+            JSONObject error = json.optJSONObject("error");
+            if (error != null) {
+                int code = error.optInt("error_code", -1);
+                switch (code) {
+                    case 5: // User authorization failed
+                        return SendResult.AUTH_FAILED;
+                    case 1:  // Unknown error — обычно временная
+                    case 6:  // Too many requests per second
+                    case 9:  // Flood control
+                    case 10: // Internal server error
+                    case 29: // Rate limit reached
+                        return SendResult.RETRYABLE;
+                    default:
+                        return SendResult.PERMANENT;
+                }
+            }
+            return SendResult.RETRYABLE; // неожиданное тело — лучше повторить
+        } catch (JSONException e) {
+            return SendResult.RETRYABLE;
+        }
     }
 
     public static String request(String method, String token, Map<String, String> params) {
+        RawResponse r = requestRaw(method, token, params);
+        return r == null ? null : r.body;
+    }
+
+    private static RawResponse requestRaw(String method, String token, Map<String, String> params) {
         HttpURLConnection connection = null;
         try {
             StringBuilder body = new StringBuilder();
@@ -77,13 +141,16 @@ public class VkApi {
                     ? connection.getInputStream()
                     : connection.getErrorStream();
 
+            if (stream == null) {
+                return new RawResponse(responseCode, "");
+            }
             try (BufferedReader reader = new BufferedReader(new InputStreamReader(stream, StandardCharsets.UTF_8))) {
                 StringBuilder response = new StringBuilder();
                 String line;
                 while ((line = reader.readLine()) != null) {
                     response.append(line);
                 }
-                return response.toString();
+                return new RawResponse(responseCode, response.toString());
             }
         } catch (Exception e) {
             Logger.e(TAG, "Исключение при запросе к API ВКонтакте: " + e.getMessage());
@@ -92,19 +159,6 @@ public class VkApi {
             if (connection != null) {
                 connection.disconnect();
             }
-        }
-    }
-
-    private static boolean isSuccess(String response) {
-        if (response == null || response.isEmpty()) {
-            return false;
-        }
-        try {
-            JSONObject json = new JSONObject(response);
-            return json.has("response");
-        } catch (JSONException e) {
-            Logger.e(TAG, "Не удалось разобрать ответ ВК: " + e.getMessage());
-            return false;
         }
     }
 }

@@ -127,6 +127,8 @@ public class SettingsActivity extends AppCompatActivity {
                             .getString("alert_min_bg", "4.1");
                     return "Текущее значение: " + value + " ммоль/л";
                 });
+                alertMinBgPref.setOnPreferenceChangeListener((preference, newValue) ->
+                        applyThreshold(preference, newValue, "alert_max_bg", "12.2", true));
             }
 
             EditTextPreference alertMaxBgPref = findPreference("alert_max_bg");
@@ -136,6 +138,8 @@ public class SettingsActivity extends AppCompatActivity {
                             .getString("alert_max_bg", "12.2");
                     return "Текущее значение: " + value + " ммоль/л";
                 });
+                alertMaxBgPref.setOnPreferenceChangeListener((preference, newValue) ->
+                        applyThreshold(preference, newValue, "alert_min_bg", "4.1", false));
             }
 
             androidx.preference.ListPreference pollIntervalPref = findPreference("poll_interval");
@@ -203,6 +207,35 @@ public class SettingsActivity extends AppCompatActivity {
                             .getBoolean("show_treatments", false);
                     return enabled ? "Будут отправляться разовые уведомления о вводе терапии" : "Уведомления о терапии отключены";
                 });
+            }
+        }
+
+        /**
+         * Валидация порога: конечное число в допустимом диапазоне ммоль/л,
+         * нижний строго меньше верхнего. Десятичная запятая нормализуется в точку.
+         */
+        private boolean applyThreshold(androidx.preference.Preference preference, Object newValue,
+                                       String otherKey, String otherDefault, boolean isMin) {
+            try {
+                double v = com.example.xdrip2vk.core.AlertThresholds
+                        .parseMmolValue(String.valueOf(newValue));
+                String otherRaw = androidx.preference.PreferenceManager
+                        .getDefaultSharedPreferences(preference.getContext())
+                        .getString(otherKey, otherDefault);
+                double other = com.example.xdrip2vk.core.AlertThresholds.parseMmolValue(otherRaw);
+                boolean ok = isMin ? v < other : v > other;
+                if (!ok) {
+                    Toast.makeText(preference.getContext(),
+                            "Нижний порог должен быть меньше верхнего", Toast.LENGTH_LONG).show();
+                    return false;
+                }
+                // Сохраняем нормализованное значение (точка вместо запятой)
+                ((EditTextPreference) preference).setText(String.valueOf(v));
+                return false; // значение уже сохранено через setText
+            } catch (IllegalArgumentException e) {
+                Toast.makeText(preference.getContext(),
+                        "Введите конечное число в ммоль/л (0.5–50)", Toast.LENGTH_LONG).show();
+                return false;
             }
         }
 
