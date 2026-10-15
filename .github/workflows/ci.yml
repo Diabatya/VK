@@ -17,9 +17,9 @@ jobs:
         with:
           distribution: temurin
           java-version: '17'
+          cache: gradle
 
-      - name: Set up Android SDK
-        uses: android-actions/setup-android@v3
+      # Android SDK уже предустановлен на GitHub-hosted ubuntu-latest ($ANDROID_HOME)
 
       - name: Grant execute permission for gradlew
         run: chmod +x gradlew
