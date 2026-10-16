@@ -34,6 +34,16 @@ public final class DeliveryCoordinator {
         SendResult send(String peerId, String text, int randomId);
     }
 
+    /**
+     * Подтверждённая запись текущего снимка состояния. Вызывается только с
+     * потока, владеющего координатором (рабочий поток сервиса). Возвращает
+     * false, если запись на диск не подтверждена — сетевую попытку после
+     * такого отказа начинать нельзя.
+     */
+    public interface Checkpoint {
+        boolean persist();
+    }
+
     /** Фабрика текстов сообщений; реализуется на стороне сервиса (нужны настройки/UI-строки). */
     public interface Messages {
         String regular(SgvReading r);
@@ -81,6 +91,8 @@ public final class DeliveryCoordinator {
         public int expired;
         /** Обход прерван: представленный токен сменился в середине серии отправок. */
         public boolean aborted;
+        /** Обход остановлен: подтверждённая запись состояния на диск не удалась. */
+        public boolean persistFailed;
 
         public boolean hasPendingFailures() {
             return retried > 0 || authFailures > 0 || permanent > 0;
@@ -97,6 +109,40 @@ public final class DeliveryCoordinator {
     /** Fingerprint токена, давшего AUTH_FAILED; "" — блокировки нет. */
     private String blockedTokenFp = "";
     private final SecureRandom random = new SecureRandom();
+    /** Checkpoint подтверждённой записи; по умолчанию — успешный no-op (тесты). */
+    private Checkpoint checkpoint = () -> true;
+    /**
+     * В памяти есть изменения, не подтверждённые записью на диск. Перед каждой
+     * сетевой попыткой такое состояние обязано попасть в checkpoint: при сбое
+     * процесса восстановление идёт с последней успешной записи.
+     */
+    private boolean persistDirty;
+
+    /** Установить механизм checkpoint (вызывается из того же потока, что и drain). */
+    public void setCheckpoint(Checkpoint cp) {
+        checkpoint = cp == null ? () -> true : cp;
+    }
+
+    /** Есть неподтверждённые диском изменения состояния. */
+    public boolean isPersistDirty() {
+        return persistDirty;
+    }
+
+    /**
+     * Если состояние «грязное» — выполнить checkpoint. true — на диске
+     * актуальный снимок (или грязных изменений нет); false — запись не
+     * подтверждена, состояние остаётся в памяти для повторной записи.
+     */
+    public boolean persistNow() {
+        if (!persistDirty) {
+            return true;
+        }
+        if (checkpoint.persist()) {
+            persistDirty = false;
+            return true;
+        }
+        return false;
+    }
 
     public DeliveryCoordinator() {
         this(Clock.SYSTEM);
@@ -146,6 +192,7 @@ public final class DeliveryCoordinator {
         // Фиксируем watermark даже для устаревшего показания: ещё более старые
         // данные при следующих опросах не должны считаться новыми.
         lastSeenBgMs = r.timestampMs;
+        persistDirty = true;
         if (v == ReadingGate.Verdict.STALE) {
             return ReadingOutcome.STALE;
         }
@@ -181,6 +228,7 @@ public final class DeliveryCoordinator {
                     // актуальной до истечения срока самого показания и не
                     // должна скрываться успехом других сообщений.
                     missedAlertUntilMs = expires;
+                    persistDirty = true;
                 }
             }
         }
@@ -205,6 +253,7 @@ public final class DeliveryCoordinator {
         }
         if (!treatmentsInitialized) {
             treatmentsInitialized = true;
+            persistDirty = true; // baseline терапии — изменение без сетевой отправки
             for (TreatmentEvent e : events) {
                 markSeen(e.id);
             }
@@ -286,7 +335,16 @@ public final class DeliveryCoordinator {
     public Summary drain(Sender sender, AuthContext auth,
                          java.util.function.BooleanSupplier authCurrent) {
         Summary s = new Summary();
-        s.expired += outbox.removeExpired(clock.now());
+        if (outbox.removeExpired(clock.now()) > 0) {
+            persistDirty = true;
+        }
+        // Подтверждённая запись на диск до любой сети: при сбое процесса
+        // восстановление пойдёт с этого снимка. Отказ диска — обход не
+        // начинается, очередь в памяти сохраняется.
+        if (!persistNow()) {
+            s.persistFailed = true;
+            return s;
+        }
         // Тот же заблокированный токен: сетевых попыток нет вообще.
         boolean tokenBlocked = !auth.tokenFp.isEmpty()
                 && auth.tokenFp.equals(blockedTokenFp);
@@ -301,13 +359,21 @@ public final class DeliveryCoordinator {
                 // просрочено пока выполнялась предыдущая отправка — не шлём
                 outbox.remove(m.key);
                 s.expired++;
+                persistDirty = true;
                 continue;
             }
             if (sweepStopped || tokenBlocked || !auth.verified || !ownerMatches(m, auth)) {
                 continue; // очередь сохраняется, но сеть не трогаем
             }
             if (!authCurrent.getAsBoolean()) {
-                s.aborted = true; // токен сменился — следующих отправок нет
+                s.aborted = true; // токен сменился/завершение — следующих отправок нет
+                break;
+            }
+            // Checkpoint до сетевой попытки: random_id, адресат, владельцы,
+            // expiry и поздняя привязка уже на диске. Отказ записи — эту и
+            // следующие попытки не начинаем, attempts не увеличиваем.
+            if (!persistNow()) {
+                s.persistFailed = true;
                 break;
             }
             SendResult res;
@@ -353,8 +419,18 @@ public final class DeliveryCoordinator {
                     s.permanent++;
                     break;
             }
+            // Результат завершённой попытки — на диск до следующей отправки.
+            // Отказ записи: следующие отправки останавливаются, изменённое
+            // состояние остаётся в памяти для повторной записи.
+            persistDirty = true;
+            if (!persistNow()) {
+                s.persistFailed = true;
+                break;
+            }
         }
-        s.expired += outbox.removeExpired(clock.now());
+        if (outbox.removeExpired(clock.now()) > 0) {
+            persistDirty = true;
+        }
         return s;
     }
 
@@ -372,6 +448,7 @@ public final class DeliveryCoordinator {
             if (!m.enqueuedFp.isEmpty() && m.enqueuedFp.equals(auth.tokenFp)
                     && (m.peerOwner.isEmpty() || m.peerOwner.equals(auth.senderId))) {
                 m.senderId = auth.senderId; // поздняя привязка после подтверждения
+                persistDirty = true; // привязка обязана попасть в checkpoint до send
                 return true;
             }
             return false; // владелец неизвестен или чужой
@@ -524,6 +601,7 @@ public final class DeliveryCoordinator {
         } catch (JSONException e) {
             return new DeliveryCoordinator();
         }
+        c.persistDirty = false; // только что загружено с диска — грязных изменений нет
         return c;
     }
 
@@ -541,7 +619,11 @@ public final class DeliveryCoordinator {
     }
 
     private boolean enqueue(PendingMessage m) {
-        return outbox.enqueueIfAbsent(m);
+        boolean added = outbox.enqueueIfAbsent(m);
+        if (added) {
+            persistDirty = true;
+        }
+        return added;
     }
 
     private void markSeen(String id) {
@@ -549,6 +631,7 @@ public final class DeliveryCoordinator {
             return;
         }
         seenTreatmentIds.add(id);
+        persistDirty = true;
         while (seenTreatmentIds.size() > SEEN_IDS_CAP) {
             String oldest = seenTreatmentIds.iterator().next();
             seenTreatmentIds.remove(oldest);

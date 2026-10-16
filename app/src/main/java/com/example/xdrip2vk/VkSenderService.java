@@ -72,6 +72,45 @@ public class VkSenderService extends Service {
     static volatile java.util.function.Supplier<List<TreatmentEvent>> treatmentsOverride;
 
     /**
+     * Хранилище состояния доставки с подтверждением записи: write() возвращает
+     * false, если запись на диск не завершена (SharedPreferences.commit()).
+     * Все обращения — только с рабочего потока сервиса.
+     */
+    interface StateStore {
+        String read();
+
+        boolean write(String json);
+    }
+
+    private final StateStore prefsStore = new StateStore() {
+        @Override
+        public String read() {
+            return prefs.getString(PREF_STATE, "");
+        }
+
+        @Override
+        public boolean write(String json) {
+            // commit() на рабочем потоке — возврат подтверждает запись на диск.
+            return prefs.edit().putString(PREF_STATE, json).commit();
+        }
+    };
+
+    // Тестовая подмена хранилища: история записей и возможность отказа.
+    static volatile StateStore stateStoreOverride;
+
+    private StateStore store() {
+        return stateStoreOverride != null ? stateStoreOverride : prefsStore;
+    }
+
+    /** Экземпляр завершается: новые poll/drain/send и перепланирование запрещены. */
+    private volatile boolean shuttingDown;
+
+    // Ограниченный повтор записи при отказе диска — без посекундного цикла.
+    private static final long PERSIST_RETRY_MS = 30_000;
+    private static final int PERSIST_RETRY_MAX = 5;
+    private int persistRetries;
+
+    /**
      * Единая точка оповещения о смене токена — ручной ввод и импорт файла
      * вызывают одинаковую процедуру: инвалидация прежней проверки и
      * повторная верификация новой версии на рабочем потоке сервиса.
@@ -105,21 +144,19 @@ public class VkSenderService extends Service {
         handlerThread = new HandlerThread("VkSenderThread");
         handlerThread.setUncaughtExceptionHandler((thread, ex) -> {
             Logger.e(TAG, "Критическая ошибка в фоновом потоке: " + ex.getMessage());
-            try {
-                handlerThread = new HandlerThread("VkSenderThread");
-                handlerThread.start();
-                handler = new Handler(handlerThread.getLooper());
-                Logger.d(TAG, "Фоновый поток пересоздан после ошибки");
-            } catch (Exception e) {
-                Logger.e(TAG, "Не удалось пересоздать фоновый поток: " + e.getMessage());
-            }
+            // Пересоздание пустого потока создало бы видимость работы с
+            // потерянными задачами: очередь runnable и позиция обхода не
+            // восстанавливаются. Помечаем поток мёртвым — сервис перезапустит
+            // система (START_STICKY/alarm), состояние на диске актуально.
+            handler = null;
         });
         handlerThread.start();
         handler = new Handler(handlerThread.getLooper());
 
         startForeground(NOTIFICATION_ID, createNotification("xDrip → VK: Ожидание данных от сенсора"));
 
-        coordinator = DeliveryCoordinator.load(prefs.getString(PREF_STATE, ""));
+        coordinator = DeliveryCoordinator.load(store().read());
+        coordinator.setCheckpoint(this::persistState);
 
         drainRunnable = this::drainAndSchedule;
         pollTask = this::pollXDrip;
@@ -154,6 +191,9 @@ public class VkSenderService extends Service {
         final Intent cmd = intent;
         // Сериализуем: никаких изменений состояния на главном потоке.
         handler.post(() -> {
+            if (shuttingDown) {
+                return; // завершение началось — новая работа не принимается
+            }
             boolean manualSend = cmd.getBooleanExtra("manual_send", false);
             boolean autoUpdate = cmd.getBooleanExtra("auto_update", false);
             boolean pollNow = cmd.getBooleanExtra("poll_now", false);
@@ -227,7 +267,8 @@ public class VkSenderService extends Service {
         DeliveryCoordinator.Messages msgs = buildMessages(XDripWebClient.fetchDeviceStatus());
 
         DeliveryCoordinator.ReadingOutcome outcome = coordinator.onReading(r, src, cfg, msgs, now);
-        saveState();
+        // Подтверждённая запись watermark/очереди/пропущенной тревоги — до drain.
+        coordinator.persistNow();
         Logger.d(TAG, "Показание " + r.sgvMgdl + " mg/dL @ " + r.timestampMs
                 + " (" + src + ") → " + outcome);
 
@@ -339,18 +380,23 @@ public class VkSenderService extends Service {
     @Override
     public void onDestroy() {
         isRunning = false;
-        saveState();
+        shuttingDown = true; // новые poll/drain/send и перепланирование запрещены
         cancelAlarms();
-        if (handler != null) {
-            if (drainRunnable != null) {
-                handler.removeCallbacks(drainRunnable);
-            }
-            if (pollTask != null) {
-                handler.removeCallbacks(pollTask);
-            }
-        }
-        if (handlerThread != null) {
-            handlerThread.quit();
+        // Финальное сохранение и остановка worker — упорядоченно на том же
+        // потоке: задача встаёт в хвост ПОСЛЕ текущего обхода, уже начатая
+        // сетевая попытка успевает завершиться и сохранить результат
+        // (остаток обхода не отправляется — drain проверяет shuttingDown).
+        // Главный поток сеть не ждёт.
+        final Handler h = handler;
+        final HandlerThread t = handlerThread;
+        if (h != null && t != null) {
+            h.post(() -> {
+                // последний checkpoint: результат начатой попытки и всё «грязное»
+                if (coordinator != null) {
+                    coordinator.persistNow();
+                }
+                t.quitSafely();
+            });
         }
         if (wakeLock != null && wakeLock.isHeld()) {
             wakeLock.release();
@@ -364,11 +410,17 @@ public class VkSenderService extends Service {
         return isRunning;
     }
 
-    private void saveState() {
+    /**
+     * Подтверждённая запись состояния на диск. Вызывается только с рабочего
+     * потока (в т.ч. как checkpoint координатора между сетевыми попытками).
+     * false — запись не подтверждена; состояние остаётся в памяти
+     * (persistDirty) и будет записано повторно.
+     */
+    private boolean persistState() {
         if (coordinator == null) {
-            return;
+            return true;
         }
-        prefs.edit().putString(PREF_STATE, coordinator.save()).apply();
+        return store().write(coordinator.save());
     }
 
     private String getDirectionArrow(String direction) {
@@ -421,6 +473,13 @@ public class VkSenderService extends Service {
         return lastNotificationText;
     }
 
+    /** Текущая очередь — для проверки восстановления в тестах. */
+    java.util.List<com.example.xdrip2vk.core.PendingMessage> pendingForTest() {
+        return coordinator == null
+                ? java.util.Collections.emptyList()
+                : coordinator.pendingMessages();
+    }
+
     private void updateNotification(String text) {
         lastNotificationText = text;
         NotificationManager manager = (NotificationManager) getSystemService(Context.NOTIFICATION_SERVICE);
@@ -428,7 +487,7 @@ public class VkSenderService extends Service {
     }
 
     private void pollXDrip() {
-        if (!isRunning) return;
+        if (!isRunning || shuttingDown) return;
 
         boolean acquired = false;
         try {
@@ -460,14 +519,14 @@ public class VkSenderService extends Service {
             List<TreatmentEvent> treatments = treatmentsOverride != null
                     ? treatmentsOverride.get() : XDripWebClient.fetchTreatments();
             boolean showTreatments = prefs.getBoolean(PREF_SHOW_TREATMENTS, false);
-            int added = coordinator.onTreatments(treatments, cfg,
+            coordinator.onTreatments(treatments, cfg,
                     buildMessages(new XDripWebClient.DeviceStatusData(0, 0)),
                     showTreatments, now);
-            if (added > 0) {
-                saveState();
-            }
+            // Не только added>0: baseline терапии, просмотренные ID и watermark
+            // — тоже изменения, их нужно подтвердить на диске.
+            coordinator.persistNow();
 
-            if (isRunning) {
+            if (isRunning && !shuttingDown) {
                 scheduleNextAlarm();
             }
         } catch (Exception e) {
@@ -548,8 +607,8 @@ public class VkSenderService extends Service {
     }
 
     private void drainAndSchedule() {
-        if (coordinator == null) {
-            return;
+        if (coordinator == null || shuttingDown) {
+            return; // завершение: уже поставленные callbacks не возобновляют работу
         }
         String token = TokenStorage.getToken(this);
         if (token.isEmpty()) {
@@ -573,10 +632,20 @@ public class VkSenderService extends Service {
                 ? senderOverride
                 : (peerId, text, randomId) -> VkApi.sendMessage(tokenF, peerId, text, randomId);
 
+        // Непосредственно перед каждой сетевой попыткой проверяется, что
+        // представленный токен актуален И завершение сервиса не началось.
         DeliveryCoordinator.Summary s = coordinator.drain(sender, auth,
-                () -> fp.equals(Fingerprint.of(TokenStorage.getToken(this))));
-        saveState();
+                () -> fp.equals(Fingerprint.of(TokenStorage.getToken(this)))
+                        && !shuttingDown);
+        // Финальный commit результатов обхода (внутри drain уже писались
+        // checkpoint'и до/после каждой попытки).
+        if (!coordinator.persistNow()) {
+            s.persistFailed = true;
+        }
         if (s.aborted) {
+            if (shuttingDown) {
+                return; // завершение: остаток обхода не отправляем
+            }
             // Токен заменён в середине обхода: обрабатываем новую версию —
             // проверка владельца и допустимые отправки под ней.
             Logger.d(TAG, "Токен сменился во время обхода — повторная проверка");
@@ -584,17 +653,32 @@ public class VkSenderService extends Service {
             return;
         }
         Logger.d(TAG, "Доставка: отправлено=" + s.sent + ", повторы=" + s.retried
-                + ", auth=" + s.authFailures + ", permanent=" + s.permanent + ", expired=" + s.expired);
+                + ", auth=" + s.authFailures + ", permanent=" + s.permanent
+                + ", expired=" + s.expired + ", persistFailed=" + s.persistFailed);
+
+        if (s.persistFailed || coordinator.isPersistDirty()) {
+            // Ограниченный повтор записи без посекундного цикла: после
+            // PERSIST_RETRY_MAX ждём обычного пробуждения по очереди.
+            persistRetries++;
+            if (persistRetries <= PERSIST_RETRY_MAX) {
+                lastDrainDelayMs = PERSIST_RETRY_MS;
+                handler.removeCallbacks(drainRunnable);
+                handler.postDelayed(drainRunnable, PERSIST_RETRY_MS);
+            }
+            updateDeliveryStatus(s, auth);
+            return;
+        }
+        persistRetries = 0;
 
         updateDeliveryStatus(s, auth);
 
         long due = coordinator.nextDueAt(auth);
-        if (due > 0) {
+        if (due > 0 && !shuttingDown) {
             long delay = Math.max(due - System.currentTimeMillis(), 1000);
             lastDrainDelayMs = delay; // для тестов планировщика
             handler.removeCallbacks(drainRunnable);
             handler.postDelayed(drainRunnable, delay);
-        } else {
+        } else if (!shuttingDown) {
             lastDrainDelayMs = -1;
         }
     }
@@ -607,6 +691,12 @@ public class VkSenderService extends Service {
      */
     private void updateDeliveryStatus(DeliveryCoordinator.Summary s, AuthContext auth) {
         long now = System.currentTimeMillis();
+        if (s.persistFailed || coordinator.isPersistDirty()) {
+            // Запись на диск не подтверждена — безусловный успех не показываем;
+            // состояние в памяти цело, запланирован ограниченный повтор записи.
+            updateNotification("Ошибка сохранения очереди на диск — сообщения в памяти сохранены, повтор записи запланирован");
+            return;
+        }
         if (coordinator.isAuthBlocked(auth.tokenFp)) {
             updateNotification("Ошибка авторизации VK — проверьте токен в настройках");
             return;
