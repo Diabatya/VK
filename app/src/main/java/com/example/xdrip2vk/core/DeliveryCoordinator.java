@@ -78,6 +78,8 @@ public final class DeliveryCoordinator {
     private final Outbox outbox = new Outbox();
     private final Clock clock;
     private long lastSeenBgMs;
+    /** Срок актуальности пропущенной тревоги (чат не был выбран); 0 — нет. */
+    private long missedAlertUntilMs;
     private boolean treatmentsInitialized;
     private final LinkedHashSet<String> seenTreatmentIds = new LinkedHashSet<>();
     private boolean authFailed;
@@ -154,12 +156,20 @@ public final class DeliveryCoordinator {
                     cfg.normalPeer, msgs.regular(r), newRandomId(), expires));
         }
 
-        if (cfg.alertsEnabled && isValidPeer(cfg.alertPeer)) {
+        if (cfg.alertsEnabled) {
             AlertThresholds.Level level = cfg.thresholds.classify(r.sgvMgdl);
             if (level != AlertThresholds.Level.NORMAL) {
-                enqueue(new PendingMessage(
-                        "alert:" + r.timestampMs,
-                        cfg.alertPeer, msgs.alert(r, level), newRandomId(), expires));
+                if (isValidPeer(cfg.alertPeer)) {
+                    enqueue(new PendingMessage(
+                            "alert:" + r.timestampMs,
+                            cfg.alertPeer, msgs.alert(r, level), newRandomId(), expires));
+                } else {
+                    // Чат тревог не выбран: псевдосообщение для peer_id=0 не
+                    // создаём, но фиксируем пропущенную тревогу — она остаётся
+                    // актуальной до истечения срока самого показания и не
+                    // должна скрываться успехом других сообщений.
+                    missedAlertUntilMs = expires;
+                }
             }
         }
         return ReadingOutcome.ACCEPTED;
@@ -280,6 +290,9 @@ public final class DeliveryCoordinator {
                 case SENT:
                     outbox.onSent(m.key);
                     s.sent++;
+                    if (m.key.startsWith("alert:")) {
+                        missedAlertUntilMs = 0; // тревога дошла — старый пропуск закрыт
+                    }
                     break;
                 case RETRYABLE:
                     outbox.onRetry(m.key, done); // backoff от завершения попытки
@@ -345,6 +358,15 @@ public final class DeliveryCoordinator {
         return authFailed;
     }
 
+    /**
+     * Срок актуальности пропущенной тревоги (чат не был выбран), или 0.
+     * now < значения — тревога ещё актуальна; now >= значения — срок вышел,
+     * тревога так и не была отправлена.
+     */
+    public long missedAlertUntil() {
+        return missedAlertUntilMs;
+    }
+
     public long getLastSeenBgMs() {
         return lastSeenBgMs;
     }
@@ -363,6 +385,7 @@ public final class DeliveryCoordinator {
             o.put("treatInit", treatmentsInitialized);
             o.put("authFailed", authFailed);
             o.put("authTokenHash", authFailedTokenHash);
+            o.put("missedAlertMs", missedAlertUntilMs);
             JSONArray ids = new JSONArray();
             for (String id : seenTreatmentIds) {
                 ids.put(id);
@@ -390,6 +413,7 @@ public final class DeliveryCoordinator {
             c.treatmentsInitialized = o.optBoolean("treatInit", false);
             c.authFailed = o.optBoolean("authFailed", false);
             c.authFailedTokenHash = o.optInt("authTokenHash", 0);
+            c.missedAlertUntilMs = o.optLong("missedAlertMs", 0);
             JSONArray ids = o.optJSONArray("seenTreat");
             if (ids != null) {
                 for (int i = 0; i < ids.length(); i++) {

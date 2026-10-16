@@ -167,4 +167,91 @@ public class VkSenderServiceDeliveryTest {
                 text.contains("не выбран чат"));
         s.onDestroy();
     }
+
+    // --- №2Б.1.1: отрицательный тревожный peer_id ---
+
+    @Test
+    public void negativeAlertPeerIdDeliveredVerbatim() {
+        prefs.edit().putBoolean("alert_enabled", true).apply();
+        TokenStorage.setAlertChatId(context, -77); // адресат-сообщество по схеме VK
+        VkSenderService s = startService();
+        s.onStartCommand(autoUpdate(54, System.currentTimeMillis() - 60_000), 0, 1);
+        idle(s);
+
+        assertEquals(2, peers.size());
+        assertTrue("обычный чат не вызван: " + peers, peers.contains("777"));
+        assertTrue("отрицательный alert peer потерян: " + peers,
+                peers.contains("-77"));
+        assertFalse("статус «не выбран чат» не должен появляться из-за знака: "
+                + lastNotificationText(s),
+                lastNotificationText(s).contains("не выбран чат"));
+        s.onDestroy();
+    }
+
+    // --- №2Б.1.1: пропущенная тревога как сохраняющееся состояние ---
+
+    @Test
+    public void missedAlertSurvivesRetrySuccessAndNextDelivery() {
+        prefs.edit().putBoolean("alert_enabled", true).apply(); // чат не выбран
+        VkSenderService s = startService();
+
+        result.set(SendResult.RETRYABLE);
+        s.onStartCommand(autoUpdate(54, System.currentTimeMillis() - 60_000), 0, 1);
+        idle(s);
+        assertEquals(1, peers.size()); // псевдосообщения для peer 0 нет
+        String t1 = lastNotificationText(s);
+        assertTrue(t1, t1.contains("повтор через"));
+        assertTrue(t1, t1.contains("не выбран чат"));
+
+        // повтор обычного сообщения успешен — тревога по-прежнему не отправлена
+        result.set(SendResult.SENT);
+        Shadows.shadowOf(s.workerLooperForTest())
+                .idleFor(java.time.Duration.ofSeconds(6));
+        String t2 = lastNotificationText(s);
+        assertTrue("успешный повтор скрыл пропущенную тревогу: " + t2,
+                t2.contains("не выбран чат"));
+
+        // следующее успешное обычное сообщение — тоже не скрывает ошибку
+        s.onStartCommand(autoUpdate(120, System.currentTimeMillis() - 30_000), 0, 2);
+        idle(s);
+        String t3 = lastNotificationText(s);
+        assertTrue("успех скрыл ошибку тревоги: " + t3, t3.contains("не выбран чат"));
+        s.onDestroy();
+    }
+
+    @Test
+    public void missedAlertSurvivesServiceRestart() {
+        prefs.edit().putBoolean("alert_enabled", true).apply(); // чат не выбран
+        VkSenderService s = startService();
+        result.set(SendResult.RETRYABLE);
+        s.onStartCommand(autoUpdate(54, System.currentTimeMillis() - 60_000), 0, 1);
+        idle(s);
+        s.onDestroy(); // состояние сохранено в prefs
+
+        // «перезапуск процесса»: запись о пропущенной тревоге восстановлена
+        VkSenderService s2 = Robolectric.buildService(VkSenderService.class).create().get();
+        idle(s2);
+        result.set(SendResult.SENT);
+        s2.onStartCommand(autoUpdate(120, System.currentTimeMillis() - 30_000), 0, 2);
+        idle(s2);
+        String text = lastNotificationText(s2);
+        assertTrue("пропущенная тревога потерялась при save/load: " + text,
+                text.contains("не выбран чат"));
+        s2.onDestroy();
+    }
+
+    @Test
+    public void validAlertChatBothDeliveredShowsSuccess() {
+        prefs.edit().putBoolean("alert_enabled", true).apply();
+        TokenStorage.setAlertChatId(context, 888);
+        VkSenderService s = startService();
+        s.onStartCommand(autoUpdate(54, System.currentTimeMillis() - 60_000), 0, 1);
+        idle(s);
+
+        assertEquals(2, peers.size());
+        String text = lastNotificationText(s);
+        assertTrue("ожидался успешный статус, был: " + text,
+                text.contains("Успешно"));
+        s.onDestroy();
+    }
 }

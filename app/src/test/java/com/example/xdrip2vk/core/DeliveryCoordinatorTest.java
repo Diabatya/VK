@@ -628,4 +628,55 @@ public class DeliveryCoordinatorTest {
                 DeliveryCoordinator.Source.AUTO, cfg(), msgs, now);
         assertEquals(2, c2.pendingCount());
     }
+
+    // ---------- пропущенная тревога без выбранного чата (№2Б.1.1) ----------
+
+    @Test
+    public void missedAlertRecordedSurvivesSaveLoadAndExpiresUndelivered() {
+        DeliveryCoordinator.Config noAlert = new DeliveryCoordinator.Config(
+                PEER, "", true, true,
+                AlertThresholds.parseMmol("4.1", "12.2"), 42);
+        coordinator.onReading(reading(54, now - 60_000, "SingleDown"),
+                DeliveryCoordinator.Source.AUTO, noAlert, msgs, now);
+        // псевдосообщения нет — только обычное; пропуск зафиксирован со сроком
+        long until = coordinator.missedAlertUntil();
+        assertEquals(now - 60_000 + ReadingGate.MAX_AGE_MS, until);
+        assertEquals(1, coordinator.pendingCount());
+
+        // причина и срок переживают save/load
+        coordinator = DeliveryCoordinator.load(coordinator.save(), () -> now);
+        assertEquals(until, coordinator.missedAlertUntil());
+
+        // обычное доставлено; запись о пропущенной тревоге не скрыта
+        coordinator.drain(sender, 42);
+        assertEquals(1, sender.calls.size());
+        assertEquals(PEER, sender.calls.get(0).peerId);
+        assertTrue(coordinator.missedAlertUntil() > 0);
+
+        // по управляемым часам срок истёк: тревога не отправлена и не доставлена
+        now = until + 1;
+        coordinator.drain(sender, 42);
+        assertEquals(1, sender.calls.size()); // новых отправок нет
+        assertTrue(coordinator.missedAlertUntil() > 0);
+        assertEquals(0, coordinator.pendingCount());
+    }
+
+    @Test
+    public void deliveredAlertClearsMissedRecord() {
+        DeliveryCoordinator.Config noAlert = new DeliveryCoordinator.Config(
+                PEER, "", true, true,
+                AlertThresholds.parseMmol("4.1", "12.2"), 42);
+        coordinator.onReading(reading(54, now - 60_000, "SingleDown"),
+                DeliveryCoordinator.Source.AUTO, noAlert, msgs, now);
+        assertTrue(coordinator.missedAlertUntil() > 0);
+        coordinator.drain(sender, 42);
+
+        // позднее корректно доставленная тревога закрывает старый пропуск —
+        // но сама по себе смена чата её не отправляет (отправляет новое событие)
+        now += 120_000;
+        coordinator.onReading(reading(50, now - 30_000, "SingleDown"),
+                DeliveryCoordinator.Source.AUTO, cfg(), msgs, now);
+        coordinator.drain(sender, 42);
+        assertEquals(0, coordinator.missedAlertUntil());
+    }
 }

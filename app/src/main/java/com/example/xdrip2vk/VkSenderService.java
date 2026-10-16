@@ -210,14 +210,9 @@ public class VkSenderService extends Service {
                 || outcome == DeliveryCoordinator.ReadingOutcome.FUTURE) {
             updateNotification("Нет свежих данных от сенсора xDrip+: данные устарели или из будущего");
         }
+        // Пропущенная из-за невыбранного чата тревога учтена в состоянии
+        // coordinator и будет отражена в статусе доставки до истечения срока.
         drainAndSchedule();
-        // Тревога не создана без выбранного чата — показываем явный статус
-        // поверх общего статуса доставки.
-        if (outcome == DeliveryCoordinator.ReadingOutcome.ACCEPTED
-                && cfg.alertsEnabled && cfg.alertPeer.isEmpty()
-                && cfg.thresholds.classify(r.sgvMgdl) != AlertThresholds.Level.NORMAL) {
-            updateNotification("Тревога не отправлена: для тревог не выбран чат — укажите его в настройках");
-        }
     }
 
     private DeliveryCoordinator.Config loadConfig() {
@@ -229,11 +224,13 @@ public class VkSenderService extends Service {
                 prefs.getString(PREF_ALERT_MIN_BG, AlertThresholds.DEFAULT_MIN_STR),
                 prefs.getString(PREF_ALERT_MAX_BG, AlertThresholds.DEFAULT_MAX_STR));
         boolean configured = !token.isEmpty() && chatId > 0;
-        // Невыбранный чат (id<=0) не превращаем в строку "0" — иначе создалось бы
-        // заведомо недоставимое сообщение для peer_id=0.
+        // Невыбранный чат — только id==0. Отрицательный peer_id — допустимый
+        // адресат VK (сообщество по схеме messages.send), отбрасывать его по
+        // знаку нельзя; пустая строка для id<=0 создавала бы ложный статус
+        // «не выбран чат» и потерю тревоги.
         return new DeliveryCoordinator.Config(
                 chatId > 0 ? String.valueOf(chatId) : "",
-                alertChatId > 0 ? String.valueOf(alertChatId) : "",
+                alertChatId != 0 ? String.valueOf(alertChatId) : "",
                 alertEnabled, configured, thresholds,
                 token.isEmpty() ? 0 : token.hashCode());
     }
@@ -498,17 +495,32 @@ public class VkSenderService extends Service {
         }
         int pending = coordinator.pendingCount();
         int terminal = coordinator.terminalCount();
+        // Пропущенная из-за невыбранного чата тревога — сохраняющееся состояние,
+        // а не одноразовый текст: её не должен скрывать поздний успех других
+        // сообщений. После истечения срока явно сообщаем, что она не отправлена.
+        long missedUntil = coordinator.missedAlertUntil();
+        String missed = missedUntil > 0
+                ? (now < missedUntil
+                        ? "Тревога не отправлена: для тревог не выбран чат — укажите его в настройках"
+                        : "Срок тревоги истёк — она не была отправлена (чат тревог не был выбран)")
+                : null;
         if (pending > 0) {
             long due = coordinator.nextDueAt();
             if (due > 0) {
                 String suffix = terminal > 0 ? " (есть окончательные ошибки)" : "";
+                String extra = missed != null ? " · " + missed : "";
                 updateNotification("Часть сообщений не доставлена, повтор через "
-                        + Math.max(due - now, 0) / 1000 + " сек" + suffix);
+                        + Math.max(due - now, 0) / 1000 + " сек" + suffix + extra);
                 return;
             }
         }
         if (terminal > 0) {
-            updateNotification("Часть сообщений не доставлена — окончательная ошибка, повтор не планируется");
+            updateNotification("Часть сообщений не доставлена — окончательная ошибка, повтор не планируется"
+                    + (missed != null ? " · " + missed : ""));
+            return;
+        }
+        if (missed != null) {
+            updateNotification(missed);
             return;
         }
         if (s.expired > 0) {
