@@ -88,7 +88,7 @@ public class DeliveryCoordinatorTest {
 
     @Before
     public void setUp() {
-        coordinator = new DeliveryCoordinator();
+        coordinator = new DeliveryCoordinator(() -> now);
         now = NOW;
         sender = new FakeSender();
     }
@@ -104,7 +104,7 @@ public class DeliveryCoordinatorTest {
             assertEquals(DeliveryCoordinator.ReadingOutcome.STALE, o);
         }
         assertEquals(0, coordinator.pendingCount());
-        assertEquals(0, coordinator.drain(sender, 42, now).sent);
+        assertEquals(0, coordinator.drain(sender, 42).sent);
         assertTrue(sender.calls.isEmpty());
     }
 
@@ -126,7 +126,7 @@ public class DeliveryCoordinatorTest {
         assertEquals(DeliveryCoordinator.ReadingOutcome.DUPLICATE,
                 coordinator.onReading(r, DeliveryCoordinator.Source.AUTO, cfg(), msgs, now + 1000));
         assertEquals(1, coordinator.pendingCount());
-        coordinator.drain(sender, 42, now);
+        coordinator.drain(sender, 42);
         assertEquals(1, sender.calls.size());
     }
 
@@ -134,13 +134,14 @@ public class DeliveryCoordinatorTest {
     public void manualSendWhileRunningCreatesMessage() {
         SgvReading r = reading(120, now - 60_000, "Flat");
         coordinator.onReading(r, DeliveryCoordinator.Source.AUTO, cfg(), msgs, now);
-        coordinator.drain(sender, 42, now); // авто-сообщение доставлено
+        coordinator.drain(sender, 42); // авто-сообщение доставлено
         assertEquals(1, sender.calls.size());
 
         // ручная отправка того же доставленного показания — новое логическое сообщение
         assertEquals(DeliveryCoordinator.ReadingOutcome.ACCEPTED,
                 coordinator.onReading(r, DeliveryCoordinator.Source.MANUAL, cfg(), msgs, now + 2000));
-        coordinator.drain(sender, 42, now + 3000);
+        now += 3000;
+        coordinator.drain(sender, 42);
         assertEquals(2, sender.calls.size());
         assertTrue(sender.calls.get(1).text.startsWith("reg:"));
     }
@@ -156,8 +157,8 @@ public class DeliveryCoordinatorTest {
             coordinator.onReading(b, DeliveryCoordinator.Source.AUTO, cfg(), msgs, now);
             return SendResult.SENT;
         });
-        coordinator.drain(sender, 42, now);
-        coordinator.drain(sender, 42, now);
+        coordinator.drain(sender, 42);
+        coordinator.drain(sender, 42);
         assertEquals(2, sender.calls.size());
         assertEquals("reg:" + a.timestampMs + ":Flat", sender.calls.get(0).text);
         assertEquals("reg:" + b.timestampMs + ":SingleUp", sender.calls.get(1).text);
@@ -168,10 +169,10 @@ public class DeliveryCoordinatorTest {
         SgvReading r = reading(120, now - 60_000, "Flat");
         coordinator.onReading(r, DeliveryCoordinator.Source.AUTO, cfg(), msgs, now);
         sender.setRule((p, t, rid) -> SendResult.RETRYABLE);
-        coordinator.drain(sender, 42, now);
+        coordinator.drain(sender, 42);
         // время вышло: сообщение протухло вместе с показанием
-        long later = r.timestampMs + ReadingGate.MAX_AGE_MS + 1000;
-        DeliveryCoordinator.Summary s = coordinator.drain(sender, 42, later);
+        now = r.timestampMs + ReadingGate.MAX_AGE_MS + 1000;
+        DeliveryCoordinator.Summary s = coordinator.drain(sender, 42);
         assertEquals(0, s.sent);
         assertEquals(1, sender.calls.size()); // повторов не было
         assertEquals(0, coordinator.pendingCount());
@@ -189,7 +190,7 @@ public class DeliveryCoordinatorTest {
     @Test
     public void comboBothSuccess() {
         enqueueLowBg();
-        DeliveryCoordinator.Summary s = coordinator.drain(sender, 42, now);
+        DeliveryCoordinator.Summary s = coordinator.drain(sender, 42);
         assertEquals(2, s.sent);
         assertEquals(0, coordinator.pendingCount());
     }
@@ -199,15 +200,17 @@ public class DeliveryCoordinatorTest {
         enqueueLowBg();
         sender.setRule((peer, text, rid) ->
                 peer.equals(PEER) ? SendResult.RETRYABLE : SendResult.SENT);
-        DeliveryCoordinator.Summary s = coordinator.drain(sender, 42, now);
+        DeliveryCoordinator.Summary s = coordinator.drain(sender, 42);
         assertEquals(1, s.sent);
         assertEquals(1, s.retried);
         assertEquals(1, coordinator.pendingCount());
         // повторяется только обычное: тревожное не дублируется
-        s = coordinator.drain(sender, 42, now + 2_000);
+        now += 2_000;
+        s = coordinator.drain(sender, 42);
         assertEquals(0, s.sent); // notBefore=+5с — ещё рано
         sender.setRule((p, t, rid) -> SendResult.SENT);
-        s = coordinator.drain(sender, 42, now + 60_000);
+        now += 60_000;
+        s = coordinator.drain(sender, 42);
         assertEquals(1, s.sent);
         assertEquals(3, sender.calls.size());
         assertEquals(PEER, sender.calls.get(2).peerId);
@@ -218,11 +221,12 @@ public class DeliveryCoordinatorTest {
         enqueueLowBg();
         sender.setRule((peer, text, rid) ->
                 peer.equals(ALERT_PEER) ? SendResult.RETRYABLE : SendResult.SENT);
-        DeliveryCoordinator.Summary s = coordinator.drain(sender, 42, now);
+        DeliveryCoordinator.Summary s = coordinator.drain(sender, 42);
         assertEquals(1, s.sent);
         assertEquals(1, s.retried);
         sender.setRule((p, t, rid) -> SendResult.SENT);
-        s = coordinator.drain(sender, 42, now + 60_000);
+        now += 60_000;
+        s = coordinator.drain(sender, 42);
         assertEquals(1, s.sent);
         assertEquals(ALERT_PEER, sender.calls.get(2).peerId);
     }
@@ -231,12 +235,13 @@ public class DeliveryCoordinatorTest {
     public void comboBothFailIndependentRetry() {
         enqueueLowBg();
         sender.setRule((p, t, rid) -> SendResult.RETRYABLE);
-        DeliveryCoordinator.Summary s = coordinator.drain(sender, 42, now);
+        DeliveryCoordinator.Summary s = coordinator.drain(sender, 42);
         assertEquals(0, s.sent);
         assertEquals(2, s.retried);
         // одно «оживёт» раньше другого — второе продолжает повторяться независимо
         sender.setRule((peer, t, rid) -> peer.equals(PEER) ? SendResult.SENT : SendResult.RETRYABLE);
-        s = coordinator.drain(sender, 42, now + 60_000);
+        now += 60_000;
+        s = coordinator.drain(sender, 42);
         assertEquals(1, s.sent);
         assertEquals(1, s.retried);
         assertEquals(1, coordinator.pendingCount());
@@ -249,11 +254,12 @@ public class DeliveryCoordinatorTest {
         enqueueLowBg();
         // сервер принял сообщение, но ответ потерян → клиент считает отправку неудачной
         sender.setRule((p, t, rid) -> SendResult.RETRYABLE);
-        coordinator.drain(sender, 42, now);
+        coordinator.drain(sender, 42);
         int firstRid = sender.calls.get(0).randomId;
         assertNotEquals(0, firstRid);
         sender.setRule((p, t, rid) -> SendResult.SENT);
-        coordinator.drain(sender, 42, now + 60_000);
+        now += 60_000;
+        coordinator.drain(sender, 42);
         assertEquals(firstRid, sender.calls.get(2).randomId); // тот же логический random_id
     }
 
@@ -279,10 +285,10 @@ public class DeliveryCoordinatorTest {
         // та же запись при следующем опросе — не новое событие
         assertEquals(0, coordinator.onTreatments(Arrays.asList(e), cfg(), msgs, true, now + 5000));
         assertEquals(2, coordinator.pendingCount());
-        coordinator.drain(sender, 42, now);
+        coordinator.drain(sender, 42);
         assertEquals(0, coordinator.onTreatments(Arrays.asList(e), cfg(), msgs, true, now + 9000));
         // и после доставки и перезагрузки — тоже
-        DeliveryCoordinator restored = DeliveryCoordinator.load(coordinator.save());
+        DeliveryCoordinator restored = DeliveryCoordinator.load(coordinator.save(), () -> now);
         assertEquals(0, restored.onTreatments(Arrays.asList(e), cfg(), msgs, true, now + 15000));
     }
 
@@ -294,7 +300,7 @@ public class DeliveryCoordinatorTest {
         TreatmentEvent e3 = new TreatmentEvent("e3", now - 90_000, 20, 1.0, "Meal");
         int added = coordinator.onTreatments(Arrays.asList(e1, e2, e3), cfg(), msgs, true, now);
         assertEquals(4, added); // ins + carb + ins+carb
-        coordinator.drain(sender, 42, now);
+        coordinator.drain(sender, 42);
         assertEquals(4, sender.calls.size());
     }
 
@@ -305,12 +311,13 @@ public class DeliveryCoordinatorTest {
         coordinator.onTreatments(Arrays.asList(e), cfg(), msgs, true, now);
         // инсулин падает, углеводы уходят
         sender.setRule((p, text, rid) -> text.startsWith("ins:") ? SendResult.RETRYABLE : SendResult.SENT);
-        DeliveryCoordinator.Summary s = coordinator.drain(sender, 42, now);
+        DeliveryCoordinator.Summary s = coordinator.drain(sender, 42);
         assertEquals(1, s.sent);
         assertEquals(1, s.retried);
         sender.calls.clear();
         sender.setRule((p, t, rid) -> SendResult.SENT);
-        coordinator.drain(sender, 42, now + 60_000);
+        now += 60_000;
+        coordinator.drain(sender, 42);
         // повторилась только инсулиновая часть — доставленная часть не шлётся заново
         assertEquals(1, sender.calls.size());
         assertTrue(sender.calls.get(0).text.startsWith("ins:"));
@@ -377,18 +384,19 @@ public class DeliveryCoordinatorTest {
                 TestUtil.fixture("treatments_xdrip.json"));
         assertNotNull(history);
         assertEquals(0, coordinator.onTreatments(history, cfg(), msgs, true, now));
-        coordinator.drain(sender, 42, now);
+        coordinator.drain(sender, 42);
         assertTrue(sender.calls.isEmpty());
 
         // 4. перезапуск: инициализация и «просмотренные» id переживают рестарт
-        DeliveryCoordinator restored = DeliveryCoordinator.load(coordinator.save());
+        DeliveryCoordinator restored = DeliveryCoordinator.load(coordinator.save(), () -> now);
         assertEquals(0, restored.onTreatments(history, cfg(), msgs, true, now + 5000));
 
         // 5. новое событие следующего опроса — доставляется ровно один раз
         TreatmentEvent fresh = new TreatmentEvent("new-1", now - 60_000, 0, 2.0, "Bolus");
         assertEquals(1, restored.onTreatments(
                 Arrays.asList(fresh), cfg(), msgs, true, now + 10_000));
-        restored.drain(sender, 42, now + 10_000);
+        now += 10_000;
+        restored.drain(sender, 42);
         assertEquals(1, sender.calls.size());
         assertTrue(sender.calls.get(0).text.startsWith("ins:"));
         assertEquals(0, restored.onTreatments(
@@ -406,15 +414,16 @@ public class DeliveryCoordinatorTest {
         List<TreatmentEvent> history = XdripJson.parseTreatments(
                 TestUtil.fixture("treatments_xdrip.json"));
         assertEquals(0, coordinator.onTreatments(history, cfg(), msgs, true, now));
-        coordinator.drain(sender, 42, now);
+        coordinator.drain(sender, 42);
         assertTrue(sender.calls.isEmpty());
 
         // после рестарта новое событие — один раз
-        DeliveryCoordinator restored = DeliveryCoordinator.load(coordinator.save());
+        DeliveryCoordinator restored = DeliveryCoordinator.load(coordinator.save(), () -> now);
         TreatmentEvent fresh = new TreatmentEvent("n2", now - 30_000, 0, 1.0, "Bolus");
         assertEquals(1, restored.onTreatments(
                 Arrays.asList(fresh), cfg(), msgs, true, now + 5000));
-        restored.drain(sender, 42, now + 5000);
+        now += 5000;
+        restored.drain(sender, 42);
         assertEquals(1, sender.calls.size());
     }
 
@@ -440,7 +449,7 @@ public class DeliveryCoordinatorTest {
         TreatmentEvent fresh = new TreatmentEvent("n1", now - 30_000, 15, 0, "Carbs");
         assertEquals(1, coordinator.onTreatments(
                 Arrays.asList(fresh), cfg(), msgs, true, now));
-        coordinator.drain(sender, 42, now);
+        coordinator.drain(sender, 42);
         assertEquals(1, sender.calls.size());
     }
 
@@ -450,14 +459,15 @@ public class DeliveryCoordinatorTest {
     public void pendingSurvivesRestart() {
         enqueueLowBg();
         sender.setRule((p, t, rid) -> SendResult.RETRYABLE);
-        coordinator.drain(sender, 42, now);
+        coordinator.drain(sender, 42);
         int rid = sender.calls.get(0).randomId;
 
         // «перезапуск процесса»: состояние восстановлено из сериализованной строки
-        DeliveryCoordinator restored = DeliveryCoordinator.load(coordinator.save());
+        DeliveryCoordinator restored = DeliveryCoordinator.load(coordinator.save(), () -> now);
         assertEquals(2, restored.pendingCount());
         sender.setRule((p, t, rid2) -> SendResult.SENT);
-        DeliveryCoordinator.Summary s = restored.drain(sender, 42, now + 60_000);
+        now += 60_000;
+        DeliveryCoordinator.Summary s = restored.drain(sender, 42);
         assertEquals(2, s.sent);
         assertEquals(rid, sender.calls.get(2).randomId); // прежний random_id
     }
@@ -468,19 +478,21 @@ public class DeliveryCoordinatorTest {
     public void authFailureStopsRetriesUntilTokenChanges() {
         enqueueLowBg();
         sender.setRule((p, t, rid) -> SendResult.AUTH_FAILED);
-        DeliveryCoordinator.Summary s = coordinator.drain(sender, 42, now);
+        DeliveryCoordinator.Summary s = coordinator.drain(sender, 42);
         assertTrue(coordinator.isAuthFailed());
         assertEquals(1, s.authFailures); // после первой auth-ошибки обход останавливается
 
         // с тем же токеном повторять бессмысленно
         sender.calls.clear();
-        coordinator.drain(sender, 42, now + 60_000);
+        now += 60_000;
+        coordinator.drain(sender, 42);
         assertTrue(sender.calls.isEmpty());
 
         // смена токена снимает блокировку: недоставленное (alert) уходит,
         // терминальное (regular, помеченное auth) не воскресает
         sender.setRule((p, t, rid) -> SendResult.SENT);
-        DeliveryCoordinator.Summary s2 = coordinator.drain(sender, 43, now + 120_000);
+        now += 120_000;
+        DeliveryCoordinator.Summary s2 = coordinator.drain(sender, 43);
         assertEquals(1, s2.sent);
         assertEquals(ALERT_PEER, sender.calls.get(0).peerId);
     }
@@ -489,9 +501,131 @@ public class DeliveryCoordinatorTest {
     public void networkErrorIsNotMaskedAsSuccess() {
         enqueueLowBg();
         sender.setRule((p, t, rid) -> SendResult.RETRYABLE);
-        DeliveryCoordinator.Summary s = coordinator.drain(sender, 42, now);
+        DeliveryCoordinator.Summary s = coordinator.drain(sender, 42);
         assertEquals(0, s.sent);
         assertTrue(s.hasPendingFailures());
         assertEquals(2, coordinator.pendingCount());
+    }
+
+    // ---------- срок действия перед каждой отправкой (№2Б.1) ----------
+
+    @Test
+    public void expiryRecheckedBeforeEverySend() {
+        enqueueLowBg(); // обычное + тревога одного показания
+        long t0 = now;
+        // первая отправка «длится» до истечения срока второго сообщения
+        sender.setRule((p, t, rid) -> {
+            now = t0 + ReadingGate.MAX_AGE_MS + 1;
+            return SendResult.SENT;
+        });
+        DeliveryCoordinator.Summary s = coordinator.drain(sender, 42);
+        assertEquals(1, sender.calls.size()); // второй sender не вызван
+        assertEquals(1, s.sent);
+        assertEquals(1, s.expired);
+        assertEquals(0, coordinator.pendingCount());
+    }
+
+    @Test
+    public void retryBackoffFromAttemptCompletionNotSweepStart() {
+        coordinator.onReading(reading(120, now - 60_000, "Flat"),
+                DeliveryCoordinator.Source.AUTO, cfg(), msgs, now);
+        long t0 = now;
+        // сетевая попытка занимает 20 секунд
+        sender.setRule((p, t, rid) -> {
+            now += 20_000;
+            return SendResult.RETRYABLE;
+        });
+        coordinator.drain(sender, 42);
+        // 5-секундный backoff отсчитывается от завершения попытки: t0+20с+5с
+        assertEquals(t0 + 25_000, coordinator.nextDueAt());
+    }
+
+    @Test
+    public void expiryAndRandomIdSurviveSaveLoad() {
+        coordinator.onReading(reading(120, now - 60_000, "Flat"),
+                DeliveryCoordinator.Source.AUTO, cfg(), msgs, now);
+        PendingMessage m = coordinator.pendingMessages().get(0);
+        long exp = m.expiresAtMs;
+        int rid = m.randomId;
+        assertNotEquals(0, rid);
+        assertEquals(now - 60_000 + ReadingGate.MAX_AGE_MS, exp);
+
+        DeliveryCoordinator restored = DeliveryCoordinator.load(coordinator.save(), () -> now);
+        assertEquals(1, restored.pendingCount());
+        PendingMessage r2 = restored.pendingMessages().get(0);
+        assertEquals(exp, r2.expiresAtMs);
+        assertEquals(rid, r2.randomId);
+    }
+
+    // ---------- auth-блок и планирование (№2Б.1) ----------
+
+    @Test
+    public void authBlockSchedulesExpiryCleanupNotPerSecondLoop() {
+        enqueueLowBg();
+        sender.setRule((p, t, rid) ->
+                p.equals(PEER) ? SendResult.AUTH_FAILED : SendResult.SENT);
+        DeliveryCoordinator.Summary s = coordinator.drain(sender, 42);
+        assertEquals(1, s.authFailures);
+        assertTrue(coordinator.isAuthFailed());
+        assertEquals(1, coordinator.pendingCount()); // тревога осталась в очереди
+        // следующее пробуждение — по сроку истечения, не через секунду
+        assertTrue(coordinator.nextDueAt() > now + 1_000);
+
+        // повторный обход с тем же токеном — сетевых попыток нет
+        sender.calls.clear();
+        now += 2_000;
+        coordinator.drain(sender, 42);
+        assertTrue(sender.calls.isEmpty());
+
+        // новое показание при auth-блоке тоже не запускает посекундный цикл
+        coordinator.onReading(reading(60, now - 30_000, "Flat"),
+                DeliveryCoordinator.Source.AUTO, cfg(), msgs, now);
+        sender.calls.clear();
+        coordinator.drain(sender, 42);
+        assertTrue(sender.calls.isEmpty());
+        assertTrue(coordinator.nextDueAt() > now + 1_000);
+    }
+
+    @Test
+    public void retryableWithoutAuthKeepsBackoff() {
+        coordinator.onReading(reading(120, now - 60_000, "Flat"),
+                DeliveryCoordinator.Source.AUTO, cfg(), msgs, now);
+        sender.setRule((p, t, rid) -> SendResult.RETRYABLE);
+        coordinator.drain(sender, 42);
+        assertEquals(now + 5_000, coordinator.nextDueAt()); // первый backoff 5 с
+    }
+
+    // ---------- тревожный адресат (№2Б.1) ----------
+
+    @Test
+    public void alertPeerZeroOrEmptyNotEnqueued() {
+        // "0" — невыбранный чат: тревоги нет в очереди, обычное доставляется
+        DeliveryCoordinator.Config c0 = new DeliveryCoordinator.Config(
+                PEER, "0", true, true,
+                AlertThresholds.parseMmol("4.1", "12.2"), 42);
+        coordinator.onReading(reading(54, now - 60_000, "SingleDown"),
+                DeliveryCoordinator.Source.AUTO, c0, msgs, now);
+        assertEquals(1, coordinator.pendingCount());
+        for (PendingMessage m : coordinator.pendingMessages()) {
+            assertNotEquals("0", m.peerId);
+        }
+        coordinator.drain(sender, 42);
+        assertEquals(1, sender.calls.size());
+        assertEquals(PEER, sender.calls.get(0).peerId);
+
+        // пустой тревожный адресат — тот же результат
+        DeliveryCoordinator c1 = new DeliveryCoordinator(() -> now);
+        DeliveryCoordinator.Config ce = new DeliveryCoordinator.Config(
+                PEER, "", true, true,
+                AlertThresholds.parseMmol("4.1", "12.2"), 42);
+        c1.onReading(reading(54, now - 60_000, "SingleDown"),
+                DeliveryCoordinator.Source.AUTO, ce, msgs, now);
+        assertEquals(1, c1.pendingCount());
+
+        // корректный тревожный адресат — обычное и тревога учитываются независимо
+        DeliveryCoordinator c2 = new DeliveryCoordinator(() -> now);
+        c2.onReading(reading(54, now - 60_000, "SingleDown"),
+                DeliveryCoordinator.Source.AUTO, cfg(), msgs, now);
+        assertEquals(2, c2.pendingCount());
     }
 }

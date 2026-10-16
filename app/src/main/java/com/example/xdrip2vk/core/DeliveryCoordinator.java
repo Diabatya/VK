@@ -76,12 +76,26 @@ public final class DeliveryCoordinator {
     }
 
     private final Outbox outbox = new Outbox();
+    private final Clock clock;
     private long lastSeenBgMs;
     private boolean treatmentsInitialized;
     private final LinkedHashSet<String> seenTreatmentIds = new LinkedHashSet<>();
     private boolean authFailed;
     private int authFailedTokenHash;
     private final SecureRandom random = new SecureRandom();
+
+    public DeliveryCoordinator() {
+        this(Clock.SYSTEM);
+    }
+
+    public DeliveryCoordinator(Clock clock) {
+        this.clock = clock;
+    }
+
+    /** Адресат VK валиден: непустой и не «0» (невыбранный чат). */
+    static boolean isValidPeer(String peer) {
+        return peer != null && !peer.isEmpty() && !"0".equals(peer);
+    }
 
     // ---------- SGV ----------
 
@@ -103,7 +117,7 @@ public final class DeliveryCoordinator {
             // Повтор того же показания через другой канал — не новое событие.
             // Если сообщение ещё в очереди, повтор обработает drain().
             if (src == Source.MANUAL && v == ReadingGate.Verdict.FRESH
-                    && cfg.configured && !cfg.normalPeer.isEmpty()
+                    && cfg.configured && isValidPeer(cfg.normalPeer)
                     && !outbox.hasPendingForPrefix("bg:" + r.timestampMs)) {
                 // Ручная отправка доставленного показания — новое логическое сообщение
                 enqueue(new PendingMessage(
@@ -121,7 +135,7 @@ public final class DeliveryCoordinator {
         if (v == ReadingGate.Verdict.STALE) {
             return ReadingOutcome.STALE;
         }
-        if (!cfg.configured || cfg.normalPeer.isEmpty()) {
+        if (!cfg.configured || !isValidPeer(cfg.normalPeer)) {
             return ReadingOutcome.ACCEPTED; // запомнили, но отправлять некуда
         }
 
@@ -140,7 +154,7 @@ public final class DeliveryCoordinator {
                     cfg.normalPeer, msgs.regular(r), newRandomId(), expires));
         }
 
-        if (cfg.alertsEnabled && !cfg.alertPeer.isEmpty()) {
+        if (cfg.alertsEnabled && isValidPeer(cfg.alertPeer)) {
             AlertThresholds.Level level = cfg.thresholds.classify(r.sgvMgdl);
             if (level != AlertThresholds.Level.NORMAL) {
                 enqueue(new PendingMessage(
@@ -183,7 +197,7 @@ public final class DeliveryCoordinator {
         });
 
         int added = 0;
-        boolean canSend = enabled && cfg.configured && !cfg.normalPeer.isEmpty();
+        boolean canSend = enabled && cfg.configured && isValidPeer(cfg.normalPeer);
         for (TreatmentEvent e : sorted) {
             if (e.id.isEmpty() || seenTreatmentIds.contains(e.id)) {
                 continue;
@@ -226,16 +240,27 @@ public final class DeliveryCoordinator {
      * Попытка доставить все готовые сообщения. Каждое сообщение независимо:
      * успех одного не подтверждает другие. Ошибка авторизации помечает сообщение
      * терминальным и блокирует повторы до смены токена.
+     *
+     * Время запрашивается у clock непосредственно перед каждой отправкой:
+     * если пока шла предыдущая сетевая попытка срок сообщения истёк,
+     * отправка не начинается. Backoff отсчитывается от завершения попытки.
      */
-    public Summary drain(Sender sender, int tokenHash, long now) {
+    public Summary drain(Sender sender, int tokenHash) {
         if (authFailed && tokenHash != authFailedTokenHash) {
             authFailed = false; // токен сменился — пробуем снова
         }
         Summary s = new Summary();
-        s.expired += outbox.removeExpired(now);
+        s.expired += outbox.removeExpired(clock.now());
 
         for (PendingMessage m : new ArrayList<>(outbox.all())) {
-            if (m.terminal || m.expiresAtMs <= now || m.notBeforeMs > now) {
+            long t = clock.now();
+            if (m.terminal || m.notBeforeMs > t) {
+                continue;
+            }
+            if (m.expiresAtMs <= t) {
+                // просрочено пока выполнялась предыдущая отправка — не шлём
+                outbox.remove(m.key);
+                s.expired++;
                 continue;
             }
             if (authFailed) {
@@ -250,13 +275,14 @@ public final class DeliveryCoordinator {
             if (res == null) {
                 res = SendResult.RETRYABLE;
             }
+            long done = clock.now(); // время завершения сетевой попытки
             switch (res) {
                 case SENT:
                     outbox.onSent(m.key);
                     s.sent++;
                     break;
                 case RETRYABLE:
-                    outbox.onRetry(m.key, now);
+                    outbox.onRetry(m.key, done); // backoff от завершения попытки
                     s.retried++;
                     break;
                 case AUTH_FAILED:
@@ -272,20 +298,43 @@ public final class DeliveryCoordinator {
                     break;
             }
         }
-        s.expired += outbox.removeExpired(now);
+        s.expired += outbox.removeExpired(clock.now());
         return s;
     }
 
-    public long nextDueAt(long now) {
+    /**
+     * Ближайшее время, когда стоит проснуться, или -1.
+     * При auth-блокировке сетевых попыток нет — планируется только очистка
+     * по ближайшему сроку истечения, а не посекундный drain.
+     */
+    public long nextDueAt() {
+        long now = clock.now();
+        if (authFailed) {
+            long best = -1;
+            for (PendingMessage m : outbox.all()) {
+                if (m.terminal || m.expiresAtMs <= now) {
+                    continue;
+                }
+                if (best < 0 || m.expiresAtMs < best) {
+                    best = m.expiresAtMs;
+                }
+            }
+            return best;
+        }
         return outbox.nextDueAt(now);
     }
 
-    public boolean hasDue(long now) {
-        return outbox.hasDue(now);
+    public boolean hasDue() {
+        return outbox.hasDue(clock.now());
     }
 
     public int pendingCount() {
         return outbox.pendingCount(false);
+    }
+
+    /** Число терминально недоставленных сообщений, оставшихся в очереди. */
+    public int terminalCount() {
+        return outbox.pendingCount(true) - outbox.pendingCount(false);
     }
 
     public List<PendingMessage> pendingMessages() {
@@ -327,7 +376,11 @@ public final class DeliveryCoordinator {
     }
 
     public static DeliveryCoordinator load(String json) {
-        DeliveryCoordinator c = new DeliveryCoordinator();
+        return load(json, Clock.SYSTEM);
+    }
+
+    public static DeliveryCoordinator load(String json, Clock clock) {
+        DeliveryCoordinator c = new DeliveryCoordinator(clock);
         if (json == null || json.isEmpty()) {
             return c;
         }

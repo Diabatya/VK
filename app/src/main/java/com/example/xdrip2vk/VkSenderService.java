@@ -56,6 +56,9 @@ public class VkSenderService extends Service {
     // Тестовая точка подмены отправителя для unit-тестов под Robolectric.
     static volatile DeliveryCoordinator.Sender senderOverride;
 
+    // Последняя реально назначенная задержка drainRunnable (для тестов планировщика).
+    volatile long lastDrainDelayMs = -1;
+
     /** Looper фонового потока — для прокачки очереди в тестах. */
     android.os.Looper workerLooperForTest() {
         return handlerThread == null ? null : handlerThread.getLooper();
@@ -208,6 +211,13 @@ public class VkSenderService extends Service {
             updateNotification("Нет свежих данных от сенсора xDrip+: данные устарели или из будущего");
         }
         drainAndSchedule();
+        // Тревога не создана без выбранного чата — показываем явный статус
+        // поверх общего статуса доставки.
+        if (outcome == DeliveryCoordinator.ReadingOutcome.ACCEPTED
+                && cfg.alertsEnabled && cfg.alertPeer.isEmpty()
+                && cfg.thresholds.classify(r.sgvMgdl) != AlertThresholds.Level.NORMAL) {
+            updateNotification("Тревога не отправлена: для тревог не выбран чат — укажите его в настройках");
+        }
     }
 
     private DeliveryCoordinator.Config loadConfig() {
@@ -219,8 +229,11 @@ public class VkSenderService extends Service {
                 prefs.getString(PREF_ALERT_MIN_BG, AlertThresholds.DEFAULT_MIN_STR),
                 prefs.getString(PREF_ALERT_MAX_BG, AlertThresholds.DEFAULT_MAX_STR));
         boolean configured = !token.isEmpty() && chatId > 0;
+        // Невыбранный чат (id<=0) не превращаем в строку "0" — иначе создалось бы
+        // заведомо недоставимое сообщение для peer_id=0.
         return new DeliveryCoordinator.Config(
-                String.valueOf(chatId), String.valueOf(alertChatId),
+                chatId > 0 ? String.valueOf(chatId) : "",
+                alertChatId > 0 ? String.valueOf(alertChatId) : "",
                 alertEnabled, configured, thresholds,
                 token.isEmpty() ? 0 : token.hashCode());
     }
@@ -370,7 +383,15 @@ public class VkSenderService extends Service {
                 .build();
     }
 
+    private volatile CharSequence lastNotificationText;
+
+    /** Последний текст уведомления — для проверки статуса в тестах. */
+    CharSequence notificationForTest() {
+        return lastNotificationText;
+    }
+
     private void updateNotification(String text) {
+        lastNotificationText = text;
         NotificationManager manager = (NotificationManager) getSystemService(Context.NOTIFICATION_SERVICE);
         manager.notify(NOTIFICATION_ID, createNotification(text));
     }
@@ -445,25 +466,58 @@ public class VkSenderService extends Service {
                 ? senderOverride
                 : (peerId, text, randomId) -> VkApi.sendMessage(tokenF, peerId, text, randomId);
 
-        DeliveryCoordinator.Summary s = coordinator.drain(sender, token.hashCode(), now);
+        DeliveryCoordinator.Summary s = coordinator.drain(sender, token.hashCode());
         saveState();
         Logger.d(TAG, "Доставка: отправлено=" + s.sent + ", повторы=" + s.retried
                 + ", auth=" + s.authFailures + ", permanent=" + s.permanent + ", expired=" + s.expired);
 
+        updateDeliveryStatus(s);
+
+        long due = coordinator.nextDueAt();
+        if (due > 0) {
+            long delay = Math.max(due - System.currentTimeMillis(), 1000);
+            lastDrainDelayMs = delay; // для тестов планировщика
+            handler.removeCallbacks(drainRunnable);
+            handler.postDelayed(drainRunnable, delay);
+        } else {
+            lastDrainDelayMs = -1;
+        }
+    }
+
+    /**
+     * Статус уведомления по фактическому состоянию очереди, а не только по
+     * последнему Summary: успех одного сообщения не должен скрывать
+     * сохраняющуюся ошибку другого, а для terminal/permanent нельзя
+     * обещать повтор.
+     */
+    private void updateDeliveryStatus(DeliveryCoordinator.Summary s) {
+        long now = System.currentTimeMillis();
         if (coordinator.isAuthFailed()) {
             updateNotification("Ошибка авторизации VK — проверьте токен в настройках");
-        } else if (s.retried > 0 || s.permanent > 0) {
-            updateNotification("Часть сообщений не доставлена, повтор через "
-                    + Math.max(coordinator.nextDueAt(now) - now, 0) / 1000 + " сек");
-        } else if (s.sent > 0) {
+            return;
+        }
+        int pending = coordinator.pendingCount();
+        int terminal = coordinator.terminalCount();
+        if (pending > 0) {
+            long due = coordinator.nextDueAt();
+            if (due > 0) {
+                String suffix = terminal > 0 ? " (есть окончательные ошибки)" : "";
+                updateNotification("Часть сообщений не доставлена, повтор через "
+                        + Math.max(due - now, 0) / 1000 + " сек" + suffix);
+                return;
+            }
+        }
+        if (terminal > 0) {
+            updateNotification("Часть сообщений не доставлена — окончательная ошибка, повтор не планируется");
+            return;
+        }
+        if (s.expired > 0) {
+            updateNotification("Срок части сообщений истёк — данные устарели и не были отправлены");
+            return;
+        }
+        if (s.sent > 0) {
             SimpleDateFormat sdf = new SimpleDateFormat("HH:mm", Locale.getDefault());
             updateNotification("Успешно отправлено в ВК в " + sdf.format(new Date(now)));
-        }
-
-        long due = coordinator.nextDueAt(System.currentTimeMillis());
-        if (due > 0) {
-            handler.removeCallbacks(drainRunnable);
-            handler.postDelayed(drainRunnable, Math.max(due - System.currentTimeMillis(), 1000));
         }
     }
 

@@ -63,6 +63,11 @@ public final class Outbox {
         map.remove(key);
     }
 
+    /** Удаляет сообщение (например, истёкшее перед самой отправкой). */
+    public boolean remove(String key) {
+        return map.remove(key) != null;
+    }
+
     public void onRetry(String key, long now) {
         PendingMessage m = map.get(key);
         if (m == null) {

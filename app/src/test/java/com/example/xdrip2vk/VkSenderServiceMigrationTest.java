@@ -248,7 +248,9 @@ public class VkSenderServiceMigrationTest {
         s.onDestroy();
         String state = prefs.getString("delivery_state_v2", "");
         assertFalse(state.isEmpty());
-        DeliveryCoordinator restored = DeliveryCoordinator.load(state);
+        // после notBefore, до истечения срока сообщения
+        long drainNow = System.currentTimeMillis() + 5 * 60_000;
+        DeliveryCoordinator restored = DeliveryCoordinator.load(state, () -> drainNow);
         assertEquals(1, restored.pendingCount());
 
         // повтор использует прежний random_id
@@ -256,7 +258,7 @@ public class VkSenderServiceMigrationTest {
         restored.drain((p, t, r) -> {
             retryCalls.add(new Call(p, t, r));
             return SendResult.SENT;
-        }, 1, System.currentTimeMillis() + 5 * 60_000); // после notBefore, до истечения
+        }, 1);
         assertEquals(1, retryCalls.size());
         assertEquals(rid, retryCalls.get(0).rid);
     }
