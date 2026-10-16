@@ -335,7 +335,9 @@ public final class DeliveryCoordinator {
     public Summary drain(Sender sender, AuthContext auth,
                          java.util.function.BooleanSupplier authCurrent) {
         Summary s = new Summary();
-        if (outbox.removeExpired(clock.now()) > 0) {
+        int removedStart = outbox.removeExpired(clock.now());
+        if (removedStart > 0) {
+            s.expired += removedStart;
             persistDirty = true;
         }
         // Подтверждённая запись на диск до любой сети: при сбое процесса
@@ -365,15 +367,29 @@ public final class DeliveryCoordinator {
             if (sweepStopped || tokenBlocked || !auth.verified || !ownerMatches(m, auth)) {
                 continue; // очередь сохраняется, но сеть не трогаем
             }
-            if (!authCurrent.getAsBoolean()) {
-                s.aborted = true; // токен сменился/завершение — следующих отправок нет
-                break;
-            }
             // Checkpoint до сетевой попытки: random_id, адресат, владельцы,
             // expiry и поздняя привязка уже на диске. Отказ записи — эту и
             // следующие попытки не начинаем, attempts не увеличиваем.
             if (!persistNow()) {
                 s.persistFailed = true;
+                break;
+            }
+            // Повторные проверки ПОСЛЕ последней блокирующей записи: за время
+            // checkpoint мог истечь срок, смениться токен или начаться
+            // завершение — тогда send не выполняется.
+            t = clock.now();
+            if (m.expiresAtMs <= t) {
+                outbox.remove(m.key);
+                s.expired++;
+                persistDirty = true;
+                if (!persistNow()) { // удаление просроченного тоже на диск
+                    s.persistFailed = true;
+                    break;
+                }
+                continue;
+            }
+            if (!authCurrent.getAsBoolean()) {
+                s.aborted = true; // токен сменился/завершение — следующих отправок нет
                 break;
             }
             SendResult res;
@@ -428,7 +444,9 @@ public final class DeliveryCoordinator {
                 break;
             }
         }
-        if (outbox.removeExpired(clock.now()) > 0) {
+        int removedEnd = outbox.removeExpired(clock.now());
+        if (removedEnd > 0) {
+            s.expired += removedEnd;
             persistDirty = true;
         }
         return s;

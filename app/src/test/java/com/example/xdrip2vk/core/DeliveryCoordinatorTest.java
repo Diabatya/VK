@@ -921,4 +921,113 @@ public class DeliveryCoordinatorTest {
         coordinator.drain(sender, AUTH);
         assertEquals(until, coordinator.missedAlertUntil());
     }
+
+    // ---------- №2Б.3.1: проверки после checkpoint и полный учёт expired ----------
+
+    @Test
+    public void expiryRecheckedAfterCheckpointBeforeSend() {
+        // Сообщение под неподтверждённым владельцем, но известным владельцем чатов.
+        DeliveryCoordinator.Config cfg = new DeliveryCoordinator.Config(
+                PEER, "", false, true,
+                AlertThresholds.parseMmol("4.1", "12.2"),
+                AuthContext.unverified("fp1"), "user:1");
+        coordinator.onReading(reading(120, now, "Flat"),
+                DeliveryCoordinator.Source.AUTO, cfg, msgs, now);
+        assertEquals(1, coordinator.pendingCount());
+
+        // Checkpoint #1 — очередь; #2 — поздняя привязка; внутри #2 часы за expiry.
+        int[] writes = {0};
+        coordinator.setCheckpoint(() -> {
+            writes[0]++;
+            if (writes[0] == 2) {
+                now += 20 * 60_000; // срок истёк за время записи привязки
+            }
+            return true;
+        });
+        DeliveryCoordinator.Summary s = coordinator.drain(
+                sender, AuthContext.verified("fp1", "user:1"));
+
+        assertEquals("send выполнен для просроченного во время checkpoint",
+                0, sender.calls.size());
+        assertTrue(s.expired >= 1);
+        assertEquals(0, coordinator.pendingCount());
+        assertTrue("удаление просроченного записано на диск", writes[0] >= 3);
+    }
+
+    @Test
+    public void authCurrentFalseInsideCheckpointAbortsBeforeSend() {
+        DeliveryCoordinator.Config cfg = new DeliveryCoordinator.Config(
+                PEER, "", false, true,
+                AlertThresholds.parseMmol("4.1", "12.2"),
+                AuthContext.unverified("fp1"), "user:1");
+        coordinator.onReading(reading(120, now, "Flat"),
+                DeliveryCoordinator.Source.AUTO, cfg, msgs, now);
+
+        boolean[] current = {true};
+        coordinator.setCheckpoint(() -> {
+            current[0] = false; // токен сменился/завершение во время записи
+            return true;
+        });
+        DeliveryCoordinator.Summary s = coordinator.drain(sender,
+                AuthContext.verified("fp1", "user:1"), () -> current[0]);
+
+        assertEquals(0, sender.calls.size());
+        assertTrue(s.aborted);
+        assertEquals(1, coordinator.pendingCount());
+        assertEquals(0, coordinator.pendingMessages().get(0).attempts);
+    }
+
+    @Test
+    public void expiredFullyCountedAtDrainBoundaries() {
+        // просроченное ДО обхода
+        coordinator.onReading(reading(120, now, "Flat"),
+                DeliveryCoordinator.Source.AUTO, cfg(), msgs, now);
+        now += 20 * 60_000;
+        DeliveryCoordinator.Summary s = coordinator.drain(sender, AUTH);
+        assertEquals(1, s.expired);
+        assertEquals(0, coordinator.pendingCount());
+        assertEquals(0, sender.calls.size());
+    }
+
+    @Test
+    public void expiredCountedForMessageExpiringDuringLastSend() {
+        // msg1 ждёт повтора (notBefore), msg2 отправляется; за время send часы
+        // уходят за expiry msg1 — финальная очистка обязана её учесть.
+        coordinator.onReading(reading(120, now - 60_000, "Flat"),
+                DeliveryCoordinator.Source.AUTO, cfg(), msgs, now - 60_000);
+        sender.setRule((p, t, r) -> SendResult.RETRYABLE);
+        coordinator.drain(sender, AUTH); // msg1 → notBefore +5с
+
+        now += 60_000;
+        coordinator.onReading(reading(118, now - 30_000, "Flat"),
+                DeliveryCoordinator.Source.AUTO, cfg(), msgs, now);
+        // за время send msg1 срок msg2 истёк — повторная проверка/финальная
+        // очистка обязаны учесть его, причём ровно один раз
+        sender.calls.clear();
+        sender.setRule((p, t, r) -> {
+            now += 20 * 60_000;
+            return SendResult.SENT;
+        });
+        DeliveryCoordinator.Summary s = coordinator.drain(sender, AUTH);
+        assertEquals(1, sender.calls.size()); // во втором обходе отправлена только msg1
+        assertEquals(1, s.sent);
+        assertEquals(1, s.expired); // msg2 просрочено — учтено один раз
+        assertEquals(0, coordinator.pendingCount());
+    }
+
+    @Test
+    public void expiredBetweenSendsCountedOnce() {
+        coordinator.onReading(reading(54, now - 60_000, "SingleDown"),
+                DeliveryCoordinator.Source.AUTO, cfg(), msgs, now - 60_000);
+        // обычное + тревога; за время первого send вторая часть устаревает
+        sender.setRule((p, t, r) -> {
+            now += 20 * 60_000;
+            return SendResult.SENT;
+        });
+        DeliveryCoordinator.Summary s = coordinator.drain(sender, AUTH);
+        assertEquals(1, sender.calls.size());
+        assertEquals(1, s.sent);
+        assertEquals(1, s.expired); // вторая часть просрочена — учтена один раз
+        assertEquals(0, coordinator.pendingCount());
+    }
 }

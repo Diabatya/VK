@@ -105,6 +105,27 @@ public class VkSenderService extends Service {
     /** Экземпляр завершается: новые poll/drain/send и перепланирование запрещены. */
     private volatile boolean shuttingDown;
 
+    /** Worker умер по необработанному исключению — экземпляр неработоспособен. */
+    volatile boolean workerFailed;
+
+    /**
+     * Аварийное состояние после ошибки worker-потока. Пересоздание пустого
+     * потока создало бы видимость работы с потерянными задачами — вместо
+     * этого экземпляр помечается неработоспособным и завершается:
+     * isRunning=false, foreground-уведомление снимается в onDestroy, а
+     * следующий запуск поднимает новый worker и очередь из подтверждённого
+     * checkpoint. Два одновременно отправляющих worker не существует.
+     * Вызывается из UncaughtExceptionHandler; прямой вызов — моделирование.
+     */
+    void onWorkerFailure(Thread thread, Throwable ex) {
+        Logger.e(TAG, "Критическая ошибка в фоновом потоке: "
+                + (ex == null ? "unknown" : ex.getMessage()));
+        workerFailed = true;
+        isRunning = false; // сервис больше не считается работающим
+        handler = null; // поток мёртв — post'ы на него больше не принимаются
+        stopSelf(); // упорядоченное завершение экземпляра на главном потоке
+    }
+
     // Ограниченный повтор записи при отказе диска — без посекундного цикла.
     private static final long PERSIST_RETRY_MS = 30_000;
     private static final int PERSIST_RETRY_MAX = 5;
@@ -142,14 +163,7 @@ public class VkSenderService extends Service {
 
         createNotificationChannel();
         handlerThread = new HandlerThread("VkSenderThread");
-        handlerThread.setUncaughtExceptionHandler((thread, ex) -> {
-            Logger.e(TAG, "Критическая ошибка в фоновом потоке: " + ex.getMessage());
-            // Пересоздание пустого потока создало бы видимость работы с
-            // потерянными задачами: очередь runnable и позиция обхода не
-            // восстанавливаются. Помечаем поток мёртвым — сервис перезапустит
-            // система (START_STICKY/alarm), состояние на диске актуально.
-            handler = null;
-        });
+        handlerThread.setUncaughtExceptionHandler(this::onWorkerFailure);
         handlerThread.start();
         handler = new Handler(handlerThread.getLooper());
 
@@ -183,6 +197,11 @@ public class VkSenderService extends Service {
     @Override
     public int onStartCommand(Intent intent, int flags, int startId) {
         Logger.d(TAG, "Команда старта сервиса");
+        if (workerFailed) {
+            // Аварийный экземпляр: команду не «проглатываем» — START_STICKY
+            // запрашивает у системы перезапуск рабочего экземпляра.
+            return START_STICKY;
+        }
         isRunning = true;
 
         if (intent == null || handler == null) {
@@ -389,14 +408,25 @@ public class VkSenderService extends Service {
         // Главный поток сеть не ждёт.
         final Handler h = handler;
         final HandlerThread t = handlerThread;
+        boolean shutdownPosted = false;
         if (h != null && t != null) {
-            h.post(() -> {
-                // последний checkpoint: результат начатой попытки и всё «грязное»
-                if (coordinator != null) {
-                    coordinator.persistNow();
-                }
-                t.quitSafely();
-            });
+            try {
+                shutdownPosted = h.post(() -> {
+                    // последний checkpoint: результат начатой попытки и всё «грязное»
+                    if (coordinator != null) {
+                        coordinator.persistNow();
+                    }
+                    t.quitSafely();
+                });
+            } catch (Exception ignored) {
+                // looper уже мёртв — хвостовую задачу поставить нельзя
+            }
+        }
+        if (!shutdownPosted && t != null) {
+            // worker уже мёртв (аварийное состояние): последнее подтверждённое
+            // состояние уже на диске — сериализовать coordinator с главного
+            // потока нельзя, просто завершаем поток.
+            t.quitSafely();
         }
         if (wakeLock != null && wakeLock.isHeld()) {
             wakeLock.release();

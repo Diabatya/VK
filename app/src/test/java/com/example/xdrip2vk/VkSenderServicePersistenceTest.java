@@ -48,6 +48,8 @@ public class VkSenderServicePersistenceTest {
         final List<String> writeThreads = new ArrayList<>();
         boolean failNextWrite;
         boolean failWrites;
+        /** Вызывается внутри успешной записи — для моделирования событий «во время checkpoint». */
+        Runnable onWrite;
 
         @Override
         public String read() {
@@ -62,6 +64,9 @@ public class VkSenderServicePersistenceTest {
                 return false;
             }
             history.add(json);
+            if (onWrite != null) {
+                onWrite.run();
+            }
             return true;
         }
     }
@@ -402,5 +407,170 @@ public class VkSenderServicePersistenceTest {
             assertTrue("запись состояния вне рабочего потока: " + threadName,
                     threadName.contains("VkSenderThread"));
         }
+    }
+
+    // --- №2Б.3.1: проверки после checkpoint и аварийное состояние ---
+
+    /**
+     * Вызывает действие внутри checkpoint-записи, содержащей позднюю
+     * привязку владельца ("snd":"<owner>") — это последняя блокирующая
+     * запись перед сетевой попыткой.
+     */
+    private void onBindingWrite(Runnable action) {
+        store.onWrite = () -> {
+            String json = store.history.get(store.history.size() - 1);
+            if (json.contains("\"snd\":\"user:1\"")) {
+                store.onWrite = null;
+                action.run();
+            }
+        };
+    }
+
+    @Test
+    public void destroyInsideCheckpointSkipsSend() {
+        VkSenderService s = startService();
+        s.onStartCommand(autoUpdate(120, System.currentTimeMillis() - 60_000), 0, 1);
+        idle(s);
+        assertEquals(1, peers.size()); // user:1 подтверждён
+
+        // Новый токен ещё не подтверждён: очередь создаётся без владельца,
+        // привязка выполняется в drain после verify — именно в той записи
+        // и начинается завершение (воспроизведение из замечания).
+        TokenStorage.setToken(context, "SYNTHETIC_TOKEN_B");
+        onBindingWrite(s::onDestroy);
+        s.onStartCommand(autoUpdate(121, System.currentTimeMillis() - 30_000), 0, 2);
+        idle(s);
+
+        assertEquals("send выполнен после начала завершения: " + peers,
+                1, peers.size());
+        // сообщение не потеряно и сохранено в последнем подтверждённом снимке
+        DeliveryCoordinator restored = DeliveryCoordinator.load(store.read());
+        assertEquals(1, restored.pendingCount());
+        assertEquals(0, restored.pendingMessages().get(0).attempts);
+    }
+
+    @Test
+    public void tokenSwapInsideCheckpointNeedsVerifyBeforeSend() {
+        VkSenderService s = startService();
+        s.onStartCommand(autoUpdate(120, System.currentTimeMillis() - 60_000), 0, 1);
+        idle(s);
+        assertEquals(1, peers.size());
+        int rid = rids.get(0);
+
+        TokenStorage.setToken(context, "SYNTHETIC_TOKEN_B"); // пока неподтверждён
+        // токен меняется ещё раз ВНУТРИ checkpoint поздней привязки
+        final List<String> verified = new ArrayList<>();
+        verifier = (token) -> {
+            verified.add(token);
+            return "user:1"; // B и C — тот же владелец
+        };
+        onBindingWrite(() -> TokenStorage.setToken(context, "SYNTHETIC_TOKEN_C"));
+        s.onStartCommand(autoUpdate(121, System.currentTimeMillis() - 30_000), 0, 2);
+        idle(s);
+
+        // send выполнен только ПОСЛЕ проверки владельца версии C
+        assertTrue("C не был проверен до отправки",
+                verified.contains("SYNTHETIC_TOKEN_C"));
+        assertEquals(2, peers.size());
+        assertNotEquals(rid, rids.get(1).intValue()); // новое сообщение — свой rid
+        s.onDestroy();
+    }
+
+    @Test
+    public void tokenSwapInsideCheckpointForeignOwnerBlocks() {
+        VkSenderService s = startService();
+        s.onStartCommand(autoUpdate(120, System.currentTimeMillis() - 60_000), 0, 1);
+        idle(s);
+        assertEquals(1, peers.size());
+
+        TokenStorage.setToken(context, "SYNTHETIC_TOKEN_B");
+        verifier = (token) -> token.equals("SYNTHETIC_TOKEN_C") ? "user:2" : "user:1";
+        onBindingWrite(() -> TokenStorage.setToken(context, "SYNTHETIC_TOKEN_C"));
+        s.onStartCommand(autoUpdate(121, System.currentTimeMillis() - 30_000), 0, 2);
+        idle(s);
+
+        assertEquals("send после смены токена на чужой аккаунт: " + peers,
+                1, peers.size());
+        assertEquals(0, TokenStorage.getChatId(context));
+        s.onDestroy();
+    }
+
+    @Test
+    public void tokenSwapInsideCheckpointUnverifiedBlocks() {
+        VkSenderService s = startService();
+        s.onStartCommand(autoUpdate(120, System.currentTimeMillis() - 60_000), 0, 1);
+        idle(s);
+        assertEquals(1, peers.size());
+
+        TokenStorage.setToken(context, "SYNTHETIC_TOKEN_B");
+        verifier = (token) -> token.equals("SYNTHETIC_TOKEN_C") ? null : "user:1";
+        onBindingWrite(() -> TokenStorage.setToken(context, "SYNTHETIC_TOKEN_C"));
+        s.onStartCommand(autoUpdate(121, System.currentTimeMillis() - 30_000), 0, 2);
+        idle(s);
+
+        assertEquals("send при неподтверждённом новом токене: " + peers,
+                1, peers.size());
+        assertEquals(1, s.pendingForTest().size());
+        s.onDestroy();
+    }
+
+    @Test
+    public void expiredShownByServiceNotMisleadingStatus() {
+        // состояние с уже просроченным сообщением — до запуска сервиса
+        store.history.add("{\"v\":1,\"lastSeenBgMs\":0,\"treatInit\":false,"
+                + "\"blockedFp\":\"\",\"missedAlertMs\":0,\"seenTreat\":[],"
+                + "\"outbox\":{\"messages\":[{"
+                + "\"key\":\"bg:1\",\"peer\":\"777\",\"text\":\"old\",\"rid\":555,"
+                + "\"exp\":" + (System.currentTimeMillis() - 60_000)
+                + ",\"att\":0,\"nb\":0,\"term\":false,\"err\":\"\","
+                + "\"snd\":\"user:1\",\"fp\":\"fp1\",\"po\":\"user:1\"}]}}");
+        VkSenderService s = startService();
+        idle(s);
+
+        assertEquals(0, peers.size()); // просроченное не отправляется
+        assertEquals(0, s.pendingForTest().size()); // и очищено
+        String text = lastNotificationText(s);
+        assertTrue("ожидался статус истёкшего срока: " + text,
+                text.contains("истёк") || text.contains("устарел"));
+        s.onDestroy();
+    }
+
+    @Test
+    public void workerFailureLeavesDegradedStateAndRestartRestores() {
+        VkSenderService s = startService();
+        rule = (peer) -> SendResult.RETRYABLE;
+        s.onStartCommand(autoUpdate(120, System.currentTimeMillis() - 60_000), 0, 1);
+        idle(s);
+        assertTrue(VkSenderService.isRunning());
+        assertEquals(1, peers.size());
+        int rid = rids.get(0);
+
+        // МОДЕЛИРОВАНИЕ ошибки worker — прямой вызов обработчика,
+        // не реальное падение процесса.
+        s.onWorkerFailure(Thread.currentThread(), new RuntimeException("test"));
+
+        assertFalse("сервис считается работающим после ошибки worker",
+                VkSenderService.isRunning());
+        assertTrue(s.workerFailed);
+        // команда на умершем экземпляре не теряется молча — просит перезапуск
+        int rc = s.onStartCommand(autoUpdate(120, System.currentTimeMillis()), 0, 2);
+        assertEquals(android.app.Service.START_STICKY, rc);
+        s.onDestroy();
+        idle(s);
+
+        // модель: backoff уже истёк к моменту восстановления — зануляем nbMs
+        // в сохранённом снимке, не прибегая к sleep
+        int last = store.history.size() - 1;
+        store.history.set(last, store.history.get(last).replaceAll("\"nb\":\\d+", "\"nb\":0"));
+
+        // «Перезапуск» — новый экземпляр: очередь из подтверждённого снимка,
+        // отправка только после проверок, с прежним random_id
+        rule = null; // SENT
+        VkSenderService s2 = Robolectric.buildService(VkSenderService.class).create().get();
+        idle(s2);
+        assertEquals(2, peers.size());
+        assertEquals(rid, rids.get(1).intValue()); // прежний random_id
+        assertEquals(0, s2.pendingForTest().size());
+        s2.onDestroy();
     }
 }
