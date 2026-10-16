@@ -679,4 +679,86 @@ public class DeliveryCoordinatorTest {
         coordinator.drain(sender, 42);
         assertEquals(0, coordinator.missedAlertUntil());
     }
+
+    @Test
+    public void staleAlertRetryDoesNotClearNewerMissedAlert() {
+        // A: чат тревог выбран, тревога A поставлена, но получает RETRYABLE
+        coordinator.onReading(reading(54, now - 120_000, "SingleDown"),
+                DeliveryCoordinator.Source.AUTO, cfg(), msgs, now);
+        sender.setRule((p, t, r) ->
+                p.equals(ALERT_PEER) ? SendResult.RETRYABLE : SendResult.SENT);
+        coordinator.drain(sender, 42);
+        assertEquals(2, sender.calls.size());
+        assertEquals(1, coordinator.pendingCount()); // тревога A ждёт повтора
+
+        // чат убрали; более новое низкое B → тревога B пропущена
+        now += 30_000;
+        DeliveryCoordinator.Config noAlert = new DeliveryCoordinator.Config(
+                PEER, "", true, true,
+                AlertThresholds.parseMmol("4.1", "12.2"), 42);
+        coordinator.onReading(reading(50, now - 30_000, "SingleDown"),
+                DeliveryCoordinator.Source.AUTO, noAlert, msgs, now);
+        long missedUntil = coordinator.missedAlertUntil();
+        assertTrue(missedUntil > 0);
+
+        // успешный повтор старой тревоги A пропуск B не закрывает
+        sender.setRule((p, t, r) -> SendResult.SENT);
+        coordinator.drain(sender, 42);
+        assertEquals(missedUntil, coordinator.missedAlertUntil());
+    }
+
+    @Test
+    public void staleAlertRetryAfterSaveLoadDoesNotClearMissedAlert() {
+        coordinator.onReading(reading(54, now - 120_000, "SingleDown"),
+                DeliveryCoordinator.Source.AUTO, cfg(), msgs, now);
+        sender.setRule((p, t, r) ->
+                p.equals(ALERT_PEER) ? SendResult.RETRYABLE : SendResult.SENT);
+        coordinator.drain(sender, 42);
+        now += 30_000;
+        DeliveryCoordinator.Config noAlert = new DeliveryCoordinator.Config(
+                PEER, "", true, true,
+                AlertThresholds.parseMmol("4.1", "12.2"), 42);
+        coordinator.onReading(reading(50, now - 30_000, "SingleDown"),
+                DeliveryCoordinator.Source.AUTO, noAlert, msgs, now);
+        long missedUntil = coordinator.missedAlertUntil();
+        assertTrue(missedUntil > 0);
+
+        // очередь сохраняется и восстанавливается перед повтором A
+        coordinator = DeliveryCoordinator.load(coordinator.save(), () -> now);
+        assertEquals(missedUntil, coordinator.missedAlertUntil());
+        assertEquals(2, coordinator.pendingCount()); // тревога A + обычное B
+
+        sender.setRule((p, t, r) -> SendResult.SENT);
+        coordinator.drain(sender, 42);
+        assertEquals(missedUntil, coordinator.missedAlertUntil());
+    }
+
+    @Test
+    public void failedNewerAlertDoesNotClearMissedAlert() {
+        // пропуск: чат тревог не выбран
+        DeliveryCoordinator.Config noAlert = new DeliveryCoordinator.Config(
+                PEER, "", true, true,
+                AlertThresholds.parseMmol("4.1", "12.2"), 42);
+        coordinator.onReading(reading(54, now - 60_000, "SingleDown"),
+                DeliveryCoordinator.Source.AUTO, noAlert, msgs, now);
+        long until = coordinator.missedAlertUntil();
+        assertTrue(until > 0);
+        coordinator.drain(sender, 42); // обычное доставлено
+
+        // чат снова выбран, но новая тревога неуспешна — пропуск не закрывается
+        now += 30_000;
+        coordinator.onReading(reading(50, now - 30_000, "SingleDown"),
+                DeliveryCoordinator.Source.AUTO, cfg(), msgs, now);
+        sender.setRule((p, t, r) ->
+                p.equals(ALERT_PEER) ? SendResult.RETRYABLE : SendResult.SENT);
+        coordinator.drain(sender, 42);
+        assertEquals(until, coordinator.missedAlertUntil());
+
+        // и при терминальной ошибке тоже
+        sender.setRule((p, t, r) ->
+                p.equals(ALERT_PEER) ? SendResult.PERMANENT : SendResult.SENT);
+        now += 6_000;
+        coordinator.drain(sender, 42);
+        assertEquals(until, coordinator.missedAlertUntil());
+    }
 }

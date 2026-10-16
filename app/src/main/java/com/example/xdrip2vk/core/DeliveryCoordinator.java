@@ -290,8 +290,15 @@ public final class DeliveryCoordinator {
                 case SENT:
                     outbox.onSent(m.key);
                     s.sent++;
-                    if (m.key.startsWith("alert:")) {
-                        missedAlertUntilMs = 0; // тревога дошла — старый пропуск закрыт
+                    // Пропущенная тревога закрывается только доставкой тревоги
+                    // того же или более нового показания. У всех тревог окно
+                    // одинаковое (время показания + 15 мин), поэтому
+                    // expiresAtMs >= missedAlertUntilMs ⇔ показание не старше.
+                    // Успешный повтор старой тревоги запись о новом пропуске
+                    // не трогает; RETRYABLE/AUTH_FAILED/PERMANENT — тем более.
+                    if (m.key.startsWith("alert:") && missedAlertUntilMs > 0
+                            && m.expiresAtMs >= missedAlertUntilMs) {
+                        missedAlertUntilMs = 0;
                     }
                     break;
                 case RETRYABLE:

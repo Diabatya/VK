@@ -241,6 +241,32 @@ public class VkSenderServiceDeliveryTest {
     }
 
     @Test
+    public void staleAlertRetryDoesNotHideNewerMissedAlert() {
+        // A: чат тревог выбран; обычное ушло, тревога A — RETRYABLE
+        prefs.edit().putBoolean("alert_enabled", true).apply();
+        TokenStorage.setAlertChatId(context, 888);
+        VkSenderService s = startService();
+        rule = (peer) -> peer.equals("888") ? SendResult.RETRYABLE : SendResult.SENT;
+        s.onStartCommand(autoUpdate(54, System.currentTimeMillis() - 120_000), 0, 1);
+        idle(s);
+        assertEquals(2, peers.size());
+
+        // чат убрали; более новое низкое B → тревога B пропущена
+        TokenStorage.setAlertChatId(context, 0);
+        rule = (peer) -> SendResult.SENT;
+        s.onStartCommand(autoUpdate(50, System.currentTimeMillis() - 30_000), 0, 2);
+        idle(s);
+
+        // повтор старой тревоги A успешен — статус про пропущенную B остаётся
+        Shadows.shadowOf(s.workerLooperForTest())
+                .idleFor(java.time.Duration.ofSeconds(6));
+        String text = lastNotificationText(s);
+        assertTrue("повтор старой тревоги скрыл пропуск новой: " + text,
+                text.contains("не выбран чат"));
+        s.onDestroy();
+    }
+
+    @Test
     public void validAlertChatBothDeliveredShowsSuccess() {
         prefs.edit().putBoolean("alert_enabled", true).apply();
         TokenStorage.setAlertChatId(context, 888);
