@@ -51,15 +51,25 @@ public final class DeliveryCoordinator {
         public final boolean configured; // токен+чат заданы — есть смысл ставить в очередь
         public final AlertThresholds thresholds;
         public final AuthContext auth;
+        /** Владелец аккаунта, которому принадлежат выбранные чаты; "" — неизвестен. */
+        public final String chatOwner;
 
         public Config(String normalPeer, String alertPeer, boolean alertsEnabled,
                       boolean configured, AlertThresholds thresholds, AuthContext auth) {
+            this(normalPeer, alertPeer, alertsEnabled, configured, thresholds, auth,
+                    auth != null && auth.verified ? auth.senderId : "");
+        }
+
+        public Config(String normalPeer, String alertPeer, boolean alertsEnabled,
+                      boolean configured, AlertThresholds thresholds, AuthContext auth,
+                      String chatOwner) {
             this.normalPeer = normalPeer == null ? "" : normalPeer;
             this.alertPeer = alertPeer == null ? "" : alertPeer;
             this.alertsEnabled = alertsEnabled;
             this.configured = configured;
             this.thresholds = thresholds;
             this.auth = auth == null ? AuthContext.NONE : auth;
+            this.chatOwner = chatOwner == null ? "" : chatOwner;
         }
     }
 
@@ -69,6 +79,8 @@ public final class DeliveryCoordinator {
         public int authFailures;
         public int permanent;
         public int expired;
+        /** Обход прерван: представленный токен сменился в середине серии отправок. */
+        public boolean aborted;
 
         public boolean hasPendingFailures() {
             return retried > 0 || authFailures > 0 || permanent > 0;
@@ -260,6 +272,19 @@ public final class DeliveryCoordinator {
      * отправка не начинается. Backoff отсчитывается от завершения попытки.
      */
     public Summary drain(Sender sender, AuthContext auth) {
+        return drain(sender, auth, () -> true);
+    }
+
+    /**
+     * @param authCurrent проверяется непосредственно перед каждой сетевой
+     *                    попыткой: если представленная версия токена сменилась
+     *                    в середине обхода, оставшиеся отправки останавливаются
+     *                    (aborted=true). Результат уже завершённой попытки
+     *                    учитывается как обычно; неотправленные сообщения
+     *                    остаются в очереди без attempts/смены random_id.
+     */
+    public Summary drain(Sender sender, AuthContext auth,
+                         java.util.function.BooleanSupplier authCurrent) {
         Summary s = new Summary();
         s.expired += outbox.removeExpired(clock.now());
         // Тот же заблокированный токен: сетевых попыток нет вообще.
@@ -280,6 +305,10 @@ public final class DeliveryCoordinator {
             }
             if (sweepStopped || tokenBlocked || !auth.verified || !ownerMatches(m, auth)) {
                 continue; // очередь сохраняется, но сеть не трогаем
+            }
+            if (!authCurrent.getAsBoolean()) {
+                s.aborted = true; // токен сменился — следующих отправок нет
+                break;
             }
             SendResult res;
             try {
@@ -332,19 +361,23 @@ public final class DeliveryCoordinator {
     /**
      * Можно ли сейчас пытаться отправить сообщение данным auth-контекстом.
      * Непривязанное сообщение связывается с подтверждённым владельцем только
-     * если оно создано под той же версией токена (enqueuedFp совпадает) —
-     * очередь старой схемы без владельца новому аккаунту не приписывается.
+     * если оно создано под той же версией токена (enqueuedFp совпадает) И
+     * адресаты были выбраны этим же аккаунтом (peerOwner) — нельзя считать,
+     * что чужие чаты принадлежат новому владельцу только по fingerprint.
+     * Очередь старой схемы без владельца новому аккаунту не приписывается.
      * Адресат и владелец при этом не переписываются.
      */
     private boolean ownerMatches(PendingMessage m, AuthContext auth) {
         if (m.senderId == null || m.senderId.isEmpty()) {
-            if (!m.enqueuedFp.isEmpty() && m.enqueuedFp.equals(auth.tokenFp)) {
+            if (!m.enqueuedFp.isEmpty() && m.enqueuedFp.equals(auth.tokenFp)
+                    && (m.peerOwner.isEmpty() || m.peerOwner.equals(auth.senderId))) {
                 m.senderId = auth.senderId; // поздняя привязка после подтверждения
                 return true;
             }
-            return false; // владелец неизвестен
+            return false; // владелец неизвестен или чужой
         }
-        return m.senderId.equals(auth.senderId);
+        return m.senderId.equals(auth.senderId)
+                && (m.peerOwner.isEmpty() || m.peerOwner.equals(auth.senderId));
     }
 
     /**
@@ -374,9 +407,11 @@ public final class DeliveryCoordinator {
     /** Та же проверка владельца, но без привязки (для планирования/статуса). */
     private boolean ownerMatchesPeek(PendingMessage m, AuthContext auth) {
         if (m.senderId == null || m.senderId.isEmpty()) {
-            return !m.enqueuedFp.isEmpty() && m.enqueuedFp.equals(auth.tokenFp);
+            return !m.enqueuedFp.isEmpty() && m.enqueuedFp.equals(auth.tokenFp)
+                    && (m.peerOwner.isEmpty() || m.peerOwner.equals(auth.senderId));
         }
-        return m.senderId.equals(auth.senderId);
+        return m.senderId.equals(auth.senderId)
+                && (m.peerOwner.isEmpty() || m.peerOwner.equals(auth.senderId));
     }
 
     /**
@@ -501,6 +536,7 @@ public final class DeliveryCoordinator {
     private PendingMessage bound(PendingMessage m, Config cfg) {
         m.senderId = cfg.auth.verified ? cfg.auth.senderId : "";
         m.enqueuedFp = cfg.auth.tokenFp;
+        m.peerOwner = cfg.chatOwner; // владелец чатов на момент постановки
         return m;
     }
 

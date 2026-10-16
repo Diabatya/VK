@@ -66,6 +66,8 @@ public class VkSenderServiceAuthTest {
     public void tearDown() {
         VkSenderService.senderOverride = null;
         VkSenderService.identityVerifierOverride = null;
+        VkSenderService.bgDataOverride = null;
+        VkSenderService.treatmentsOverride = null;
     }
 
     private VkSenderService startService() {
@@ -235,6 +237,225 @@ public class VkSenderServiceAuthTest {
         s.onStartCommand(tokenChanged(), 0, 2);
         idle(s);
         assertEquals(2, peers.size());
+        s.onDestroy();
+    }
+
+    // --- №2Б.2.1: наследование чатов чужого аккаунта ---
+
+    @Test
+    public void unverifiedThenForeignTokenDoesNotInheritChats() {
+        // T1 подтверждён как user:1, чаты 777/888 выбраны под user:1
+        prefs.edit().putBoolean("alert_enabled", true).apply();
+        TokenStorage.setAlertChatId(context, 888);
+        VkSenderService s = startService();
+        s.onStartCommand(autoUpdate(120, System.currentTimeMillis() - 60_000), 0, 1);
+        idle(s);
+        assertEquals(1, peers.size());
+        assertEquals("777", peers.get(0));
+
+        // Фаза 1: токен B сохранён, проверка владельца ещё не удалась
+        verifier = (token) -> token.equals("SYNTHETIC_TOKEN_B") ? null : "user:1";
+        TokenStorage.setToken(context, "SYNTHETIC_TOKEN_B");
+        s.onStartCommand(tokenChanged(), 0, 2);
+        idle(s);
+        assertEquals(1, peers.size()); // отправок нет
+        assertEquals(777, TokenStorage.getChatId(context)); // чаты пока прежние
+
+        // Фаза 2: свежее низкое показание поступает до подтверждения владельца;
+        // проверка в том же обходе подтверждает ДРУГОГО владельца user:2
+        verifier = (token) -> token.equals("SYNTHETIC_TOKEN_B") ? "user:2" : "user:1";
+        s.onStartCommand(autoUpdate(54, System.currentTimeMillis()), 0, 3);
+        idle(s);
+
+        // ни одной отправки в унаследованные чаты от B
+        assertEquals("отправки в унаследованные чаты: " + peers, 1, peers.size());
+        assertEquals(0, TokenStorage.getChatId(context));
+        assertEquals(0, TokenStorage.getAlertChatId(context));
+        String text = lastNotificationText(s);
+        assertTrue("ожидалась причина блокировки: " + text,
+                text.contains("заблокирован"));
+
+        // после явного выбора чатов под user:2 новое показание доставляется
+        TokenStorage.setChatId(context, 999);
+        TokenStorage.setAlertChatId(context, 555);
+        s.onStartCommand(autoUpdate(60, System.currentTimeMillis()), 0, 4);
+        idle(s);
+        assertEquals(3, peers.size());
+        assertEquals("999", peers.get(1));
+        assertEquals("555", peers.get(2));
+        s.onDestroy();
+    }
+
+    @Test
+    public void unverifiedThenSameSenderTokenKeepsDelivery() {
+        prefs.edit().putBoolean("alert_enabled", true).apply();
+        TokenStorage.setAlertChatId(context, 888);
+        VkSenderService s = startService();
+        s.onStartCommand(autoUpdate(120, System.currentTimeMillis() - 60_000), 0, 1);
+        idle(s);
+        assertEquals(1, peers.size());
+
+        // B сначала неподтверждён
+        verifier = (token) -> token.equals("SYNTHETIC_TOKEN_B") ? null : "user:1";
+        TokenStorage.setToken(context, "SYNTHETIC_TOKEN_B");
+        s.onStartCommand(tokenChanged(), 0, 2);
+        idle(s);
+        assertEquals(1, peers.size());
+
+        // свежее низкое показание до подтверждения; проверка находит user:1 —
+        // тот же аккаунт, чаты его — доставка сохраняется
+        verifier = (token) -> token.equals("SYNTHETIC_TOKEN_B") ? "user:1" : "user:1";
+        s.onStartCommand(autoUpdate(54, System.currentTimeMillis()), 0, 3);
+        idle(s);
+        assertEquals(3, peers.size());
+        assertEquals("777", peers.get(1));
+        assertEquals("888", peers.get(2));
+        assertEquals(777, TokenStorage.getChatId(context)); // чаты не сброшены
+        s.onDestroy();
+    }
+
+    @Test
+    public void coldStartCandidateWithReplacedForeignTokenNotSent() {
+        VkSenderService s1 = startService();
+        s1.onStartCommand(autoUpdate(120, System.currentTimeMillis() - 120_000), 0, 1);
+        idle(s1);
+        assertEquals(1, peers.size()); // user:1 подтверждён, чаты его
+        s1.onDestroy();
+
+        // Между запусками токен заменён на чужого владельца; остался candidate
+        TokenStorage.setToken(context, "SYNTHETIC_TOKEN_B");
+        verifier = (token) -> token.equals("SYNTHETIC_TOKEN_B") ? "user:2" : "user:1";
+        prefs.edit()
+                .putFloat("candidate_bg_value", 54f)
+                .putLong("candidate_bg_timestamp", System.currentTimeMillis())
+                .putString("candidate_bg_direction", "Flat")
+                .commit();
+
+        VkSenderService s2 = Robolectric.buildService(VkSenderService.class).create().get();
+        idle(s2); // onCreate → injectSavedReading → enqueue → drain + verify
+
+        assertEquals("candidate ушёл в унаследованные чаты: " + peers,
+                1, peers.size());
+        assertEquals(0, TokenStorage.getChatId(context));
+        s2.onDestroy();
+    }
+
+    @Test
+    public void treatmentEnqueuedBeforeForeignConfirmNotSent() {
+        prefs.edit().putBoolean("show_treatments", true).apply();
+        VkSenderService s = startService();
+        s.onStartCommand(autoUpdate(120, System.currentTimeMillis() - 60_000), 0, 1);
+        idle(s);
+        assertEquals(1, peers.size()); // user:1 подтверждён
+
+        // Инициализация терапии: первый валидный снимок только помечается
+        VkSenderService.bgDataOverride = java.util.Collections::emptyList;
+        VkSenderService.treatmentsOverride = java.util.Collections::emptyList;
+        Intent poll = new Intent(context, VkSenderService.class)
+                .putExtra("poll_now", true);
+        s.onStartCommand(poll, 0, 2);
+        idle(s);
+
+        // Токен B пока неподтверждён
+        verifier = (token) -> token.equals("SYNTHETIC_TOKEN_B") ? null : "user:1";
+        TokenStorage.setToken(context, "SYNTHETIC_TOKEN_B");
+        s.onStartCommand(tokenChanged(), 0, 3);
+        idle(s);
+
+        // Снимок конфигурации для терапии получен до подтверждения user:2
+        long now = System.currentTimeMillis();
+        VkSenderService.treatmentsOverride = () -> java.util.Collections.singletonList(
+                new com.example.xdrip2vk.core.TreatmentEvent("t1", now, 12, 0, "carbs"));
+        verifier = (token) -> token.equals("SYNTHETIC_TOKEN_B") ? "user:2" : "user:1";
+        s.onStartCommand(poll, 0, 4);
+        idle(s);
+
+        assertEquals("терапия ушла в чужие чаты: " + peers, 1, peers.size());
+        assertEquals(0, TokenStorage.getChatId(context));
+        s.onDestroy();
+    }
+
+    // --- №2Б.2.1: смена токена в середине обхода ---
+
+    @Test
+    public void tokenSwapMidDrainStopsNextSendSameOwnerResumes() {
+        prefs.edit().putBoolean("alert_enabled", true).apply();
+        TokenStorage.setAlertChatId(context, 888);
+        VkSenderService s = startService();
+        final boolean[] swapped = {false};
+        VkSenderService.senderOverride = (peer, text, rid) -> {
+            peers.add(peer);
+            rids.add(new int[]{rid});
+            if (!swapped[0]) {
+                // имитация: токен заменён пока шла первая сетевая попытка
+                swapped[0] = true;
+                TokenStorage.setToken(context, "SYNTHETIC_TOKEN_2");
+            }
+            return SendResult.SENT;
+        };
+        s.onStartCommand(autoUpdate(54, System.currentTimeMillis()), 0, 1);
+        idle(s);
+
+        // оба сообщения доставлены по разу; результат первой попытки не потерян
+        assertEquals(2, peers.size());
+        assertTrue(peers.contains("777"));
+        assertTrue(peers.contains("888"));
+        assertNotEquals(rids.get(0)[0], rids.get(1)[0]);
+        s.onDestroy();
+    }
+
+    @Test
+    public void tokenSwapMidDrainForeignOwnerBlocksRest() {
+        prefs.edit().putBoolean("alert_enabled", true).apply();
+        TokenStorage.setAlertChatId(context, 888);
+        VkSenderService s = startService();
+        verifier = (token) -> token.equals("SYNTHETIC_TOKEN_B") ? "user:2" : "user:1";
+        final boolean[] swapped = {false};
+        VkSenderService.senderOverride = (peer, text, rid) -> {
+            peers.add(peer);
+            rids.add(new int[]{rid});
+            if (!swapped[0]) {
+                swapped[0] = true;
+                TokenStorage.setToken(context, "SYNTHETIC_TOKEN_B");
+            }
+            return SendResult.SENT;
+        };
+        s.onStartCommand(autoUpdate(54, System.currentTimeMillis()), 0, 1);
+        idle(s);
+
+        // вторая отправка под другой учётной записью не выполнена
+        assertEquals("отправка продолжилась после смены токена: " + peers,
+                1, peers.size());
+        assertEquals(0, TokenStorage.getChatId(context));
+        String text = lastNotificationText(s);
+        assertTrue("ожидалась причина блокировки: " + text,
+                text.contains("заблокирован"));
+        s.onDestroy();
+    }
+
+    @Test
+    public void tokenSwapMidDrainUnverifiedOwnerBlocksRest() {
+        prefs.edit().putBoolean("alert_enabled", true).apply();
+        TokenStorage.setAlertChatId(context, 888);
+        VkSenderService s = startService();
+        verifier = (token) -> token.equals("SYNTHETIC_TOKEN_B") ? null : "user:1";
+        final boolean[] swapped = {false};
+        VkSenderService.senderOverride = (peer, text, rid) -> {
+            peers.add(peer);
+            rids.add(new int[]{rid});
+            if (!swapped[0]) {
+                swapped[0] = true;
+                TokenStorage.setToken(context, "SYNTHETIC_TOKEN_B");
+            }
+            return SendResult.SENT;
+        };
+        s.onStartCommand(autoUpdate(54, System.currentTimeMillis()), 0, 1);
+        idle(s);
+
+        assertEquals(1, peers.size());
+        String text = lastNotificationText(s);
+        assertTrue("ожидался статус неподтверждённого владельца: " + text,
+                text.contains("владельца токена") || text.contains("заблокирован"));
         s.onDestroy();
     }
 }

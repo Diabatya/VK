@@ -67,6 +67,10 @@ public class VkSenderService extends Service {
     // Тестовая точка подмены проверки владельца токена (без сети).
     static volatile java.util.function.Function<String, String> identityVerifierOverride;
 
+    // Тестовые подмены ответов xDrip-вебсервера (без сети).
+    static volatile java.util.function.Supplier<List<SgvReading>> bgDataOverride;
+    static volatile java.util.function.Supplier<List<TreatmentEvent>> treatmentsOverride;
+
     /**
      * Единая точка оповещения о смене токена — ручной ввод и импорт файла
      * вызывают одинаковую процедуру: инвалидация прежней проверки и
@@ -255,11 +259,14 @@ public class VkSenderService extends Service {
         // адресат VK (сообщество по схеме messages.send), отбрасывать его по
         // знаку нельзя; пустая строка для id<=0 создавала бы ложный статус
         // «не выбран чат» и потерю тревоги.
+        // Выбранные чаты принадлежат последнему подтверждённому аккаунту —
+        // нельзя считать их адресатами нового токена до проверки владельца.
         return new DeliveryCoordinator.Config(
                 chatId > 0 ? String.valueOf(chatId) : "",
                 alertChatId != 0 ? String.valueOf(alertChatId) : "",
                 alertEnabled, configured, thresholds,
-                currentAuthContext(token));
+                currentAuthContext(token),
+                prefs.getString(PREF_LAST_SENDER, ""));
     }
 
     private DeliveryCoordinator.Messages buildMessages(XDripWebClient.DeviceStatusData status) {
@@ -433,8 +440,8 @@ public class VkSenderService extends Service {
             String url = "http://127.0.0.1:17580/sgv.json";
             Logger.d(TAG, "Запрос данных от xDrip+ (веб-сервер): " + url);
 
-            List<SgvReading> dataList = XDripWebClient.fetchBgData(url);
-            DeliveryCoordinator.Config cfg = loadConfig();
+            List<SgvReading> dataList = bgDataOverride != null
+                    ? bgDataOverride.get() : XDripWebClient.fetchBgData(url);
             long now = System.currentTimeMillis();
 
             if (!dataList.isEmpty()) {
@@ -446,8 +453,12 @@ public class VkSenderService extends Service {
                 updateNotification("Нет связи с xDrip+: проверьте, что в xDrip+ включён веб-сервер на порту 17580");
             }
 
-            // Новые записи терапии (инсулин/углеводы) — все события в окне, не только одно
-            List<TreatmentEvent> treatments = XDripWebClient.fetchTreatments();
+            // Новые записи терапии (инсулин/углеводы) — все события в окне, не только одно.
+            // Свежий снимок конфигурации: во время applyReading могла
+            // подтвердиться смена владельца и сброс чатов — старый cfg устарел.
+            DeliveryCoordinator.Config cfg = loadConfig();
+            List<TreatmentEvent> treatments = treatmentsOverride != null
+                    ? treatmentsOverride.get() : XDripWebClient.fetchTreatments();
             boolean showTreatments = prefs.getBoolean(PREF_SHOW_TREATMENTS, false);
             int added = coordinator.onTreatments(treatments, cfg,
                     buildMessages(new XDripWebClient.DeviceStatusData(0, 0)),
@@ -562,8 +573,16 @@ public class VkSenderService extends Service {
                 ? senderOverride
                 : (peerId, text, randomId) -> VkApi.sendMessage(tokenF, peerId, text, randomId);
 
-        DeliveryCoordinator.Summary s = coordinator.drain(sender, auth);
+        DeliveryCoordinator.Summary s = coordinator.drain(sender, auth,
+                () -> fp.equals(Fingerprint.of(TokenStorage.getToken(this))));
         saveState();
+        if (s.aborted) {
+            // Токен заменён в середине обхода: обрабатываем новую версию —
+            // проверка владельца и допустимые отправки под ней.
+            Logger.d(TAG, "Токен сменился во время обхода — повторная проверка");
+            drainAndSchedule();
+            return;
+        }
         Logger.d(TAG, "Доставка: отправлено=" + s.sent + ", повторы=" + s.retried
                 + ", auth=" + s.authFailures + ", permanent=" + s.permanent + ", expired=" + s.expired);
 

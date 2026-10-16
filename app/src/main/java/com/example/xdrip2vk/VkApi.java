@@ -113,27 +113,51 @@ public class VkApi {
      * неопределённый ответ не считается успешной проверкой.
      */
     public static String fetchTokenOwner(String token) {
+        return fetchTokenOwner(token, new java.util.function.BiFunction<String, Map<String, String>, String>() {
+            @Override
+            public String apply(String method, Map<String, String> params) {
+                return request(method, token, params);
+            }
+        });
+    }
+
+    /**
+     * Вариант с подменяемым транспортом (тесты без сети). Метод VK и параметры
+     * передаются транспорту как есть; произвольные user_id/group_id для
+     * определения владельца не запрашиваются — только владелец токена.
+     */
+    static String fetchTokenOwner(String token,
+                                  java.util.function.BiFunction<String, Map<String, String>, String> transport) {
         if (token == null || token.isEmpty()) {
             return null;
         }
-        Long id = firstResponseId(request("users.get", token, null));
+        Long id = firstResponseId(transport.apply("users.get", null));
         if (id != null) {
             return "user:" + id;
         }
-        id = firstResponseId(request("groups.getById", token, null));
+        id = firstResponseId(transport.apply("groups.getById", null));
         if (id != null) {
             return "group:" + id;
         }
         return null;
     }
 
-    /** Первый объект с полем id из массива response (учитываем и форму {groups:[]}). */
+    /**
+     * Однозначный владелец из ответа VK. Принимается только массив response
+     * ровно с одним объектом с положительным целочисленным id (учитываем и
+     * форму {groups:[]}). Нуль, отрицательное, дробное, переполнение,
+     * отсутствующий/нечисловой id, несколько объектов или ответ с ошибкой —
+     * не подтверждают владельца.
+     */
     private static Long firstResponseId(String body) {
         if (body == null || body.isEmpty()) {
             return null;
         }
         try {
             JSONObject o = new JSONObject(body);
+            if (o.has("error")) {
+                return null; // ответ с ошибкой — проверка не пройдена
+            }
             JSONArray arr = o.optJSONArray("response");
             if (arr == null) {
                 JSONObject resp = o.optJSONObject("response");
@@ -141,16 +165,26 @@ public class VkApi {
                     arr = resp.optJSONArray("groups");
                 }
             }
-            if (arr != null && arr.length() > 0) {
-                JSONObject item = arr.optJSONObject(0);
-                if (item != null && item.has("id")) {
-                    return item.getLong("id");
-                }
+            if (arr == null || arr.length() != 1) {
+                return null; // пусто или неоднозначный владелец
             }
+            JSONObject item = arr.optJSONObject(0);
+            if (item == null) {
+                return null;
+            }
+            Object idObj = item.opt("id");
+            if (!(idObj instanceof Number)) {
+                return null; // отсутствует, null или не число
+            }
+            double d = ((Number) idObj).doubleValue();
+            long l = ((Number) idObj).longValue();
+            if (d != l || l <= 0 || l > Integer.MAX_VALUE) {
+                return null; // дробный, ноль, отрицательный, переполнение
+            }
+            return l;
         } catch (JSONException e) {
-            // неопределённый ответ — проверка не пройдена
+            return null; // битый JSON — неопределённый ответ
         }
-        return null;
     }
 
     public static String request(String method, String token, Map<String, String> params) {

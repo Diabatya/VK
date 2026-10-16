@@ -24,6 +24,13 @@ public final class PendingMessage {
     public String senderId;
     /** Fingerprint токена, под которым создано; "" — наследие старой схемы. */
     public String enqueuedFp;
+    /**
+     * Владелец аккаунта, которому принадлежали выбранные чаты на момент
+     * постановки в очередь; "" — чаты не были привязаны к аккаунту
+     * (свежая установка до первого подтверждения) или legacy-запись.
+     * Защищает от отправки в чужие чаты при смене владельца токена.
+     */
+    public String peerOwner;
 
     public PendingMessage(String key, String peerId, String text, int randomId, long expiresAtMs) {
         this.key = key;
@@ -37,6 +44,7 @@ public final class PendingMessage {
         this.lastError = "";
         this.senderId = "";
         this.enqueuedFp = "";
+        this.peerOwner = "";
     }
 
     public JSONObject toJson() throws JSONException {
@@ -52,6 +60,7 @@ public final class PendingMessage {
         o.put("err", lastError == null ? "" : lastError);
         o.put("snd", senderId == null ? "" : senderId);
         o.put("fp", enqueuedFp == null ? "" : enqueuedFp);
+        o.put("po", peerOwner == null ? "" : peerOwner);
         return o;
     }
 
@@ -70,6 +79,7 @@ public final class PendingMessage {
         // заблокированными («владелец неизвестен») до истечения срока.
         m.senderId = o.optString("snd", "");
         m.enqueuedFp = o.optString("fp", "");
+        m.peerOwner = o.optString("po", "");
         if (m.key.isEmpty() || m.randomId == 0) {
             return null;
         }
