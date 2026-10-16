@@ -53,6 +53,14 @@ public class VkSenderService extends Service {
     private Runnable pollTask;
     private static final int ALARM_REQUEST_CODE = 1001;
 
+    // Тестовая точка подмены отправителя для unit-тестов под Robolectric.
+    static volatile DeliveryCoordinator.Sender senderOverride;
+
+    /** Looper фонового потока — для прокачки очереди в тестах. */
+    android.os.Looper workerLooperForTest() {
+        return handlerThread == null ? null : handlerThread.getLooper();
+    }
+
     @Override
     public void onCreate() {
         super.onCreate();
@@ -89,6 +97,17 @@ public class VkSenderService extends Service {
 
         // Все изменения состояния — только на фоновом потоке, строго по очереди.
         handler.post(() -> {
+            if (prefs.getString(PREF_STATE, "").isEmpty()) {
+                // Миграция со схемы 4.3: старый UI-кеш last_bg_* мог содержать
+                // устаревшую глюкозу с ошибочно «текущим» временем. Он недоверен —
+                // очищаем и не отправляем; валидные данные придут от источника.
+                SharedPreferences.Editor editor = prefs.edit();
+                editor.putFloat("last_bg_value", 0f);
+                editor.putLong("last_bg_timestamp", 0);
+                editor.putString("last_bg_direction", "");
+                editor.apply();
+                Logger.d(TAG, "Недоверенный кеш предыдущей версии очищен");
+            }
             injectSavedReading();
             drainAndSchedule();
         });
@@ -150,12 +169,17 @@ public class VkSenderService extends Service {
         return new SgvReading(bg, ts, direction == null ? "" : direction, "");
     }
 
-    /** Показание, сохранённое BgReceiver, на случай рестарта сервиса без intent. */
+    /**
+     * Кандидат-показание, сохранённое BgReceiver, на случай рестарта сервиса
+     * без intent. Используется только candidate_* — входной снимок, записанный
+     * уже новой схемой после проверки. Устаревший last_bg_* версии 4.3 сюда
+     * не попадает и автоматически не отправляется.
+     */
     private void injectSavedReading() {
-        float savedBg = prefs.getFloat("last_bg_value", 0);
-        long savedTs = prefs.getLong("last_bg_timestamp", 0);
+        float savedBg = prefs.getFloat("candidate_bg_value", 0);
+        long savedTs = prefs.getLong("candidate_bg_timestamp", 0);
         if (savedBg > 0 && savedTs > coordinator.getLastSeenBgMs()) {
-            String direction = prefs.getString("last_bg_direction", "");
+            String direction = prefs.getString("candidate_bg_direction", "");
             applyReading(new SgvReading(savedBg, savedTs, direction, ""),
                     DeliveryCoordinator.Source.AUTO);
         }
@@ -415,8 +439,9 @@ public class VkSenderService extends Service {
             return;
         }
         final String tokenF = token;
-        DeliveryCoordinator.Sender sender = (peerId, text, randomId) ->
-                VkApi.sendMessage(tokenF, peerId, text, randomId);
+        DeliveryCoordinator.Sender sender = senderOverride != null
+                ? senderOverride
+                : (peerId, text, randomId) -> VkApi.sendMessage(tokenF, peerId, text, randomId);
 
         DeliveryCoordinator.Summary s = coordinator.drain(sender, token.hashCode(), now);
         saveState();

@@ -6,6 +6,7 @@ import android.content.Intent;
 import android.content.SharedPreferences;
 import android.os.PowerManager;
 import androidx.preference.PreferenceManager;
+import com.example.xdrip2vk.core.ReadingGate;
 import com.example.xdrip2vk.core.TimeFields;
 
 public class BgReceiver extends BroadcastReceiver {
@@ -39,8 +40,8 @@ public class BgReceiver extends BroadcastReceiver {
             double bgValue = extractBgValue(intent);
             Logger.d(TAG, "Извлечён сахар из broadcast: " + bgValue);
 
-            if (bgValue == 0) {
-                Logger.w(TAG, "Сахар равен 0, broadcast проигнорирован");
+            if (!(bgValue > 0)) {
+                Logger.w(TAG, "Сахар некорректен (0, отрицательный или NaN), broadcast проигнорирован");
                 return;
             }
 
@@ -53,14 +54,23 @@ public class BgReceiver extends BroadcastReceiver {
 
             String direction = extractDirection(intent);
 
-            // Сохраняем данные в SharedPreferences для сервиса и UI
+            // Валидация до любой записи: некорректное/просроченное/будущее
+            // событие не попадает ни в какой кеш и не запускает сервис.
+            if (ReadingGate.check(timestamp, System.currentTimeMillis()) != ReadingGate.Verdict.FRESH) {
+                Logger.w(TAG, "Broadcast отклонён фильтром свежести: bg=" + bgValue + " ts=" + timestamp);
+                return;
+            }
+
+            // Доверенный UI-кеш (last_bg_*) пишет только сервис для принятого
+            // показания. Receiver публикует лишь кандидата — входной снимок,
+            // который сервис проверит и использует для восстановления.
             SharedPreferences prefs = PreferenceManager.getDefaultSharedPreferences(context);
             SharedPreferences.Editor editor = prefs.edit();
-            editor.putLong("last_bg_timestamp", timestamp);
-            editor.putFloat("last_bg_value", (float) bgValue);
-            editor.putString("last_bg_direction", direction);
+            editor.putLong("candidate_bg_timestamp", timestamp);
+            editor.putFloat("candidate_bg_value", (float) bgValue);
+            editor.putString("candidate_bg_direction", direction);
             editor.apply();
-            Logger.d(TAG, "Данные от xDrip+ сохранены в настройки приложения");
+            Logger.d(TAG, "Данные от xDrip+ сохранены как кандидат на принятие");
 
             // Автоматическое обновление: НЕ считается ручной принудительной отправкой —
             // сервис применяет обычную дедупликацию по времени показания.
@@ -154,6 +164,8 @@ public class BgReceiver extends BroadcastReceiver {
 
     private String extractDirection(Intent intent) {
         String[] keys = {
+            // Официальный ключ xDrip+ BroadcastAPI
+            "com.eveningoutpost.dexdrip.Extras.BgSlopeName",
             "direction",
             "slopeName",
             "slope_name",

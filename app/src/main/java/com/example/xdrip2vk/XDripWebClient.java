@@ -54,12 +54,17 @@ public class XDripWebClient {
         return result;
     }
 
+    /**
+     * @return null — снимок не получен (сеть/HTTP-ошибка) или не удалось
+     *         разобрать (невалидный JSON); список, в т.ч. пустой, —
+     *         успешно полученный валидный ответ.
+     */
     public static List<TreatmentEvent> fetchTreatments() {
         Logger.d(TAG, "Запрос терапии от xDrip+: " + TREATMENTS_URL);
 
         String responseData = httpGet(TREATMENTS_URL);
         if (responseData == null) {
-            return new ArrayList<>();
+            return null;
         }
         Logger.d(TAG, "Ответ терапии от xDrip+: " + responseData);
         return XdripJson.parseTreatments(responseData);

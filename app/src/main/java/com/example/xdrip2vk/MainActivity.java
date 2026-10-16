@@ -26,6 +26,7 @@ import android.widget.Button;
 import android.widget.TextView;
 import com.google.android.material.chip.Chip;
 import com.google.android.material.floatingactionbutton.FloatingActionButton;
+import com.example.xdrip2vk.core.ReadingGate;
 import java.text.SimpleDateFormat;
 import java.util.Date;
 import java.util.Locale;
@@ -48,7 +49,7 @@ public class MainActivity extends AppCompatActivity {
     private Runnable updateUiRunnable;
     private long lastUpdateTime = 0;
     private long pollInterval = 300000; // 5 минут по умолчанию
-    private static final long MAX_DATA_AGE = 900000; // 15 минут
+
 
     @Override
     protected void onCreate(Bundle savedInstanceState) {
@@ -118,7 +119,11 @@ public class MainActivity extends AppCompatActivity {
         }
 
         long dataAge = System.currentTimeMillis() - lastTimestamp;
-        boolean hasFreshData = lastBg > 0 && lastTimestamp > 0 && dataAge <= MAX_DATA_AGE;
+        // Допустимость времени и конечность значения: будущее/невалидное
+        // показание не должно выглядеть свежим на экране.
+        boolean hasFreshData = lastBg > 0 && Float.isFinite(lastBg) && lastTimestamp > 0
+                && ReadingGate.check(lastTimestamp, System.currentTimeMillis())
+                        == ReadingGate.Verdict.FRESH;
 
         // Обновляем статус xDrip через Chip
         if (hasFreshData) {
@@ -221,9 +226,10 @@ public class MainActivity extends AppCompatActivity {
         SharedPreferences prefs = PreferenceManager.getDefaultSharedPreferences(this);
         long lastTimestamp = prefs.getLong("last_bg_timestamp", 0);
         float lastBg = prefs.getFloat("last_bg_value", 0);
-        long dataAge = System.currentTimeMillis() - lastTimestamp;
-        
-        if (lastBg > 0 && lastTimestamp > 0 && dataAge <= MAX_DATA_AGE) {
+
+        if (lastBg > 0 && Float.isFinite(lastBg) && lastTimestamp > 0
+                && ReadingGate.check(lastTimestamp, System.currentTimeMillis())
+                        == ReadingGate.Verdict.FRESH) {
             Intent intent = new Intent(this, VkSenderService.class);
             intent.putExtra("manual_send", true);
             // Контракт: bg_value — double в мг/дл, timestamp — epoch мс

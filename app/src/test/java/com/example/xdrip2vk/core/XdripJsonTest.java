@@ -90,6 +90,43 @@ public class XdripJsonTest {
     }
 
     @Test
+    public void treatmentWithoutValidTimeRejected() {
+        // отсутствующее время
+        assertTrue(XdripJson.parseTreatments(
+                "[{\"_id\":\"a\",\"carbs\":10}]").isEmpty());
+        // мусорная строка вместо времени
+        assertTrue(XdripJson.parseTreatments(
+                "[{\"_id\":\"a\",\"created_at\":\"garbage\",\"carbs\":10}]").isEmpty());
+        // нулевое время
+        assertTrue(XdripJson.parseTreatments(
+                "[{\"_id\":\"a\",\"created_at\":0,\"carbs\":10}]").isEmpty());
+        // отрицательное время
+        assertTrue(XdripJson.parseTreatments(
+                "[{\"_id\":\"a\",\"created_at\":-5000,\"carbs\":10}]").isEmpty());
+    }
+
+    @Test
+    public void treatmentsInvalidJsonIsNotEmptySnapshot() {
+        // невалидный JSON — ошибка загрузки (null), а не достоверно пустой снимок
+        assertNull(XdripJson.parseTreatments("{not json"));
+        assertNull(XdripJson.parseTreatments("{\"oops\":1}"));
+        assertNull(XdripJson.parseTreatments(""));
+        assertNull(XdripJson.parseTreatments(null));
+        // достоверно пустой массив — валидный пустой снимок
+        List<TreatmentEvent> empty = XdripJson.parseTreatments("[]");
+        assertNotNull(empty);
+        assertTrue(empty.isEmpty());
+    }
+
+    @Test
+    public void treatmentSecondsTimestampAccepted() {
+        List<TreatmentEvent> out = XdripJson.parseTreatments(
+                "[{\"_id\":\"s1\",\"created_at\":1715336400,\"insulin\":2}]");
+        assertEquals(1, out.size());
+        assertEquals(1715336400000L, out.get(0).createdAtMs);
+    }
+
+    @Test
     public void timeFieldsNeverReturnNow() {
         assertEquals(-1, TimeFields.toEpochMs(null));
         assertEquals(-1, TimeFields.toEpochMs(""));

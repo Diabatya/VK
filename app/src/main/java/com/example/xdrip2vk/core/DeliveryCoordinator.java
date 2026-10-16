@@ -148,15 +148,18 @@ public final class DeliveryCoordinator {
     // ---------- Терапия ----------
 
     /**
-     * Обрабатывает свежую порцию событий терапии. Первый вызов после установки
-     * новой схемы учёта только инициализирует состояние: всё уже существующее
-     * помечается как просмотренное и НЕ отправляется.
+     * Обрабатывает свежую порцию событий терапии.
+     * @param events null — снимок не получен (сетевая ошибка или невалидный JSON);
+     *               учёт НЕ инициализируется и события не помечаются просмотренными.
+     *               Пустой список — достоверно пустой снимок: инициализация выполняется.
+     *               Первый валидный снимок отмечает все существующие записи
+     *               просмотренными без отправки бэклога.
      * @return число поставленных в очередь частей сообщений.
      */
     public int onTreatments(List<TreatmentEvent> events, Config cfg, Messages msgs,
                             boolean enabled, long now) {
         if (events == null) {
-            events = Collections.emptyList();
+            return 0;
         }
         if (!treatmentsInitialized) {
             treatmentsInitialized = true;
@@ -183,11 +186,18 @@ public final class DeliveryCoordinator {
             if (!canSend) {
                 continue;
             }
-            boolean tooOld = e.createdAtMs > 0 && now - e.createdAtMs > TREATMENT_MAX_AGE_MS;
-            if (tooOld) {
-                continue;
+            // Повторная проверка времени: прямой вызов с некорректным событием
+            // тоже не должен создавать сообщение.
+            if (e.createdAtMs <= 0) {
+                continue; // время отсутствует/некорректно — now не подставляется
             }
-            long expires = (e.createdAtMs > 0 ? e.createdAtMs : now) + TREATMENT_MAX_AGE_MS;
+            if (e.createdAtMs > now + ReadingGate.MAX_FUTURE_SKEW_MS) {
+                continue; // событие из будущего сверх допуска рассинхрона
+            }
+            if (now - e.createdAtMs > TREATMENT_MAX_AGE_MS) {
+                continue; // старше шестичасового окна терапии
+            }
+            long expires = e.createdAtMs + TREATMENT_MAX_AGE_MS;
             if (e.hasInsulin()) {
                 if (enqueue(new PendingMessage("treat:" + e.id + ":ins",
                         cfg.normalPeer, msgs.treatment(e, true), newRandomId(), expires))) {

@@ -65,37 +65,46 @@ public final class XdripJson {
         return out;
     }
 
+    /**
+     * @return список событий, либо null если ответ не удалось разобрать
+     *         (невалидный JSON — это НЕ достоверно пустой снимок).
+     *         События без корректного времени из результата исключаются.
+     */
     public static List<TreatmentEvent> parseTreatments(String json) {
         List<TreatmentEvent> out = new ArrayList<>();
         if (json == null || json.isEmpty()) {
-            return out;
+            return null; // пустое тело ответа — не валидный снимок
         }
+        JSONArray arr;
         try {
-            JSONArray arr = new JSONArray(json);
-            for (int i = 0; i < arr.length(); i++) {
-                JSONObject item = arr.optJSONObject(i);
-                if (item == null) {
-                    continue;
-                }
-                double carbs = item.optDouble("carbs", 0);
-                double insulin = item.optDouble("insulin", 0);
-                if (!(carbs > 0) && !(insulin > 0)) {
-                    continue;
-                }
-                String id = item.optString("_id", "");
-                if (id.isEmpty()) {
-                    id = item.optString("uuid", "");
-                }
-                long ts = firstTime(item, TREATMENT_TIME_KEYS);
-                String eventType = item.optString("eventType", "");
-                if (id.isEmpty()) {
-                    // Детерминированный ID: одна и та же запись всегда даёт один ключ
-                    id = "t|" + ts + "|" + carbs + "|" + insulin + "|" + eventType;
-                }
-                out.add(new TreatmentEvent(id, Math.max(ts, 0), carbs, insulin, eventType));
-            }
+            arr = new JSONArray(json);
         } catch (JSONException e) {
-            // см. выше
+            return null; // ответ не является JSON-массивом — ошибка, не «пустой снимок»
+        }
+        for (int i = 0; i < arr.length(); i++) {
+            JSONObject item = arr.optJSONObject(i);
+            if (item == null) {
+                continue;
+            }
+            double carbs = item.optDouble("carbs", 0);
+            double insulin = item.optDouble("insulin", 0);
+            if (!(carbs > 0) && !(insulin > 0)) {
+                continue;
+            }
+            long ts = firstTime(item, TREATMENT_TIME_KEYS);
+            if (ts <= 0) {
+                continue; // без корректного времени событие отклоняется, now не подставляется
+            }
+            String id = item.optString("_id", "");
+            if (id.isEmpty()) {
+                id = item.optString("uuid", "");
+            }
+            String eventType = item.optString("eventType", "");
+            if (id.isEmpty()) {
+                // Детерминированный ID: одна и та же запись всегда даёт один ключ
+                id = "t|" + ts + "|" + carbs + "|" + insulin + "|" + eventType;
+            }
+            out.add(new TreatmentEvent(id, ts, carbs, insulin, eventType));
         }
         return out;
     }

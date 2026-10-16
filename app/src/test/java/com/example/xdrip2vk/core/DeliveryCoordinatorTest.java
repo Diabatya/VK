@@ -327,6 +327,85 @@ public class DeliveryCoordinatorTest {
         assertEquals(0, coordinator.pendingCount());
     }
 
+    // ---------- время терапии (R01/R02) ----------
+
+    @Test
+    public void treatmentWithInvalidTimeNotEnqueued() {
+        initTreatments();
+        List<TreatmentEvent> bad = Arrays.asList(
+                new TreatmentEvent("zero", 0, 10, 0, "Carbs"),
+                new TreatmentEvent("neg", -1000, 10, 0, "Carbs"));
+        assertEquals(0, coordinator.onTreatments(bad, cfg(), msgs, true, now));
+        assertEquals(0, coordinator.pendingCount());
+        // id помечены просмотренными — повторные опросы тоже ничего не ставят
+        assertEquals(0, coordinator.onTreatments(bad, cfg(), msgs, true, now + 5000));
+        assertEquals(0, coordinator.pendingCount());
+    }
+
+    @Test
+    public void futureTreatmentNotEnqueued() {
+        initTreatments();
+        TreatmentEvent future = new TreatmentEvent("f1",
+                now + 24L * 3600 * 1000, 10, 0, "Carbs");
+        assertEquals(0, coordinator.onTreatments(
+                Arrays.asList(future), cfg(), msgs, true, now));
+        assertEquals(0, coordinator.pendingCount());
+        // в пределах допуска рассинхрона — принимается
+        TreatmentEvent skew = new TreatmentEvent("f2",
+                now + 60_000, 10, 0, "Carbs");
+        assertEquals(1, coordinator.onTreatments(
+                Arrays.asList(skew), cfg(), msgs, true, now));
+    }
+
+    // ---------- ошибка загрузки vs пустой снимок (R03) ----------
+
+    @Test
+    public void fetchFailureThenBacklogThenNewEventSequence() {
+        // Обязательная последовательность:
+        // timeout → некорректный JSON → успешный снимок со старыми событиями
+        // → перезапуск → снимок с новым событием.
+        // 1. timeout: снимок не получен — инициализации нет
+        assertEquals(0, coordinator.onTreatments(null, cfg(), msgs, true, now));
+
+        // 2. некорректный JSON — тоже не валидный снимок
+        assertNull(XdripJson.parseTreatments("{broken"));
+        assertEquals(0, coordinator.onTreatments(
+                XdripJson.parseTreatments("{broken"), cfg(), msgs, true, now));
+
+        // 3. первый успешный снимок со старыми событиями — пометка без отправки
+        List<TreatmentEvent> history = XdripJson.parseTreatments(
+                TestUtil.fixture("treatments_xdrip.json"));
+        assertNotNull(history);
+        assertEquals(0, coordinator.onTreatments(history, cfg(), msgs, true, now));
+        coordinator.drain(sender, 42, now);
+        assertTrue(sender.calls.isEmpty());
+
+        // 4. перезапуск: инициализация и «просмотренные» id переживают рестарт
+        DeliveryCoordinator restored = DeliveryCoordinator.load(coordinator.save());
+        assertEquals(0, restored.onTreatments(history, cfg(), msgs, true, now + 5000));
+
+        // 5. новое событие следующего опроса — доставляется ровно один раз
+        TreatmentEvent fresh = new TreatmentEvent("new-1", now - 60_000, 0, 2.0, "Bolus");
+        assertEquals(1, restored.onTreatments(
+                Arrays.asList(fresh), cfg(), msgs, true, now + 10_000));
+        restored.drain(sender, 42, now + 10_000);
+        assertEquals(1, sender.calls.size());
+        assertTrue(sender.calls.get(0).text.startsWith("ins:"));
+        assertEquals(0, restored.onTreatments(
+                Arrays.asList(fresh), cfg(), msgs, true, now + 15_000));
+    }
+
+    @Test
+    public void emptySnapshotIsValidBaseline() {
+        assertEquals(0, coordinator.onTreatments(
+                Collections.emptyList(), cfg(), msgs, true, now));
+        TreatmentEvent fresh = new TreatmentEvent("n1", now - 30_000, 15, 0, "Carbs");
+        assertEquals(1, coordinator.onTreatments(
+                Arrays.asList(fresh), cfg(), msgs, true, now));
+        coordinator.drain(sender, 42, now);
+        assertEquals(1, sender.calls.size());
+    }
+
     // ---------- перезапуск ----------
 
     @Test
