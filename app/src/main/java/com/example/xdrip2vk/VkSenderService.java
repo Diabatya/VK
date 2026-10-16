@@ -178,7 +178,9 @@ public class VkSenderService extends Service {
     private void injectSavedReading() {
         float savedBg = prefs.getFloat("candidate_bg_value", 0);
         long savedTs = prefs.getLong("candidate_bg_timestamp", 0);
-        if (savedBg > 0 && savedTs > coordinator.getLastSeenBgMs()) {
+        // Кандидат проверяется ещё раз: повреждённый кеш (NaN/Infinity/<=0)
+        // не должен доходить до coordinator и очереди.
+        if (savedBg > 0 && Float.isFinite(savedBg) && savedTs > coordinator.getLastSeenBgMs()) {
             String direction = prefs.getString("candidate_bg_direction", "");
             applyReading(new SgvReading(savedBg, savedTs, direction, ""),
                     DeliveryCoordinator.Source.AUTO);

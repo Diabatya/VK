@@ -170,6 +170,69 @@ public class VkSenderServiceMigrationTest {
         s.onDestroy();
     }
 
+    // --- обход валидации через candidate-кеш (№2А.1) ---
+
+    @Test
+    public void corruptedCandidateWithInfinityNotInjected() {
+        // кеш кандидата повреждён: float Infinity — не измерение
+        prefs.edit()
+                .putFloat("candidate_bg_value", Float.POSITIVE_INFINITY)
+                .putLong("candidate_bg_timestamp", System.currentTimeMillis() - 60_000)
+                .putString("candidate_bg_direction", "Flat")
+                .apply();
+
+        VkSenderService s = startService();
+        assertTrue("повреждённый кандидат не должен отправляться", sends.isEmpty());
+        s.onDestroy();
+    }
+
+    @Test
+    public void corruptedCandidateWithNaNOrZeroNotInjected() {
+        prefs.edit()
+                .putFloat("candidate_bg_value", Float.NaN)
+                .putLong("candidate_bg_timestamp", System.currentTimeMillis() - 60_000)
+                .apply();
+        VkSenderService s = startService();
+        assertTrue(sends.isEmpty());
+        s.onDestroy();
+    }
+
+    @Test
+    public void fullChainReceiverCandidateColdStartOverflowRejected() {
+        // broadcast с конечным double, переполняющим float (1e40 → Infinity в кеше)
+        long ts = System.currentTimeMillis() - 60_000;
+        Intent i = new Intent("com.eveningoutpost.dexdrip.BgEstimate");
+        i.putExtra("com.eveningoutpost.dexdrip.Extras.BgEstimate", 1e40);
+        i.putExtra("com.eveningoutpost.dexdrip.Extras.Time", ts);
+        new BgReceiver().onReceive(context, i);
+
+        // переполняющий кандидат даже не записан
+        assertEquals(0, prefs.getFloat("candidate_bg_value", 0), 0.01f);
+
+        // холодный запуск: обхода через injectSavedReading нет
+        VkSenderService s = startService();
+        assertTrue(sends.isEmpty());
+        assertEquals(0, prefs.getLong("last_bg_timestamp", 0));
+        s.onDestroy();
+    }
+
+    @Test
+    public void fullChainReceiverCandidateColdStartValid() {
+        // та же цепочка с корректным показанием: отправка ровно один раз
+        long ts = System.currentTimeMillis() - 60_000;
+        Intent i = new Intent("com.eveningoutpost.dexdrip.BgEstimate");
+        i.putExtra("com.eveningoutpost.dexdrip.Extras.BgEstimate", 118.0);
+        i.putExtra("com.eveningoutpost.dexdrip.Extras.Time", ts);
+        i.putExtra("com.eveningoutpost.dexdrip.Extras.BgSlopeName", "SingleUp");
+        new BgReceiver().onReceive(context, i);
+
+        VkSenderService s = startService();
+        assertEquals(1, sends.size());
+        assertEquals(118f, prefs.getFloat("last_bg_value", 0), 0.01f);
+        assertEquals(ts, prefs.getLong("last_bg_timestamp", 0));
+        s.onDestroy();
+    }
+
     @Test
     public void pendingAndRandomIdSurviveProcessRestart() {
         VkSenderService s = startService();

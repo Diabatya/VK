@@ -396,6 +396,44 @@ public class DeliveryCoordinatorTest {
     }
 
     @Test
+    public void malformedArrayDoesNotInitBaseline() {
+        // [17, null] — повреждённый ответ: baseline не завершается
+        assertNull(XdripJson.parseTreatments("[17, null]"));
+        assertEquals(0, coordinator.onTreatments(
+                XdripJson.parseTreatments("[17, null]"), cfg(), msgs, true, now));
+
+        // первый корректный снимок со старыми событиями — без бэклога
+        List<TreatmentEvent> history = XdripJson.parseTreatments(
+                TestUtil.fixture("treatments_xdrip.json"));
+        assertEquals(0, coordinator.onTreatments(history, cfg(), msgs, true, now));
+        coordinator.drain(sender, 42, now);
+        assertTrue(sender.calls.isEmpty());
+
+        // после рестарта новое событие — один раз
+        DeliveryCoordinator restored = DeliveryCoordinator.load(coordinator.save());
+        TreatmentEvent fresh = new TreatmentEvent("n2", now - 30_000, 0, 1.0, "Bolus");
+        assertEquals(1, restored.onTreatments(
+                Arrays.asList(fresh), cfg(), msgs, true, now + 5000));
+        restored.drain(sender, 42, now + 5000);
+        assertEquals(1, sender.calls.size());
+    }
+
+    // ---------- значение показания (№2А.1) ----------
+
+    @Test
+    public void nonFiniteOrNonPositiveSgvNotAccepted() {
+        for (double bad : new double[]{Double.NaN, Double.POSITIVE_INFINITY,
+                Double.NEGATIVE_INFINITY, 0, -3}) {
+            assertEquals(DeliveryCoordinator.ReadingOutcome.INVALID,
+                    coordinator.onReading(reading(bad, now - 60_000, "Flat"),
+                            DeliveryCoordinator.Source.AUTO, cfg(), msgs, now));
+        }
+        // отклонённые значения не трогают watermark и очередь
+        assertEquals(0, coordinator.getLastSeenBgMs());
+        assertEquals(0, coordinator.pendingCount());
+    }
+
+    @Test
     public void emptySnapshotIsValidBaseline() {
         assertEquals(0, coordinator.onTreatments(
                 Collections.emptyList(), cfg(), msgs, true, now));

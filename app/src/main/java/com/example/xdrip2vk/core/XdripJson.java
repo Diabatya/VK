@@ -84,7 +84,9 @@ public final class XdripJson {
         for (int i = 0; i < arr.length(); i++) {
             JSONObject item = arr.optJSONObject(i);
             if (item == null) {
-                continue;
+                // Необъектный элемент (число, null, строка...) — ответ не
+                // соответствует структуре: это ошибка, а не пустой снимок.
+                return null;
             }
             double carbs = item.optDouble("carbs", 0);
             double insulin = item.optDouble("insulin", 0);

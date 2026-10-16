@@ -40,8 +40,11 @@ public class BgReceiver extends BroadcastReceiver {
             double bgValue = extractBgValue(intent);
             Logger.d(TAG, "Извлечён сахар из broadcast: " + bgValue);
 
-            if (!(bgValue > 0)) {
-                Logger.w(TAG, "Сахар некорректен (0, отрицательный или NaN), broadcast проигнорирован");
+            // Отклоняем NaN, ±Infinity, ноль и отрицательные значения, а также
+            // double, переполняющий float: после записи в кеш (float) он станет
+            // Infinity и обойдёт проверку при восстановлении.
+            if (!Double.isFinite(bgValue) || bgValue <= 0 || !Float.isFinite((float) bgValue)) {
+                Logger.w(TAG, "Сахар некорректен (0, отрицательный, NaN/Infinity, переполнение float), broadcast проигнорирован");
                 return;
             }
 

@@ -26,6 +26,13 @@ android {
         targetCompatibility JavaVersion.VERSION_1_8
     }
 
+    // Имя APK: caxarok_<versionName>.apk — версия подставляется автоматически.
+    applicationVariants.all { variant ->
+        variant.outputs.all { output ->
+            outputFileName = "caxarok_${variant.versionName}.apk"
+        }
+    }
+
     testOptions {
         unitTests.includeAndroidResources = true
     }

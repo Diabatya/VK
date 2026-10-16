@@ -106,10 +106,14 @@ public class BgReceiverTest {
     @Test
     public void invalidBgBroadcastRejected() {
         long ts = System.currentTimeMillis() - 60_000;
-        new BgReceiver().onReceive(context, xdripBroadcast(Double.NaN, ts, "Flat"));
-        new BgReceiver().onReceive(context, xdripBroadcast(-5, ts, "Flat"));
+        // NaN, ±Infinity, ноль, отрицательное и конечный double, переполняющий float
+        for (double bad : new double[]{Double.NaN, Double.POSITIVE_INFINITY,
+                Double.NEGATIVE_INFINITY, 0, -5, 1e40}) {
+            new BgReceiver().onReceive(context, xdripBroadcast(bad, ts, "Flat"));
+        }
 
         assertEquals(0, prefs.getLong("candidate_bg_timestamp", 0));
+        assertEquals(0, prefs.getLong("last_bg_timestamp", 0));
         assertNull(shadowApp().getNextStartedService());
     }
 

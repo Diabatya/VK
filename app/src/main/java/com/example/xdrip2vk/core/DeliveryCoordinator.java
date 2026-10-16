@@ -86,6 +86,12 @@ public final class DeliveryCoordinator {
     // ---------- SGV ----------
 
     public ReadingOutcome onReading(SgvReading r, Source src, Config cfg, Messages msgs, long now) {
+        // Повторная проверка значения: ни один входной канал (intent,
+        // candidate-кеш, HTTP) не должен принести NaN/Infinity/<=0 до watermark
+        // и очереди.
+        if (!(r.sgvMgdl > 0) || !Double.isFinite(r.sgvMgdl)) {
+            return ReadingOutcome.INVALID;
+        }
         ReadingGate.Verdict v = ReadingGate.check(r.timestampMs, now);
         if (v == ReadingGate.Verdict.INVALID) {
             return ReadingOutcome.INVALID;

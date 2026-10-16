@@ -119,6 +119,22 @@ public class XdripJsonTest {
     }
 
     @Test
+    public void treatmentsNonObjectElementsAreErrorNotEmptySnapshot() {
+        // необъектные элементы — структурная ошибка, а не пустой снимок
+        assertNull(XdripJson.parseTreatments("[17, null]"));
+        assertNull(XdripJson.parseTreatments("[\"str\", 42]"));
+        // смешанный ответ: корректный объект + необъектный элемент — тоже ошибка,
+        // такой снимок нельзя использовать как baseline
+        assertNull(XdripJson.parseTreatments(
+                "[{\"_id\":\"ok\",\"created_at\":1715336400000,\"insulin\":2}, 17]"));
+        // корректные объекты без инсулина/углеводов — штатная ситуация, не ошибка
+        List<TreatmentEvent> notes = XdripJson.parseTreatments(
+                "[{\"_id\":\"note\",\"created_at\":1715336400000,\"eventType\":\"Note\"}]");
+        assertNotNull(notes);
+        assertTrue(notes.isEmpty());
+    }
+
+    @Test
     public void treatmentSecondsTimestampAccepted() {
         List<TreatmentEvent> out = XdripJson.parseTreatments(
                 "[{\"_id\":\"s1\",\"created_at\":1715336400,\"insulin\":2}]");
