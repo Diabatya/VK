@@ -13,6 +13,13 @@ public class AlarmReceiver extends BroadcastReceiver {
     public void onReceive(Context context, Intent intent) {
         Logger.d(TAG, "Получен сигнал alarm, запускаем сервис для опроса xDrip+");
 
+        // Передача запрещена пользователем: alarm не возобновляет работу —
+        // выход до WakeLock и запуска сервиса.
+        if (!VkSenderService.isTransmissionAllowed(context)) {
+            Logger.d(TAG, "Передача остановлена пользователем — alarm проигнорирован");
+            return;
+        }
+
         PowerManager pm = (PowerManager) context.getSystemService(Context.POWER_SERVICE);
         if (pm == null) {
             Logger.w(TAG, "PowerManager недоступен");

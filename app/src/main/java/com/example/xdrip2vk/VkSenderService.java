@@ -46,6 +46,20 @@ public class VkSenderService extends Service {
     private static final String PREF_CONFIRMED_SENDER = "confirmed_sender";
     private static final String PREF_CONFIRMED_SENDER_FP = "confirmed_sender_fp";
     private static final String PREF_LAST_SENDER = "last_active_sender";
+    /**
+     * Сохранённое разрешение пользователя на передачу — источник выбора
+     * пользователя, не состояние процесса. Отсутствие ключа — установка до
+     * введения ключа: разрешено только если заданы токен и обычный чат
+     * (прежнее поведение существующей установки).
+     */
+    static final String PREF_TRANSMISSION_ENABLED = "transmission_enabled";
+    /** После явного «Запустить» первый снимок терапии — baseline без бэклога. */
+    private static final String PREF_TREATMENT_BASELINE_PENDING = "treatment_baseline_pending";
+    /**
+     * Запрет уже запрошен, но commit ещё не завершён: новые отправки в этом
+     * процессе блокируются сразу, не дожидаясь подтверждения записи.
+     */
+    private static volatile boolean userStopInFlight;
     /** Оба пути смены токена (ручной ввод и импорт файла) приходят сюда. */
     public static final String ACTION_TOKEN_CHANGED =
             "com.example.xdrip2vk.action.TOKEN_CHANGED";
@@ -132,11 +146,81 @@ public class VkSenderService extends Service {
     private int persistRetries;
 
     /**
+     * Разрешила ли пользовательская настройка передачу. При отсутствии ключа
+     * — миграция: разрешено только для существующей настроенной установки
+     * (заданы токен и обычный чат); новая ненастроенная — выключена.
+     * Сам чтение ключ не создаёт: выбор записывается только явным
+     * «Запустить»/«Остановить», настройки токена/чатов его не меняют.
+     */
+    public static boolean isTransmissionAllowed(Context context) {
+        if (userStopInFlight) {
+            return false; // запрет уже запрошен — запись ещё может идти
+        }
+        SharedPreferences p = PreferenceManager.getDefaultSharedPreferences(context);
+        if (!p.contains(PREF_TRANSMISSION_ENABLED)) {
+            return !TokenStorage.getToken(context).isEmpty()
+                    && TokenStorage.getChatId(context) > 0;
+        }
+        return p.getBoolean(PREF_TRANSMISSION_ENABLED, false);
+    }
+
+    /** Тестовая подмена подтверждённой записи разрешения (отказ диска). */
+    static volatile java.util.function.BooleanSupplier transmissionWriteOverride;
+
+    /** Подтверждённая запись пользовательского выбора; возобновление помечает baseline терапии. */
+    private static boolean writeTransmissionEnabled(Context context, boolean enabled) {
+        if (transmissionWriteOverride != null) {
+            return transmissionWriteOverride.getAsBoolean();
+        }
+        SharedPreferences.Editor e = PreferenceManager.getDefaultSharedPreferences(context)
+                .edit()
+                .putBoolean(PREF_TRANSMISSION_ENABLED, enabled);
+        if (enabled) {
+            e.putBoolean(PREF_TREATMENT_BASELINE_PENDING, true);
+        }
+        return e.commit();
+    }
+
+    /**
+     * «Остановить»: сначала блокировка в этом процессе и подтверждённая
+     * запись запрета, затем завершение текущего экземпляра.
+     * @return true — запрет подтверждённо записан и переживёт перезапуск;
+     *         false — передача остановлена, но сохранение не подтверждено.
+     */
+    public static boolean requestStopTransmission(Context context) {
+        userStopInFlight = true; // новые попытки блокируются до конца записи
+        boolean saved = writeTransmissionEnabled(context, false);
+        context.stopService(new Intent(context, VkSenderService.class));
+        return saved;
+    }
+
+    /**
+     * «Запустить»: сохранить разрешение и поднять рабочий экземпляр.
+     * Первый снимок терапии после возобновления становится baseline —
+     * история за время остановки не уходит бэклогом.
+     */
+    public static void requestStartTransmission(Context context) {
+        userStopInFlight = false;
+        writeTransmissionEnabled(context, true);
+        context.startForegroundService(new Intent(context, VkSenderService.class));
+    }
+
+    /** Сброс процессного флага запрета — только для тестов. */
+    static void resetTransmissionFlagsForTest() {
+        userStopInFlight = false;
+    }
+
+    /**
      * Единая точка оповещения о смене токена — ручной ввод и импорт файла
      * вызывают одинаковую процедуру: инвалидация прежней проверки и
      * повторная верификация новой версии на рабочем потоке сервиса.
+     * При запрещённой передаче настройка сохраняется, но сервис не
+     * запускается — смена токена не включает передачу.
      */
     public static void notifyTokenChanged(Context context) {
+        if (!isTransmissionAllowed(context)) {
+            return;
+        }
         Intent i = new Intent(context, VkSenderService.class);
         i.setAction(ACTION_TOKEN_CHANGED);
         context.startService(i);
@@ -162,12 +246,21 @@ public class VkSenderService extends Service {
         wakeLock = pm.newWakeLock(PowerManager.PARTIAL_WAKE_LOCK, "xDrip2VK::ServiceWakeLock");
 
         createNotificationChannel();
+        startForeground(NOTIFICATION_ID, createNotification("xDrip → VK: Ожидание данных от сенсора"));
+
+        if (!isTransmissionAllowed(this)) {
+            // Запоздавший запуск при сохранённом запрете: foreground-вызов
+            // уже выполнен (требование жизненного цикла), экземпляр сразу
+            // завершается — ожидать данные при запрете нельзя.
+            Logger.w(TAG, "Передача запрещена пользователем — экземпляр завершается");
+            stopSelf();
+            return;
+        }
+
         handlerThread = new HandlerThread("VkSenderThread");
         handlerThread.setUncaughtExceptionHandler(this::onWorkerFailure);
         handlerThread.start();
         handler = new Handler(handlerThread.getLooper());
-
-        startForeground(NOTIFICATION_ID, createNotification("xDrip → VK: Ожидание данных от сенсора"));
 
         coordinator = DeliveryCoordinator.load(store().read());
         coordinator.setCheckpoint(this::persistState);
@@ -202,6 +295,12 @@ public class VkSenderService extends Service {
             // запрашивает у системы перезапуск рабочего экземпляра.
             return START_STICKY;
         }
+        if (!isTransmissionAllowed(this)) {
+            // Запоздавшая команда (в т.ч. восстановление с null intent) при
+            // сохранённом запрете: экземпляр завершается, перезапуск не нужен.
+            stopSelf();
+            return START_NOT_STICKY;
+        }
         isRunning = true;
 
         if (intent == null || handler == null) {
@@ -210,8 +309,8 @@ public class VkSenderService extends Service {
         final Intent cmd = intent;
         // Сериализуем: никаких изменений состояния на главном потоке.
         handler.post(() -> {
-            if (shuttingDown) {
-                return; // завершение началось — новая работа не принимается
+            if (shuttingDown || !isTransmissionAllowed(this)) {
+                return; // завершение/запрет — queued intent обхода не даёт
             }
             boolean manualSend = cmd.getBooleanExtra("manual_send", false);
             boolean autoUpdate = cmd.getBooleanExtra("auto_update", false);
@@ -517,7 +616,7 @@ public class VkSenderService extends Service {
     }
 
     private void pollXDrip() {
-        if (!isRunning || shuttingDown) return;
+        if (!isRunning || shuttingDown || !isTransmissionAllowed(this)) return;
 
         boolean acquired = false;
         try {
@@ -548,6 +647,15 @@ public class VkSenderService extends Service {
             DeliveryCoordinator.Config cfg = loadConfig();
             List<TreatmentEvent> treatments = treatmentsOverride != null
                     ? treatmentsOverride.get() : XDripWebClient.fetchTreatments();
+            if (prefs.getBoolean(PREF_TREATMENT_BASELINE_PENDING, false)) {
+                // Явное возобновление: первый ВАЛИДНЫЙ снимок — baseline без
+                // бэклога за время остановки. null/ошибка baseline не
+                // завершают — флаг и неинициализированность сохраняются.
+                if (treatments != null) {
+                    prefs.edit().remove(PREF_TREATMENT_BASELINE_PENDING).apply();
+                    coordinator.resetTreatmentsBaseline();
+                }
+            }
             boolean showTreatments = prefs.getBoolean(PREF_SHOW_TREATMENTS, false);
             coordinator.onTreatments(treatments, cfg,
                     buildMessages(new XDripWebClient.DeviceStatusData(0, 0)),
@@ -640,6 +748,10 @@ public class VkSenderService extends Service {
         if (coordinator == null || shuttingDown) {
             return; // завершение: уже поставленные callbacks не возобновляют работу
         }
+        if (!isTransmissionAllowed(this)) {
+            updateNotification("Передача остановлена пользователем");
+            return; // запрет: ни отправок, ни перепланирования
+        }
         String token = TokenStorage.getToken(this);
         if (token.isEmpty()) {
             if (coordinator.pendingCount() > 0) {
@@ -662,11 +774,13 @@ public class VkSenderService extends Service {
                 ? senderOverride
                 : (peerId, text, randomId) -> VkApi.sendMessage(tokenF, peerId, text, randomId);
 
-        // Непосредственно перед каждой сетевой попыткой проверяется, что
-        // представленный токен актуален И завершение сервиса не началось.
+        // Непосредственно перед каждой сетевой попыткой (ПОСЛЕ последнего
+        // блокирующего checkpoint) проверяется: представленный токен актуален,
+        // завершение не началось, пользовательское разрешение не отозвано.
         DeliveryCoordinator.Summary s = coordinator.drain(sender, auth,
                 () -> fp.equals(Fingerprint.of(TokenStorage.getToken(this)))
-                        && !shuttingDown);
+                        && !shuttingDown
+                        && isTransmissionAllowed(this));
         // Финальный commit результатов обхода (внутри drain уже писались
         // checkpoint'и до/после каждой попытки).
         if (!coordinator.persistNow()) {
@@ -798,6 +912,9 @@ public class VkSenderService extends Service {
     }
 
     private void scheduleNextAlarm() {
+        if (!isTransmissionAllowed(this)) {
+            return; // запрет: будильники не восстанавливаются
+        }
         long interval = 300000; // 5 минут по умолчанию
         try {
             interval = Long.parseLong(prefs.getString("poll_interval", "300000"));

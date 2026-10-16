@@ -49,6 +49,8 @@ public class MainActivity extends AppCompatActivity {
     private Runnable updateUiRunnable;
     private long lastUpdateTime = 0;
     private long pollInterval = 300000; // 5 минут по умолчанию
+    /** «Запустить» нажата, ждём разрешения Android; «Остановить» сбрасывает. */
+    private volatile boolean startRequested;
 
 
     @Override
@@ -79,8 +81,14 @@ public class MainActivity extends AppCompatActivity {
             tvVersion.setText("v1.3");
         }
 
-        btnStartService.setOnClickListener(v -> startVkSenderService());
-        btnStopService.setOnClickListener(v -> stopVkSenderService());
+        btnStartService.setOnClickListener(v -> {
+            startRequested = true;
+            startVkSenderService();
+        });
+        btnStopService.setOnClickListener(v -> {
+            startRequested = false; // поздний grant разрешения не включит передачу
+            stopVkSenderService();
+        });
         fabSendNow.setOnClickListener(v -> sendNow());
 
         // Свайп влево → настройки
@@ -223,6 +231,11 @@ public class MainActivity extends AppCompatActivity {
     }
 
     private void sendNow() {
+        // Ручная отправка не включает постоянную работу скрытно.
+        if (!VkSenderService.isTransmissionAllowed(this)) {
+            chipStatus.setText("Сначала запустите передачу");
+            return;
+        }
         SharedPreferences prefs = PreferenceManager.getDefaultSharedPreferences(this);
         long lastTimestamp = prefs.getLong("last_bg_timestamp", 0);
         float lastBg = prefs.getFloat("last_bg_value", 0);
@@ -268,14 +281,19 @@ public class MainActivity extends AppCompatActivity {
             }
         }
 
-        Intent serviceIntent = new Intent(this, VkSenderService.class);
-        startForegroundService(serviceIntent);
+        VkSenderService.requestStartTransmission(this);
         updateStatus();
     }
 
     private void stopVkSenderService() {
-        Intent serviceIntent = new Intent(this, VkSenderService.class);
-        stopService(serviceIntent);
+        // Сначала подтверждённая запись запрета (внутри — блокировка
+        // текущего процесса до commit), затем завершение экземпляра.
+        boolean saved = VkSenderService.requestStopTransmission(this);
+        if (!saved) {
+            Toast.makeText(this,
+                    "Не удалось сохранить запрет — передача остановлена, но после перезапуска может возобновиться",
+                    Toast.LENGTH_LONG).show();
+        }
         updateStatus();
     }
 
@@ -296,11 +314,16 @@ public class MainActivity extends AppCompatActivity {
     }
 
     private void updateStatus() {
-        if (VkSenderService.isRunning()) {
+        // Различаем выбор пользователя и состояние процесса: после аварии
+        // (передача разрешена, процесс мёртв) «Остановлено» не показываем.
+        if (!VkSenderService.isTransmissionAllowed(this)) {
+            chipStatus.setText("Передача остановлена");
+            chipStatus.setChipIconResource(R.drawable.ic_status_off);
+        } else if (VkSenderService.isRunning()) {
             chipStatus.setText("Сервис работает");
             chipStatus.setChipIconResource(R.drawable.ic_status_on);
         } else {
-            chipStatus.setText("Сервис остановлен");
+            chipStatus.setText("Передача включена — сервис не активен");
             chipStatus.setChipIconResource(R.drawable.ic_status_off);
         }
     }
@@ -324,7 +347,11 @@ public class MainActivity extends AppCompatActivity {
     public void onRequestPermissionsResult(int requestCode, String[] permissions, int[] grantResults) {
         super.onRequestPermissionsResult(requestCode, permissions, grantResults);
         if (requestCode == REQUEST_NOTIFICATION_PERMISSION) {
-            if (grantResults.length > 0 && grantResults[0] == PackageManager.PERMISSION_GRANTED) {
+            if (grantResults.length > 0 && grantResults[0] == PackageManager.PERMISSION_GRANTED
+                    && startRequested) {
+                // Устаревший callback: пользователь мог успеть нажать
+                // «Остановить» — тогда startRequested уже false и поздний
+                // grant передачу не включит.
                 startVkSenderService();
             }
         }

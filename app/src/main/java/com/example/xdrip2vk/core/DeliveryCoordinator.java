@@ -305,6 +305,18 @@ public final class DeliveryCoordinator {
         return added;
     }
 
+    /**
+     * Явное возобновление передачи после остановки: история за время паузы не
+     * должна уходить бэклогом — следующий валидный снимок снова становится
+     * baseline (все его события помечаются просмотренными без отправки).
+     * Сообщения, поставленные до остановки, в outbox не трогаются.
+     */
+    public void resetTreatmentsBaseline() {
+        treatmentsInitialized = false;
+        seenTreatmentIds.clear();
+        persistDirty = true;
+    }
+
     // ---------- Доставка ----------
 
     /**

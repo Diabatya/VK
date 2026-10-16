@@ -22,7 +22,11 @@ public class BootReceiver extends BroadcastReceiver {
                 }
             }
 
-            // Запускаем сервис только если настроены токен и chat ID
+            // Запускаем сервис только если пользователь разрешил передачу
+            // и настроены токен и chat ID
+            if (!VkSenderService.isTransmissionAllowed(context)) {
+                return;
+            }
             String token = TokenStorage.getToken(context);
             long chatId = TokenStorage.getChatId(context);
 

@@ -18,6 +18,13 @@ public class BgReceiver extends BroadcastReceiver {
     public void onReceive(Context context, Intent intent) {
         Logger.d(TAG, "Получен broadcast от xDrip+: " + intent.getAction());
 
+        // Передача запрещена пользователем: выходим до WakeLock, записи
+        // кандидата и запуска сервиса — broadcast не ставит сообщения в очередь.
+        if (!VkSenderService.isTransmissionAllowed(context)) {
+            Logger.d(TAG, "Передача остановлена пользователем — broadcast проигнорирован");
+            return;
+        }
+
         // Удерживаем CPU awake на время обработки broadcast и старта сервиса (макс 10 сек)
         PowerManager pm = (PowerManager) context.getSystemService(Context.POWER_SERVICE);
         if (pm == null) {

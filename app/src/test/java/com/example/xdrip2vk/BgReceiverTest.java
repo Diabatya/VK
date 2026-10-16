@@ -34,6 +34,11 @@ public class BgReceiverTest {
         context = ApplicationProvider.getApplicationContext();
         prefs = PreferenceManager.getDefaultSharedPreferences(context);
         prefs.edit().clear().commit();
+        // передача разрешена: тестируется обработка broadcast, а не запрет
+        prefs.edit()
+                .putBoolean(VkSenderService.PREF_TRANSMISSION_ENABLED, true)
+                .commit();
+        VkSenderService.resetTransmissionFlagsForTest();
     }
 
     private Intent xdripBroadcast(double bg, long ts, String slopeName) {
