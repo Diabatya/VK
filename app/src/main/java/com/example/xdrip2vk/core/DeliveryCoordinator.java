@@ -50,16 +50,16 @@ public final class DeliveryCoordinator {
         public final boolean alertsEnabled;
         public final boolean configured; // токен+чат заданы — есть смысл ставить в очередь
         public final AlertThresholds thresholds;
-        public final int tokenHash;
+        public final AuthContext auth;
 
         public Config(String normalPeer, String alertPeer, boolean alertsEnabled,
-                      boolean configured, AlertThresholds thresholds, int tokenHash) {
+                      boolean configured, AlertThresholds thresholds, AuthContext auth) {
             this.normalPeer = normalPeer == null ? "" : normalPeer;
             this.alertPeer = alertPeer == null ? "" : alertPeer;
             this.alertsEnabled = alertsEnabled;
             this.configured = configured;
             this.thresholds = thresholds;
-            this.tokenHash = tokenHash;
+            this.auth = auth == null ? AuthContext.NONE : auth;
         }
     }
 
@@ -82,8 +82,8 @@ public final class DeliveryCoordinator {
     private long missedAlertUntilMs;
     private boolean treatmentsInitialized;
     private final LinkedHashSet<String> seenTreatmentIds = new LinkedHashSet<>();
-    private boolean authFailed;
-    private int authFailedTokenHash;
+    /** Fingerprint токена, давшего AUTH_FAILED; "" — блокировки нет. */
+    private String blockedTokenFp = "";
     private final SecureRandom random = new SecureRandom();
 
     public DeliveryCoordinator() {
@@ -122,10 +122,10 @@ public final class DeliveryCoordinator {
                     && cfg.configured && isValidPeer(cfg.normalPeer)
                     && !outbox.hasPendingForPrefix("bg:" + r.timestampMs)) {
                 // Ручная отправка доставленного показания — новое логическое сообщение
-                enqueue(new PendingMessage(
+                enqueue(bound(new PendingMessage(
                         "bg:" + r.timestampMs + ":m:" + now,
                         cfg.normalPeer, msgs.regular(r), newRandomId(),
-                        r.timestampMs + ReadingGate.MAX_AGE_MS));
+                        r.timestampMs + ReadingGate.MAX_AGE_MS), cfg));
                 return ReadingOutcome.ACCEPTED;
             }
             // Для устаревшего повтора возвращаем реальный вердикт — информативнее DUPLICATE
@@ -146,23 +146,23 @@ public final class DeliveryCoordinator {
             // Ручная отправка всегда создаёт новое логическое сообщение,
             // если это показание уже не ждёт в очереди.
             if (!outbox.hasPendingForPrefix("bg:" + r.timestampMs)) {
-                enqueue(new PendingMessage(
+                enqueue(bound(new PendingMessage(
                         "bg:" + r.timestampMs + ":m:" + now,
-                        cfg.normalPeer, msgs.regular(r), newRandomId(), expires));
+                        cfg.normalPeer, msgs.regular(r), newRandomId(), expires), cfg));
             }
         } else {
-            enqueue(new PendingMessage(
+            enqueue(bound(new PendingMessage(
                     "bg:" + r.timestampMs,
-                    cfg.normalPeer, msgs.regular(r), newRandomId(), expires));
+                    cfg.normalPeer, msgs.regular(r), newRandomId(), expires), cfg));
         }
 
         if (cfg.alertsEnabled) {
             AlertThresholds.Level level = cfg.thresholds.classify(r.sgvMgdl);
             if (level != AlertThresholds.Level.NORMAL) {
                 if (isValidPeer(cfg.alertPeer)) {
-                    enqueue(new PendingMessage(
+                    enqueue(bound(new PendingMessage(
                             "alert:" + r.timestampMs,
-                            cfg.alertPeer, msgs.alert(r, level), newRandomId(), expires));
+                            cfg.alertPeer, msgs.alert(r, level), newRandomId(), expires), cfg));
                 } else {
                     // Чат тревог не выбран: псевдосообщение для peer_id=0 не
                     // создаём, но фиксируем пропущенную тревогу — она остаётся
@@ -229,14 +229,14 @@ public final class DeliveryCoordinator {
             }
             long expires = e.createdAtMs + TREATMENT_MAX_AGE_MS;
             if (e.hasInsulin()) {
-                if (enqueue(new PendingMessage("treat:" + e.id + ":ins",
-                        cfg.normalPeer, msgs.treatment(e, true), newRandomId(), expires))) {
+                if (enqueue(bound(new PendingMessage("treat:" + e.id + ":ins",
+                        cfg.normalPeer, msgs.treatment(e, true), newRandomId(), expires), cfg))) {
                     added++;
                 }
             }
             if (e.hasCarbs()) {
-                if (enqueue(new PendingMessage("treat:" + e.id + ":carb",
-                        cfg.normalPeer, msgs.treatment(e, false), newRandomId(), expires))) {
+                if (enqueue(bound(new PendingMessage("treat:" + e.id + ":carb",
+                        cfg.normalPeer, msgs.treatment(e, false), newRandomId(), expires), cfg))) {
                     added++;
                 }
             }
@@ -248,19 +248,24 @@ public final class DeliveryCoordinator {
 
     /**
      * Попытка доставить все готовые сообщения. Каждое сообщение независимо:
-     * успех одного не подтверждает другие. Ошибка авторизации помечает сообщение
-     * терминальным и блокирует повторы до смены токена.
+     * успех одного не подтверждает другие. Ошибка авторизации НЕ делает
+     * сообщение терминальным — оно остаётся auth-заблокированным и
+     * возобновляется после подтверждённого обновления токена того же
+     * отправителя. Сетевых попыток с заблокированным токеном нет; при
+     * неподтверждённой личности очередь сохраняется без отправок; сообщения
+     * чужого подтверждённого аккаунта или без владельца не отправляются.
      *
      * Время запрашивается у clock непосредственно перед каждой отправкой:
      * если пока шла предыдущая сетевая попытка срок сообщения истёк,
      * отправка не начинается. Backoff отсчитывается от завершения попытки.
      */
-    public Summary drain(Sender sender, int tokenHash) {
-        if (authFailed && tokenHash != authFailedTokenHash) {
-            authFailed = false; // токен сменился — пробуем снова
-        }
+    public Summary drain(Sender sender, AuthContext auth) {
         Summary s = new Summary();
         s.expired += outbox.removeExpired(clock.now());
+        // Тот же заблокированный токен: сетевых попыток нет вообще.
+        boolean tokenBlocked = !auth.tokenFp.isEmpty()
+                && auth.tokenFp.equals(blockedTokenFp);
+        boolean sweepStopped = false;
 
         for (PendingMessage m : new ArrayList<>(outbox.all())) {
             long t = clock.now();
@@ -273,8 +278,8 @@ public final class DeliveryCoordinator {
                 s.expired++;
                 continue;
             }
-            if (authFailed) {
-                continue; // авторизация сломана — повторы бессмысленны
+            if (sweepStopped || tokenBlocked || !auth.verified || !ownerMatches(m, auth)) {
+                continue; // очередь сохраняется, но сеть не трогаем
             }
             SendResult res;
             try {
@@ -306,10 +311,12 @@ public final class DeliveryCoordinator {
                     s.retried++;
                     break;
                 case AUTH_FAILED:
-                    outbox.onTerminal(m.key, "auth");
-                    authFailed = true;
-                    authFailedTokenHash = tokenHash;
+                    // Возобновляемая блокировка, а не окончательная ошибка:
+                    // random_id, адресат, текст и expiry сохраняются.
+                    outbox.onAuthBlocked(m.key);
+                    blockedTokenFp = auth.tokenFp;
                     s.authFailures++;
+                    sweepStopped = true; // остальным этот токен тоже не пройдёт
                     break;
                 case PERMANENT:
                 default:
@@ -323,25 +330,74 @@ public final class DeliveryCoordinator {
     }
 
     /**
-     * Ближайшее время, когда стоит проснуться, или -1.
-     * При auth-блокировке сетевых попыток нет — планируется только очистка
-     * по ближайшему сроку истечения, а не посекундный drain.
+     * Можно ли сейчас пытаться отправить сообщение данным auth-контекстом.
+     * Непривязанное сообщение связывается с подтверждённым владельцем только
+     * если оно создано под той же версией токена (enqueuedFp совпадает) —
+     * очередь старой схемы без владельца новому аккаунту не приписывается.
+     * Адресат и владелец при этом не переписываются.
      */
-    public long nextDueAt() {
-        long now = clock.now();
-        if (authFailed) {
-            long best = -1;
-            for (PendingMessage m : outbox.all()) {
-                if (m.terminal || m.expiresAtMs <= now) {
-                    continue;
-                }
-                if (best < 0 || m.expiresAtMs < best) {
-                    best = m.expiresAtMs;
-                }
+    private boolean ownerMatches(PendingMessage m, AuthContext auth) {
+        if (m.senderId == null || m.senderId.isEmpty()) {
+            if (!m.enqueuedFp.isEmpty() && m.enqueuedFp.equals(auth.tokenFp)) {
+                m.senderId = auth.senderId; // поздняя привязка после подтверждения
+                return true;
             }
-            return best;
+            return false; // владелец неизвестен
         }
-        return outbox.nextDueAt(now);
+        return m.senderId.equals(auth.senderId);
+    }
+
+    /**
+     * Ближайшее время, когда стоит проснуться, или -1.
+     * Сообщения, недоступные текущему auth (заблокированный токен,
+     * неподтверждённая личность, чужой/неизвестный владелец), планируют
+     * только очистку по сроку истечения — не посекундный drain.
+     */
+    public long nextDueAt(AuthContext auth) {
+        long now = clock.now();
+        boolean tokenBlocked = !auth.tokenFp.isEmpty()
+                && auth.tokenFp.equals(blockedTokenFp);
+        long best = -1;
+        for (PendingMessage m : outbox.all()) {
+            if (m.terminal || m.expiresAtMs <= now) {
+                continue;
+            }
+            boolean eligible = !tokenBlocked && auth.verified && ownerMatchesPeek(m, auth);
+            long t = eligible ? Math.max(m.notBeforeMs, now) : m.expiresAtMs;
+            if (best < 0 || t < best) {
+                best = t;
+            }
+        }
+        return best;
+    }
+
+    /** Та же проверка владельца, но без привязки (для планирования/статуса). */
+    private boolean ownerMatchesPeek(PendingMessage m, AuthContext auth) {
+        if (m.senderId == null || m.senderId.isEmpty()) {
+            return !m.enqueuedFp.isEmpty() && m.enqueuedFp.equals(auth.tokenFp);
+        }
+        return m.senderId.equals(auth.senderId);
+    }
+
+    /**
+     * Сколько нетерминальных непросроченных сообщений недоступно данному
+     * auth-контексту (чужой подтверждённый аккаунт, неизвестный владелец
+     * старой схемы, заблокированный токен). Для достоверного статуса.
+     */
+    public int blockedCount(AuthContext auth) {
+        long now = clock.now();
+        boolean tokenBlocked = !auth.tokenFp.isEmpty()
+                && auth.tokenFp.equals(blockedTokenFp);
+        int n = 0;
+        for (PendingMessage m : outbox.all()) {
+            if (m.terminal || m.expiresAtMs <= now) {
+                continue;
+            }
+            if (tokenBlocked || !auth.verified || !ownerMatchesPeek(m, auth)) {
+                n++;
+            }
+        }
+        return n;
     }
 
     public boolean hasDue() {
@@ -361,8 +417,9 @@ public final class DeliveryCoordinator {
         return outbox.all();
     }
 
-    public boolean isAuthFailed() {
-        return authFailed;
+    /** Данный fingerprint токена сейчас заблокирован ошибкой авторизации. */
+    public boolean isAuthBlocked(String tokenFp) {
+        return tokenFp != null && !tokenFp.isEmpty() && tokenFp.equals(blockedTokenFp);
     }
 
     /**
@@ -390,8 +447,7 @@ public final class DeliveryCoordinator {
             o.put("v", STATE_VERSION);
             o.put("lastSeenBgMs", lastSeenBgMs);
             o.put("treatInit", treatmentsInitialized);
-            o.put("authFailed", authFailed);
-            o.put("authTokenHash", authFailedTokenHash);
+            o.put("blockedFp", blockedTokenFp);
             o.put("missedAlertMs", missedAlertUntilMs);
             JSONArray ids = new JSONArray();
             for (String id : seenTreatmentIds) {
@@ -418,8 +474,7 @@ public final class DeliveryCoordinator {
             JSONObject o = new JSONObject(json);
             c.lastSeenBgMs = o.optLong("lastSeenBgMs", 0);
             c.treatmentsInitialized = o.optBoolean("treatInit", false);
-            c.authFailed = o.optBoolean("authFailed", false);
-            c.authFailedTokenHash = o.optInt("authTokenHash", 0);
+            c.blockedTokenFp = o.optString("blockedFp", "");
             c.missedAlertUntilMs = o.optLong("missedAlertMs", 0);
             JSONArray ids = o.optJSONArray("seenTreat");
             if (ids != null) {
@@ -435,6 +490,18 @@ public final class DeliveryCoordinator {
             return new DeliveryCoordinator();
         }
         return c;
+    }
+
+    /**
+     * Привязка нового сообщения к контексту авторизации: подтверждённый
+     * владелец записывается сразу; без подтверждения сообщение помечается
+     * версией токена, под которой создано, — после успешной проверки того
+     * же токена оно получит владельца автоматически.
+     */
+    private PendingMessage bound(PendingMessage m, Config cfg) {
+        m.senderId = cfg.auth.verified ? cfg.auth.senderId : "";
+        m.enqueuedFp = cfg.auth.tokenFp;
+        return m;
     }
 
     private boolean enqueue(PendingMessage m) {

@@ -20,6 +20,10 @@ public final class PendingMessage {
     public long notBeforeMs;
     public boolean terminal;
     public String lastError;
+    /** Подтверждённый владелец ("user:123"/"group:456"); "" — не привязано/legacy. */
+    public String senderId;
+    /** Fingerprint токена, под которым создано; "" — наследие старой схемы. */
+    public String enqueuedFp;
 
     public PendingMessage(String key, String peerId, String text, int randomId, long expiresAtMs) {
         this.key = key;
@@ -31,6 +35,8 @@ public final class PendingMessage {
         this.notBeforeMs = 0;
         this.terminal = false;
         this.lastError = "";
+        this.senderId = "";
+        this.enqueuedFp = "";
     }
 
     public JSONObject toJson() throws JSONException {
@@ -44,6 +50,8 @@ public final class PendingMessage {
         o.put("nb", notBeforeMs);
         o.put("term", terminal);
         o.put("err", lastError == null ? "" : lastError);
+        o.put("snd", senderId == null ? "" : senderId);
+        o.put("fp", enqueuedFp == null ? "" : enqueuedFp);
         return o;
     }
 
@@ -58,6 +66,10 @@ public final class PendingMessage {
         m.notBeforeMs = o.optLong("nb", 0);
         m.terminal = o.optBoolean("term", false);
         m.lastError = o.optString("err", "");
+        // У записей старой схемы владельца нет — такие сообщения остаются
+        // заблокированными («владелец неизвестен») до истечения срока.
+        m.senderId = o.optString("snd", "");
+        m.enqueuedFp = o.optString("fp", "");
         if (m.key.isEmpty() || m.randomId == 0) {
             return null;
         }

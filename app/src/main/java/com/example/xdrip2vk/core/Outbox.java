@@ -82,6 +82,18 @@ public final class Outbox {
         }
     }
 
+    /**
+     * Ошибка авторизации — возобновляемая блокировка: сообщение остаётся
+     * в очереди с прежними random_id и сроком и повторится после
+     * подтверждённого обновления токена того же отправителя.
+     */
+    public void onAuthBlocked(String key) {
+        PendingMessage m = map.get(key);
+        if (m != null) {
+            m.lastError = "auth";
+        }
+    }
+
     public void onTerminal(String key, String error) {
         PendingMessage m = map.get(key);
         if (m != null) {

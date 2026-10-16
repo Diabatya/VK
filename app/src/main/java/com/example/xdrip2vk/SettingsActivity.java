@@ -97,6 +97,7 @@ public class SettingsActivity extends AppCompatActivity {
                 tokenPref.setOnPreferenceChangeListener((preference, newValue) -> {
                     String value = newValue == null ? "" : newValue.toString().trim();
                     TokenStorage.setToken(preference.getContext(), value);
+                    VkSenderService.notifyTokenChanged(preference.getContext());
                     preference.setSummary(value.isEmpty() ? "Токен не задан" : "Токен задан");
                     ((EditTextPreference) preference).setText(value);
                     return true;
@@ -261,6 +262,8 @@ public class SettingsActivity extends AppCompatActivity {
                     return;
                 }
                 TokenStorage.setToken(requireContext(), token);
+                // Тот же путь, что и ручной ввод: проверка новой версии токена.
+                VkSenderService.notifyTokenChanged(requireContext());
                 EditTextPreference tokenPref = findPreference("vk_token");
                 if (tokenPref != null) {
                     tokenPref.setText(token);

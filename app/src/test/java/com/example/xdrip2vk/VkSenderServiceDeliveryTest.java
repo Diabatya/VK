@@ -50,11 +50,13 @@ public class VkSenderServiceDeliveryTest {
             peers.add(peer);
             return rule != null ? rule.apply(peer) : result.get();
         };
+        VkSenderService.identityVerifierOverride = (token) -> "user:1";
     }
 
     @After
     public void tearDown() {
         VkSenderService.senderOverride = null;
+        VkSenderService.identityVerifierOverride = null;
     }
 
     private VkSenderService startService() {

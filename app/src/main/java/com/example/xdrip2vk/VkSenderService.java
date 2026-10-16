@@ -18,7 +18,9 @@ import android.os.Build;
 import androidx.core.app.NotificationCompat;
 import androidx.preference.PreferenceManager;
 import com.example.xdrip2vk.core.AlertThresholds;
+import com.example.xdrip2vk.core.AuthContext;
 import com.example.xdrip2vk.core.DeliveryCoordinator;
+import com.example.xdrip2vk.core.Fingerprint;
 import com.example.xdrip2vk.core.SgvReading;
 import com.example.xdrip2vk.core.TreatmentEvent;
 import com.example.xdrip2vk.core.Units;
@@ -41,6 +43,12 @@ public class VkSenderService extends Service {
     private static final String PREF_SHOW_COB = "show_cob";
     private static final String PREF_SHOW_TREATMENTS = "show_treatments";
     private static final String PREF_STATE = "delivery_state_v2";
+    private static final String PREF_CONFIRMED_SENDER = "confirmed_sender";
+    private static final String PREF_CONFIRMED_SENDER_FP = "confirmed_sender_fp";
+    private static final String PREF_LAST_SENDER = "last_active_sender";
+    /** Оба пути смены токена (ручной ввод и импорт файла) приходят сюда. */
+    public static final String ACTION_TOKEN_CHANGED =
+            "com.example.xdrip2vk.action.TOKEN_CHANGED";
     private static volatile boolean isRunning = false;
     private HandlerThread handlerThread;
     private Handler handler;
@@ -55,6 +63,20 @@ public class VkSenderService extends Service {
 
     // Тестовая точка подмены отправителя для unit-тестов под Robolectric.
     static volatile DeliveryCoordinator.Sender senderOverride;
+
+    // Тестовая точка подмены проверки владельца токена (без сети).
+    static volatile java.util.function.Function<String, String> identityVerifierOverride;
+
+    /**
+     * Единая точка оповещения о смене токена — ручной ввод и импорт файла
+     * вызывают одинаковую процедуру: инвалидация прежней проверки и
+     * повторная верификация новой версии на рабочем потоке сервиса.
+     */
+    public static void notifyTokenChanged(Context context) {
+        Intent i = new Intent(context, VkSenderService.class);
+        i.setAction(ACTION_TOKEN_CHANGED);
+        context.startService(i);
+    }
 
     // Последняя реально назначенная задержка drainRunnable (для тестов планировщика).
     volatile long lastDrainDelayMs = -1;
@@ -131,8 +153,13 @@ public class VkSenderService extends Service {
             boolean manualSend = cmd.getBooleanExtra("manual_send", false);
             boolean autoUpdate = cmd.getBooleanExtra("auto_update", false);
             boolean pollNow = cmd.getBooleanExtra("poll_now", false);
+            boolean tokenChanged = ACTION_TOKEN_CHANGED.equals(cmd.getAction());
 
-            if (manualSend || autoUpdate) {
+            if (tokenChanged) {
+                // Не ждём следующего показания: проверка новой версии токена
+                // и возобновление допустимой очереди — сразу на рабочем потоке.
+                drainAndSchedule();
+            } else if (manualSend || autoUpdate) {
                 SgvReading r = readingFromIntent(cmd);
                 if (r == null) {
                     Logger.w(TAG, "Отклонено показание из intent: нет корректных данных");
@@ -232,7 +259,7 @@ public class VkSenderService extends Service {
                 chatId > 0 ? String.valueOf(chatId) : "",
                 alertChatId != 0 ? String.valueOf(alertChatId) : "",
                 alertEnabled, configured, thresholds,
-                token.isEmpty() ? 0 : token.hashCode());
+                currentAuthContext(token));
     }
 
     private DeliveryCoordinator.Messages buildMessages(XDripWebClient.DeviceStatusData status) {
@@ -446,11 +473,73 @@ public class VkSenderService extends Service {
         drainAndSchedule();
     }
 
+    /**
+     * Auth-контекст представленного токена: fingerprint + подтверждённый
+     * владелец. Подтверждённая привязка повторно используется для того же
+     * fingerprint; для новой версии токена нужна новая проверка.
+     */
+    private AuthContext currentAuthContext(String token) {
+        if (token.isEmpty()) {
+            return AuthContext.NONE;
+        }
+        String fp = Fingerprint.of(token);
+        if (fp.isEmpty()) {
+            return AuthContext.NONE;
+        }
+        String confirmedFp = prefs.getString(PREF_CONFIRMED_SENDER_FP, "");
+        if (fp.equals(confirmedFp)) {
+            return AuthContext.verified(fp,
+                    prefs.getString(PREF_CONFIRMED_SENDER, ""));
+        }
+        return AuthContext.unverified(fp);
+    }
+
+    /**
+     * Проверка владельца токена запросом VK на рабочем потоке. Результат
+     * применяется только если токен за время проверки не сменился: устаревший
+     * ответ для прежней версии не активирует отправку. Ошибка сети или
+     * неопределённый ответ — не подтверждение. null → токен сменился.
+     */
+    private AuthContext verifyTokenOwner(String token, String fp) {
+        String owner = identityVerifierOverride != null
+                ? identityVerifierOverride.apply(token)
+                : VkApi.fetchTokenOwner(token);
+        String tokenNow = TokenStorage.getToken(this);
+        if (!Fingerprint.of(tokenNow).equals(fp)) {
+            return null; // токен сменился во время проверки
+        }
+        if (owner == null || owner.isEmpty()) {
+            return AuthContext.unverified(fp);
+        }
+        prefs.edit()
+                .putString(PREF_CONFIRMED_SENDER, owner)
+                .putString(PREF_CONFIRMED_SENDER_FP, fp)
+                .apply();
+        onConfirmedSender(owner);
+        return AuthContext.verified(fp, owner);
+    }
+
+    /**
+     * Подтверждённая смена аккаунта: чаты прежнего отправителя сбрасываются —
+     * их нужно выбрать заново. Единицы, пороги и имя устройства сохраняются.
+     * Старая очередь хранится в coordinator со своим владельцем до истечения.
+     */
+    private void onConfirmedSender(String owner) {
+        String prev = prefs.getString(PREF_LAST_SENDER, "");
+        if (!prev.isEmpty() && !prev.equals(owner)) {
+            TokenStorage.setChatId(this, 0);
+            TokenStorage.setAlertChatId(this, 0);
+            Logger.w(TAG, "Подтверждён другой владелец токена — чаты нужно выбрать заново");
+        }
+        if (!owner.equals(prev)) {
+            prefs.edit().putString(PREF_LAST_SENDER, owner).apply();
+        }
+    }
+
     private void drainAndSchedule() {
         if (coordinator == null) {
             return;
         }
-        long now = System.currentTimeMillis();
         String token = TokenStorage.getToken(this);
         if (token.isEmpty()) {
             if (coordinator.pendingCount() > 0) {
@@ -458,19 +547,29 @@ public class VkSenderService extends Service {
             }
             return;
         }
+        String fp = Fingerprint.of(token);
+        AuthContext auth = currentAuthContext(token);
+        if (!auth.verified) {
+            auth = verifyTokenOwner(token, fp);
+            if (auth == null) {
+                // Токен заменён во время проверки — цикл с новой версией.
+                drainAndSchedule();
+                return;
+            }
+        }
         final String tokenF = token;
         DeliveryCoordinator.Sender sender = senderOverride != null
                 ? senderOverride
                 : (peerId, text, randomId) -> VkApi.sendMessage(tokenF, peerId, text, randomId);
 
-        DeliveryCoordinator.Summary s = coordinator.drain(sender, token.hashCode());
+        DeliveryCoordinator.Summary s = coordinator.drain(sender, auth);
         saveState();
         Logger.d(TAG, "Доставка: отправлено=" + s.sent + ", повторы=" + s.retried
                 + ", auth=" + s.authFailures + ", permanent=" + s.permanent + ", expired=" + s.expired);
 
-        updateDeliveryStatus(s);
+        updateDeliveryStatus(s, auth);
 
-        long due = coordinator.nextDueAt();
+        long due = coordinator.nextDueAt(auth);
         if (due > 0) {
             long delay = Math.max(due - System.currentTimeMillis(), 1000);
             lastDrainDelayMs = delay; // для тестов планировщика
@@ -487,14 +586,25 @@ public class VkSenderService extends Service {
      * сохраняющуюся ошибку другого, а для terminal/permanent нельзя
      * обещать повтор.
      */
-    private void updateDeliveryStatus(DeliveryCoordinator.Summary s) {
+    private void updateDeliveryStatus(DeliveryCoordinator.Summary s, AuthContext auth) {
         long now = System.currentTimeMillis();
-        if (coordinator.isAuthFailed()) {
+        if (coordinator.isAuthBlocked(auth.tokenFp)) {
             updateNotification("Ошибка авторизации VK — проверьте токен в настройках");
+            return;
+        }
+        if (!auth.verified) {
+            updateNotification("Не удалось подтвердить владельца токена — отправка заблокирована");
             return;
         }
         int pending = coordinator.pendingCount();
         int terminal = coordinator.terminalCount();
+        // Сообщения другого подтверждённого аккаунта или старой схемы без
+        // владельца — заблокированы до истечения срока, а не «ждут повтора».
+        int blocked = coordinator.blockedCount(auth);
+        int eligible = pending - blocked;
+        String blockedNote = blocked > 0
+                ? "очередь прежнего аккаунта или версии заблокирована — выберите чаты заново"
+                : null;
         // Пропущенная из-за невыбранного чата тревога — сохраняющееся состояние,
         // а не одноразовый текст: её не должен скрывать поздний успех других
         // сообщений. После истечения срока явно сообщаем, что она не отправлена.
@@ -504,18 +614,33 @@ public class VkSenderService extends Service {
                         ? "Тревога не отправлена: для тревог не выбран чат — укажите его в настройках"
                         : "Срок тревоги истёк — она не была отправлена (чат тревог не был выбран)")
                 : null;
-        if (pending > 0) {
-            long due = coordinator.nextDueAt();
+        if (eligible > 0) {
+            long due = coordinator.nextDueAt(auth);
             if (due > 0) {
-                String suffix = terminal > 0 ? " (есть окончательные ошибки)" : "";
-                String extra = missed != null ? " · " + missed : "";
-                updateNotification("Часть сообщений не доставлена, повтор через "
-                        + Math.max(due - now, 0) / 1000 + " сек" + suffix + extra);
+                StringBuilder b = new StringBuilder(
+                        "Часть сообщений не доставлена, повтор через ")
+                        .append(Math.max(due - now, 0) / 1000).append(" сек");
+                if (terminal > 0) {
+                    b.append(" (есть окончательные ошибки)");
+                }
+                if (blockedNote != null) {
+                    b.append(" · ").append(blockedNote);
+                }
+                if (missed != null) {
+                    b.append(" · ").append(missed);
+                }
+                updateNotification(b.toString());
                 return;
             }
         }
         if (terminal > 0) {
             updateNotification("Часть сообщений не доставлена — окончательная ошибка, повтор не планируется"
+                    + (blockedNote != null ? " · " + blockedNote : "")
+                    + (missed != null ? " · " + missed : ""));
+            return;
+        }
+        if (blockedNote != null) {
+            updateNotification("Часть сообщений не доставлена — " + blockedNote
                     + (missed != null ? " · " + missed : ""));
             return;
         }

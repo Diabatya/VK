@@ -9,6 +9,7 @@ import android.content.SharedPreferences;
 import androidx.preference.PreferenceManager;
 import androidx.test.core.app.ApplicationProvider;
 
+import com.example.xdrip2vk.core.AuthContext;
 import com.example.xdrip2vk.core.DeliveryCoordinator;
 import com.example.xdrip2vk.core.SendResult;
 
@@ -62,11 +63,14 @@ public class VkSenderServiceMigrationTest {
             sends.add(new Call(peer, text, rid));
             return result.get();
         };
+        // владелец токена подтверждён синтетически — без сети
+        VkSenderService.identityVerifierOverride = (token) -> "user:1";
     }
 
     @After
     public void tearDown() {
         VkSenderService.senderOverride = null;
+        VkSenderService.identityVerifierOverride = null;
     }
 
     private VkSenderService startService() {
@@ -258,7 +262,7 @@ public class VkSenderServiceMigrationTest {
         restored.drain((p, t, r) -> {
             retryCalls.add(new Call(p, t, r));
             return SendResult.SENT;
-        }, 1);
+        }, AuthContext.verified("fp", "user:1")); // тот же отправитель
         assertEquals(1, retryCalls.size());
         assertEquals(rid, retryCalls.get(0).rid);
     }

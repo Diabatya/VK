@@ -2,6 +2,7 @@ package com.example.xdrip2vk;
 
 import com.example.xdrip2vk.core.SendResult;
 
+import org.json.JSONArray;
 import org.json.JSONException;
 import org.json.JSONObject;
 import java.io.BufferedReader;
@@ -99,6 +100,57 @@ public class VkApi {
         } catch (JSONException e) {
             return SendResult.RETRYABLE;
         }
+    }
+
+    /**
+     * Подтверждённый владелец предъявленного токена по официальному контракту
+     * VK API: для пользовательского токена users.get без параметров возвращает
+     * владельца токена, для токена сообщества groups.getById без параметров
+     * возвращает сообщество-владельца (схема vk-api-schema, methods.json).
+     * Владельца определяет только предъявленный токен — никаких user_id/group_id
+     * снаружи не передаётся. Возвращает "user:&lt;id&gt;" или "group:&lt;id&gt;",
+     * либо null при ошибке сети/отказе авторизации/неопределённом ответе —
+     * неопределённый ответ не считается успешной проверкой.
+     */
+    public static String fetchTokenOwner(String token) {
+        if (token == null || token.isEmpty()) {
+            return null;
+        }
+        Long id = firstResponseId(request("users.get", token, null));
+        if (id != null) {
+            return "user:" + id;
+        }
+        id = firstResponseId(request("groups.getById", token, null));
+        if (id != null) {
+            return "group:" + id;
+        }
+        return null;
+    }
+
+    /** Первый объект с полем id из массива response (учитываем и форму {groups:[]}). */
+    private static Long firstResponseId(String body) {
+        if (body == null || body.isEmpty()) {
+            return null;
+        }
+        try {
+            JSONObject o = new JSONObject(body);
+            JSONArray arr = o.optJSONArray("response");
+            if (arr == null) {
+                JSONObject resp = o.optJSONObject("response");
+                if (resp != null) {
+                    arr = resp.optJSONArray("groups");
+                }
+            }
+            if (arr != null && arr.length() > 0) {
+                JSONObject item = arr.optJSONObject(0);
+                if (item != null && item.has("id")) {
+                    return item.getLong("id");
+                }
+            }
+        } catch (JSONException e) {
+            // неопределённый ответ — проверка не пройдена
+        }
+        return null;
     }
 
     public static String request(String method, String token, Map<String, String> params) {
