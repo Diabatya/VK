@@ -156,4 +156,92 @@ public class BgReceiverTest {
         // старый пришёл лишь во входной кандидат — сервис отсечёт его дедупом
         assertEquals(now - 5 * 60_000, prefs.getLong("candidate_bg_timestamp", 0));
     }
+
+    // --- Текущее поведение доверия (задание 2В.1): подтверждение отправителя
+    // отсутствует — тесты документируют уязвимость, а не одобряют её.
+    // Прямой вызов onReceive под Robolectric не моделирует системную проверку
+    // полномочий между приложениями; он показывает лишь, что содержимое
+    // намерения определяет обработку независимо от его происхождения.
+
+    @Test
+    public void forgedBroadcastWithSameContractAccepted() {
+        // «Посторонний отправитель»: содержимое соответствует официальному
+        // контракту — receiver не проверяет и не может проверить отправителя.
+        long ts = System.currentTimeMillis() - 60_000;
+        new BgReceiver().onReceive(context, xdripBroadcast(100, ts, "Flat"));
+
+        assertEquals(100f, prefs.getFloat("candidate_bg_value", 0), 0.01f);
+        assertNotNull("контент корректен — принят независимо от отправителя",
+                shadowApp().getNextStartedService());
+    }
+
+    @Test
+    public void explicitIntentWithForeignActionStillProcessed() {
+        // Explicit Intent к exported receiver обходит intent-filter, а сам
+        // receiver action не проверяет: чужой/отсутствующий action с
+        // корректными extras обрабатывается так же.
+        long ts = System.currentTimeMillis() - 60_000;
+        for (String action : new String[]{"com.foreign.action.X", null}) {
+            prefs.edit().remove("candidate_bg_timestamp")
+                    .remove("candidate_bg_value").commit();
+            shadowApp().clearStartedServices();
+            Intent i = new Intent(action);
+            i.putExtra("com.eveningoutpost.dexdrip.Extras.BgEstimate", 110);
+            i.putExtra("com.eveningoutpost.dexdrip.Extras.Time", ts);
+            new BgReceiver().onReceive(context, i);
+            assertEquals("action=" + action, 110f,
+                    prefs.getFloat("candidate_bg_value", 0), 0.01f);
+            assertNotNull("action=" + action,
+                    shadowApp().getNextStartedService());
+        }
+    }
+
+    @Test
+    public void invalidExtraTypesRejected() {
+        // Некорректные типы: строка-не-число и объект не дают показания.
+        long ts = System.currentTimeMillis() - 60_000;
+        Intent i = new Intent("com.eveningoutpost.dexdrip.BgEstimate");
+        i.putExtra("com.eveningoutpost.dexdrip.Extras.BgEstimate", "abc");
+        i.putExtra("estimate", new java.util.Date());
+        i.putExtra("bg_value", "12x");
+        i.putExtra("com.eveningoutpost.dexdrip.Extras.Time", ts);
+        new BgReceiver().onReceive(context, i);
+
+        assertEquals(0, prefs.getLong("candidate_bg_timestamp", 0));
+        assertNull(shadowApp().getNextStartedService());
+    }
+
+    @Test
+    public void duplicateBroadcastRepublishedDedupByService() {
+        // Повтор одного показания: receiver публикует кандидата повторно
+        // (receiver — входной фильтр, дедупликация показаний — в сервисе).
+        long ts = System.currentTimeMillis() - 60_000;
+        new BgReceiver().onReceive(context, xdripBroadcast(120, ts, "Flat"));
+        new BgReceiver().onReceive(context, xdripBroadcast(120, ts, "Flat"));
+        assertEquals(120f, prefs.getFloat("candidate_bg_value", 0), 0.01f);
+        assertNotNull(shadowApp().getNextStartedService());
+        assertNotNull(shadowApp().getNextStartedService());
+    }
+
+    @Test
+    public void deniedTransmissionRejectsAllInputs() {
+        // Сохранённый запрет передачи закрывает все входы: broadcast,
+        // explicit intent, повтор — ни кандидата, ни запуска сервиса.
+        prefs.edit()
+                .putBoolean(VkSenderService.PREF_TRANSMISSION_ENABLED, false)
+                .commit();
+        VkSenderService.resetTransmissionFlagsForTest();
+        long ts = System.currentTimeMillis() - 60_000;
+        new BgReceiver().onReceive(context, xdripBroadcast(120, ts, "Flat"));
+        Intent foreign = new Intent("com.foreign.action.X");
+        foreign.putExtra("com.eveningoutpost.dexdrip.Extras.BgEstimate", 110);
+        foreign.putExtra("com.eveningoutpost.dexdrip.Extras.Time", ts);
+        new BgReceiver().onReceive(context, foreign);
+        new BootReceiver().onReceive(context,
+                new Intent(Intent.ACTION_BOOT_COMPLETED));
+        new AlarmReceiver().onReceive(context, new Intent());
+
+        assertEquals(0, prefs.getLong("candidate_bg_timestamp", 0));
+        assertNull(shadowApp().getNextStartedService());
+    }
 }
