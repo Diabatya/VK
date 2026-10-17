@@ -105,6 +105,13 @@ public class VkSenderServiceStoppedTest {
     }
 
     private VkSenderService startService() {
+        // Подтверждённое разрешение заранее: без ключа первое чтение ставит
+        // миграционную запись в очередь, и gate экземпляра в окне записи
+        // недетерминированно запрещает запуск.
+        if (!prefs.contains(VkSenderService.PREF_TRANSMISSION_ENABLED)) {
+            prefs.edit().putBoolean(
+                    VkSenderService.PREF_TRANSMISSION_ENABLED, true).commit();
+        }
         VkSenderService s = Robolectric.buildService(VkSenderService.class).create().get();
         idle(s);
         return s;

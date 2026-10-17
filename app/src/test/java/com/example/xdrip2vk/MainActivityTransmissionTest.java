@@ -104,6 +104,11 @@ public class MainActivityTransmissionTest {
 
     @Test
     public void statusDistinguishesUserStopFromDeadProcess() {
+        // подтверждённое разрешение заранее — иначе onResume гонится с
+        // миграционной записью и в её окне получает запрет
+        prefs.edit()
+                .putBoolean(VkSenderService.PREF_TRANSMISSION_ENABLED, true)
+                .commit();
         MainActivity a = activity();
         // передача разрешена, но процесс не живёт (авария/выгрузка) —
         // это не пользовательское «Остановлено»
