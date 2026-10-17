@@ -21,7 +21,12 @@ public class BgReceiver extends BroadcastReceiver {
         // Передача запрещена пользователем: выходим до WakeLock, записи
         // кандидата и запуска сервиса — broadcast не ставит сообщения в очередь.
         if (!VkSenderService.isTransmissionAllowed(context)) {
-            Logger.d(TAG, "Передача остановлена пользователем — broadcast проигнорирован");
+            // Выбор ещё не подтверждён (миграция в очереди/в полёте) —
+            // событие не теряем: одноразовый будильник повторной проверки.
+            if (VkSenderService.isConfirmationPending()) {
+                VkSenderService.scheduleConfirmationRetry(context);
+            }
+            Logger.d(TAG, "Передача сейчас не разрешена — broadcast проигнорирован");
             return;
         }
 

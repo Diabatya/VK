@@ -16,7 +16,12 @@ public class AlarmReceiver extends BroadcastReceiver {
         // Передача запрещена пользователем: alarm не возобновляет работу —
         // выход до WakeLock и запуска сервиса.
         if (!VkSenderService.isTransmissionAllowed(context)) {
-            Logger.d(TAG, "Передача остановлена пользователем — alarm проигнорирован");
+            // Выбор ещё не подтверждён — повторная проверка через будильник,
+            // чтобы пришедшее в окно инициализации событие не потерялось.
+            if (VkSenderService.isConfirmationPending()) {
+                VkSenderService.scheduleConfirmationRetry(context);
+            }
+            Logger.d(TAG, "Передача сейчас не разрешена — alarm проигнорирован");
             return;
         }
 

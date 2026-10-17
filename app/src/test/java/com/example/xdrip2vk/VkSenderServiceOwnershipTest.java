@@ -637,8 +637,9 @@ public class VkSenderServiceOwnershipTest {
                     VkSenderService.PREF_TRANSMISSION_ENABLED, true).apply();
             return false;
         };
-        // До первой попытки записи — прежний вывод из конфигурации.
-        assertTrue(VkSenderService.isTransmissionAllowed(context));
+        // Уже первое чтение не разрешает: инициализация поставлена, но
+        // не подтверждена — разрешение появится только после записи.
+        assertFalse(VkSenderService.isTransmissionAllowed(context));
         VkSenderService.awaitSwitchIdleForTest(); // попытка 1 отказала
 
         // После отказа: кеш содержит true, но это не доказательство.
@@ -665,7 +666,8 @@ public class VkSenderServiceOwnershipTest {
                     .putBoolean(VkSenderService.PREF_TRANSMISSION_ENABLED, true)
                     .commit();
         };
-        assertTrue(VkSenderService.isTransmissionAllowed(context)); // legacy-вывод
+        // До подтверждения миграции — запрет.
+        assertFalse(VkSenderService.isTransmissionAllowed(context));
         VkSenderService.awaitSwitchIdleForTest(); // попытка 1 отказала
 
         assertFalse("после отказа кеш не доказательство",
@@ -836,7 +838,8 @@ public class VkSenderServiceOwnershipTest {
             }
             return true;
         };
-        assertTrue(VkSenderService.isTransmissionAllowed(context)); // legacy-вывод
+        // До подтверждения инициализации — запрет уже на первом чтении.
+        assertFalse(VkSenderService.isTransmissionAllowed(context));
         awaitLatch(writeEntered); // запись инициализации выполняется
 
         assertEntriesDeniedWhileWriteHeld();
@@ -844,6 +847,113 @@ public class VkSenderServiceOwnershipTest {
         writeRelease.countDown();
         VkSenderService.awaitSwitchIdleForTest();
         assertTrue(VkSenderService.isTransmissionAllowed(context));
+    }
+
+    // ---------- 5.5 Миграция в очереди: запрет до начала записи ----------
+
+    /** Занимает switchExecutor управляемой задачей: [entered, release]. */
+    private CountDownLatch[] occupySwitchExecutor() {
+        CountDownLatch entered = new CountDownLatch(1);
+        CountDownLatch release = new CountDownLatch(1);
+        VkSenderService.enqueueSwitchTaskForTest(() -> {
+            entered.countDown();
+            try {
+                release.await(10, TimeUnit.SECONDS);
+            } catch (InterruptedException e) {
+                Thread.currentThread().interrupt();
+            }
+        });
+        awaitLatch(entered); // executor занят, миграция встанет за блокером
+        return new CountDownLatch[]{entered, release};
+    }
+
+    @Test
+    public void queuedMigrationDeniesAllEntriesUntilConfirmation() {
+        // Ключа нет, установка настроена; executor занят — миграционная
+        // запись ещё даже не начата.
+        CountDownLatch[] block = occupySwitchExecutor();
+
+        // Первое чтение ставит миграцию в очередь и не разрешает.
+        assertFalse("миграция ожидает выполнения — разрешения нет",
+                VkSenderService.isTransmissionAllowed(context));
+        // Повторные чтения не создают дополнительных задач и не разрешают.
+        assertFalse(VkSenderService.isTransmissionAllowed(context));
+
+        // Все входы в окне ожидания в очереди — сервис не запускается.
+        assertEntriesDeniedWhileWriteHeld();
+
+        // Запоздавший экземпляр сервиса в этом окне ничего не отправляет.
+        VkSenderService s = Robolectric.buildService(VkSenderService.class)
+                .create().get(); // gate → stopSelf, worker не создан
+        assertNull(s.workerLooperForTest());
+        s.onStartCommand(
+                autoUpdate(120, System.currentTimeMillis() - 60_000), 0, 1);
+        awaitWorkerIfAlive(s);
+        assertEquals(0, peers.size());
+        s.onDestroy();
+
+        // Boot не потерян навсегда: поставлен будильник повторной проверки.
+        AlarmManager am =
+                (AlarmManager) context.getSystemService(Context.ALARM_SERVICE);
+        assertFalse("вход во время ожидания не запланировал повторную проверку",
+                Shadows.shadowOf(am).getScheduledAlarms().isEmpty());
+
+        // Освобождаем executor: успех подтверждает миграцию.
+        block[1].countDown();
+        VkSenderService.awaitSwitchIdleForTest();
+        assertTrue("подтверждённая миграция настроенной установки разрешает",
+                VkSenderService.isTransmissionAllowed(context));
+        assertTrue(prefs.getBoolean(
+                VkSenderService.PREF_TRANSMISSION_ENABLED, false));
+
+        // Предусмотренное продолжение: следующий вход после подтверждения
+        // запускает сервис (также сработает будильник повторной проверки).
+        new AlarmReceiver().onReceive(context, new Intent());
+        assertNotNull("после подтверждения вход запускает сервис",
+                shadowApp().getNextStartedService());
+    }
+
+    @Test
+    public void queuedMigrationDenialStaysOnWriteFailure() {
+        // Отказ записи, кеш меняется до результата — запрет сохраняется
+        // на всём протяжении: очередь → запись → отказ.
+        VkSenderService.transmissionWriteOverride = (enabled, mark) -> {
+            prefs.edit().putBoolean(
+                    VkSenderService.PREF_TRANSMISSION_ENABLED, enabled).apply();
+            return false;
+        };
+        CountDownLatch[] block = occupySwitchExecutor();
+
+        assertFalse(VkSenderService.isTransmissionAllowed(context)); // в очереди
+        new AlarmReceiver().onReceive(context, new Intent());
+        assertNull(shadowApp().getNextStartedService());
+
+        block[1].countDown();
+        VkSenderService.awaitSwitchIdleForTest(); // запись отказала
+        assertFalse("отказ миграционной записи оставляет запрет",
+                VkSenderService.isTransmissionAllowed(context));
+        new AlarmReceiver().onReceive(context, new Intent());
+        assertNull(shadowApp().getNextStartedService());
+    }
+
+    @Test
+    public void stopDuringQueuedMigrationKeepsDenyAfterCompletion() {
+        // Миграция ждёт в очереди; пришёл явный Stop — после её завершения
+        // выбор пользователя остаётся действующим.
+        CountDownLatch[] block = occupySwitchExecutor();
+        assertFalse(VkSenderService.isTransmissionAllowed(context)); // миграция в очереди
+
+        VkSenderService.requestStopTransmission(context); // за миграцией
+        assertFalse("Stop немедленно запрещает",
+                VkSenderService.isTransmissionAllowed(context));
+
+        block[1].countDown(); // миграция (true) → затем Stop (false)
+        VkSenderService.awaitSwitchIdleForTest();
+        assertFalse("устаревшая миграция не отменила явный Stop",
+                VkSenderService.isTransmissionAllowed(context));
+        assertFalse(prefs.getBoolean(
+                VkSenderService.PREF_TRANSMISSION_ENABLED, true));
+        assertNull(shadowApp().getNextStartedService());
     }
 
     // ---------- 6. Повтор миграции сохраняет исходное решение ----------
@@ -923,7 +1033,7 @@ public class VkSenderServiceOwnershipTest {
                     .putBoolean(VkSenderService.PREF_TRANSMISSION_ENABLED, enabled)
                     .commit();
         };
-        assertTrue(VkSenderService.isTransmissionAllowed(context));
+        assertFalse(VkSenderService.isTransmissionAllowed(context));
         VkSenderService.awaitSwitchIdleForTest(); // попытка 1 отказала
 
         // Смена аккаунта между попытками — чат сброшен.
@@ -967,7 +1077,7 @@ public class VkSenderServiceOwnershipTest {
                     .putBoolean(VkSenderService.PREF_TRANSMISSION_ENABLED, enabled)
                     .commit();
         };
-        assertTrue(VkSenderService.isTransmissionAllowed(context));
+        assertFalse(VkSenderService.isTransmissionAllowed(context));
         VkSenderService.awaitSwitchIdleForTest(); // попытка 1 отказала
 
         stopTransmission(); // подтверждённый явный Stop
@@ -1096,8 +1206,11 @@ public class VkSenderServiceOwnershipTest {
     public void existingInstallMigrationSurvivesChatReset() {
         // существующая настроенная установка без ключа → разрешено (миграция)
         assertFalse(prefs.contains(VkSenderService.PREF_TRANSMISSION_ENABLED));
-        assertTrue(VkSenderService.isTransmissionAllowed(context));
+        assertFalse("до подтверждения миграции передача запрещена",
+                VkSenderService.isTransmissionAllowed(context));
         VkSenderService.awaitSwitchIdleForTest();
+        assertTrue("после подтверждения миграции — разрешено",
+                VkSenderService.isTransmissionAllowed(context));
 
         // сброс/смена чатов (смена аккаунта) — не остановка пользователем
         TokenStorage.setChatId(context, 0);

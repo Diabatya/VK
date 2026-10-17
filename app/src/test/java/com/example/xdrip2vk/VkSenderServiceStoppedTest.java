@@ -195,8 +195,11 @@ public class VkSenderServiceStoppedTest {
 
     @Test
     public void migrationExistingInstallDefaultsEnabled() {
-        // ключа нет, но заданы токен и обычный чат — прежнее поведение
+        // ключа нет, но заданы токен и обычный чат — прежнее поведение;
+        // до подтверждения записи инициализации передача запрещена
         assertFalse(prefs.contains(VkSenderService.PREF_TRANSMISSION_ENABLED));
+        assertFalse(VkSenderService.isTransmissionAllowed(context));
+        VkSenderService.awaitSwitchIdleForTest(); // миграция подтверждена
         assertTrue(VkSenderService.isTransmissionAllowed(context));
     }
 

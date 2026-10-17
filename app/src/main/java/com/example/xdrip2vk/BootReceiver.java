@@ -25,6 +25,13 @@ public class BootReceiver extends BroadcastReceiver {
             // Запускаем сервис только если пользователь разрешил передачу
             // и настроены токен и chat ID
             if (!VkSenderService.isTransmissionAllowed(context)) {
+                // Boot случился до подтверждения миграции выбора — без
+                // повторной проверки автозапуск был бы потерян навсегда
+                // (будильники при перезагрузке стираются). При
+                // подтверждённом запрете пользователя будильник не ставим.
+                if (VkSenderService.isConfirmationPending()) {
+                    VkSenderService.scheduleConfirmationRetry(context);
+                }
                 return;
             }
             String token = TokenStorage.getToken(context);

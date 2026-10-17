@@ -256,13 +256,55 @@ public class VkSenderService extends Service {
             boolean legacy = !TokenStorage.getToken(context).isEmpty()
                     && TokenStorage.getChatId(context) > 0;
             maybeInitTransmissionKey(context.getApplicationContext(), legacy);
-            // Неподтверждённая инициализация не разрешает новые отправки.
-            return !migrationUnconfirmed && legacy;
+            // Неподтверждённая инициализация не разрешает новые отправки:
+            // ни в очереди, ни во время записи кеш prefs не является
+            // источником — разрешение публикует только успешная запись.
+            return false;
         }
         boolean v = p.getBoolean(PREF_TRANSMISSION_ENABLED, false);
         choiceConfirmed = true;
         confirmedEnabled = v; // чистое чтение — значение подтверждено диском
         return v;
+    }
+
+    /**
+     * Инициализация/повтор выбора запланирован, но ещё не подтверждён —
+     * вход в этот момент запрещён, но событие не должно теряться навсегда.
+     */
+    static boolean isConfirmationPending() {
+        return migrationUnconfirmed;
+    }
+
+    private static final int RETRY_ALARM_REQUEST_CODE = 1002;
+    private static final long CONFIRM_RETRY_MS = 30_000;
+
+    /**
+     * Одноразовый будильник повторной проверки: вход (boot/alarm/broadcast)
+     * пришёл до подтверждения выбора. При срабатывании AlarmReceiver снова
+     * выполняет gate — при подтверждённом разрешении запускает сервис, при
+     * подтверждённом запрете (выбор пользователя) цепочка умирает.
+     */
+    static void scheduleConfirmationRetry(Context context) {
+        AlarmManager am =
+                (AlarmManager) context.getSystemService(Context.ALARM_SERVICE);
+        if (am == null) {
+            return;
+        }
+        Intent i = new Intent(context, AlarmReceiver.class);
+        PendingIntent pi = PendingIntent.getBroadcast(context,
+                RETRY_ALARM_REQUEST_CODE, i,
+                PendingIntent.FLAG_UPDATE_CURRENT | PendingIntent.FLAG_IMMUTABLE);
+        long t = System.currentTimeMillis() + CONFIRM_RETRY_MS;
+        try {
+            // не exact: SCHEDULE_EXACT_ALARM на API 31+ не требуется
+            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.M) {
+                am.setAndAllowWhileIdle(AlarmManager.RTC_WAKEUP, t, pi);
+            } else {
+                am.set(AlarmManager.RTC_WAKEUP, t, pi);
+            }
+        } catch (SecurityException e) {
+            am.set(AlarmManager.RTC_WAKEUP, t, pi);
+        }
     }
 
     private static volatile boolean migrationInitQueued;
@@ -275,6 +317,9 @@ public class VkSenderService extends Service {
         if (migrationInitQueued) {
             return; // попытка уже в очереди — повторные чтения её не накапливают
         }
+        // Неподтверждённое состояние ставится синхронно при постановке —
+        // действует весь период «очередь → запись → обработка результата».
+        migrationUnconfirmed = true;
         migrationInitQueued = true;
         switchExecutor.execute(() -> {
             try {
@@ -442,6 +487,11 @@ public class VkSenderService extends Service {
         }
     }
 
+    /** Поставить задачу в очередь переключателя — только для тестов. */
+    static void enqueueSwitchTaskForTest(Runnable r) {
+        switchExecutor.execute(r);
+    }
+
     /** Сброс процессных флагов и владения состоянием — только для тестов. */
     static void resetTransmissionFlagsForTest() {
         awaitSwitchIdleForTest(); // сначала добить очередь — старые записи не протекают в следующий тест
@@ -469,6 +519,9 @@ public class VkSenderService extends Service {
      */
     public static void notifyTokenChanged(Context context) {
         if (!isTransmissionAllowed(context)) {
+            if (isConfirmationPending()) {
+                scheduleConfirmationRetry(context);
+            }
             return;
         }
         Intent i = new Intent(context, VkSenderService.class);
