@@ -61,6 +61,15 @@ public class VkSenderService extends Service {
      */
     private static volatile boolean userStopInFlight;
 
+    /**
+     * Неподтверждённый запрос разрешения: Start не смог записать
+     * transmission_enabled=true на диск (отказ commit или запрос устарел во
+     * время записи). Отказавший commit мог уже поменять значение в памяти —
+     * поэтому разрешение считается НЕ подтверждённым до успешного актуального
+     * Start. Снимается только в ветке успеха requestStartTransmission.
+     */
+    private static volatile boolean startWriteDenied;
+
     // ---- Передача владения состоянием доставки между экземплярами ----
     // Старый экземпляр может ещё дожимать сетевую попытку и писать checkpoint,
     // когда создан новый. Новый экземпляр НЕ загружает и не меняет очередь,
@@ -217,34 +226,61 @@ public class VkSenderService extends Service {
      * завершённым — следующее чтение повторит вывод и попытку.
      */
     public static boolean isTransmissionAllowed(Context context) {
-        if (userStopInFlight) {
-            return false; // запрет уже запрошен — запись ещё может идти
+        if (userStopInFlight || startWriteDenied) {
+            // запрет запрошен или разрешение не удалось подтвердить на диске —
+            // изменённый в памяти prefs отказавшим commit — не доказательство
+            return false;
         }
         SharedPreferences p = PreferenceManager.getDefaultSharedPreferences(context);
-        if (!p.contains(PREF_TRANSMISSION_ENABLED)) {
+        if (!p.contains(PREF_TRANSMISSION_ENABLED) || migrationUnconfirmed) {
             boolean legacy = !TokenStorage.getToken(context).isEmpty()
                     && TokenStorage.getChatId(context) > 0;
             maybeInitTransmissionKey(context.getApplicationContext(), legacy);
-            return legacy;
+            // Неподтверждённая инициализация не разрешает новые отправки.
+            return !migrationUnconfirmed && legacy;
         }
         return p.getBoolean(PREF_TRANSMISSION_ENABLED, false);
     }
 
     private static volatile boolean migrationInitQueued;
+    /** Попытка инициализации ключа отказала — значение в памяти недоверенно. */
+    private static volatile boolean migrationUnconfirmed;
+    /** Значение последней попытки инициализации (0/1); -1 — не было. */
+    private static volatile int migrationAttemptedValue = -1;
 
     private static void maybeInitTransmissionKey(final Context app, final boolean legacy) {
         if (migrationInitQueued) {
-            return;
+            return; // попытка уже в очереди — повторные чтения её не накапливают
         }
         migrationInitQueued = true;
         switchExecutor.execute(() -> {
             try {
-                if (!PreferenceManager.getDefaultSharedPreferences(app)
-                        .contains(PREF_TRANSMISSION_ENABLED)) {
-                    writeTransmissionEnabled(app, legacy, false);
+                SharedPreferences p =
+                        PreferenceManager.getDefaultSharedPreferences(app);
+                if (!p.contains(PREF_TRANSMISSION_ENABLED)) {
+                    migrationAttemptedValue = legacy ? 1 : 0;
+                    migrationUnconfirmed =
+                            !writeTransmissionEnabled(app, legacy, false);
+                } else if (migrationUnconfirmed) {
+                    // Ключ в памяти появился от отказавшего commit или от
+                    // подтверждённой пользовательской записи. Если значение
+                    // сменилось — выбор пользователя, миграцию не перетираем;
+                    // если совпадает с попыткой — запись могла не дойти до
+                    // диска, повторяем.
+                    int current =
+                            p.getBoolean(PREF_TRANSMISSION_ENABLED, false) ? 1 : 0;
+                    if (current == migrationAttemptedValue) {
+                        migrationUnconfirmed =
+                                !writeTransmissionEnabled(app, legacy, false);
+                    } else {
+                        migrationUnconfirmed = false;
+                    }
+                } else {
+                    migrationUnconfirmed = false; // ключ подтверждён другой записью
                 }
             } finally {
-                // отказ записи — ключ не появился, следующее чтение повторит
+                // отказ записи — инициализация не завершена, повтор при
+                // следующем чтении (цикла по таймеру нет)
                 migrationInitQueued = false;
             }
         });
@@ -323,8 +359,14 @@ public class VkSenderService extends Service {
                     && writeTransmissionEnabled(app, true, true)
                     && isSwitchGenerationCurrent(gen)) {
                 userStopInFlight = false;
+                startWriteDenied = false; // разрешение подтверждено на диске
                 app.startForegroundService(new Intent(app, VkSenderService.class));
                 ok = true;
+            } else {
+                // Запись не подтверждена: значение в памяти могло уже
+                // поменяться отказавшим commit — до успешного Start любые
+                // проверки разрешения возвращают запрет.
+                startWriteDenied = true;
             }
             if (done != null) {
                 done.accept(ok);
@@ -352,8 +394,11 @@ public class VkSenderService extends Service {
     static void resetTransmissionFlagsForTest() {
         awaitSwitchIdleForTest(); // сначала добить очередь — старые записи не протекают в следующий тест
         userStopInFlight = false;
+        startWriteDenied = false;
         activeInstance = null;
         migrationInitQueued = false;
+        migrationUnconfirmed = false;
+        migrationAttemptedValue = -1;
         synchronized (STATE_OWNER_LOCK) {
             stateOwned = false;
             STATE_OWNER_LOCK.notifyAll();

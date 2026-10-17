@@ -492,6 +492,202 @@ public class VkSenderServiceOwnershipTest {
 
         assertFalse(ok.get());
         assertNull(shadowApp().getNextStartedService());
+        // №2Б.4.2: изменённый кеш prefs — не доказательство разрешения
+        assertFalse("неуспешный Start не разрешает передачу через prefs в памяти",
+                VkSenderService.isTransmissionAllowed(context));
+    }
+
+    /** Модель отказа записи Start: commit меняет кеш на true, но возвращает false. */
+    private void installFailedStartOverride() {
+        VkSenderService.transmissionWriteOverride = () -> {
+            prefs.edit().putBoolean(
+                    VkSenderService.PREF_TRANSMISSION_ENABLED, true).apply();
+            return false;
+        };
+    }
+
+    @Test
+    public void failedStartDeniesAllEntryPointsDespiteDirtyPrefs() {
+        // Подтверждённый запрет на диске; «новый процесс» — флаги сброшены.
+        prefs.edit().putBoolean(
+                VkSenderService.PREF_TRANSMISSION_ENABLED, false).commit();
+        installFailedStartOverride();
+        AtomicBoolean ok = new AtomicBoolean(true);
+        VkSenderService.requestStartTransmission(context, ok::set);
+        VkSenderService.awaitSwitchIdleForTest();
+        assertFalse(ok.get());
+        assertFalse(VkSenderService.isTransmissionAllowed(context));
+
+        // Все входы должны использовать подтверждённый выбор, а не кеш prefs.
+        new AlarmReceiver().onReceive(context, new Intent());
+        Intent bg = new Intent("com.eveningoutpost.dexdrip.BgEstimate");
+        bg.putExtra("com.eveningoutpost.dexdrip.Extras.BgEstimate", 120.0);
+        bg.putExtra("com.eveningoutpost.dexdrip.Extras.Time",
+                System.currentTimeMillis() - 60_000);
+        new BgReceiver().onReceive(context, bg);
+        // МОДЕЛИРОВАНИЕ boot — прямой вызов receiver; разрешение на
+        // уведомления выдано, чтобы дойти до проверки разрешения передачи.
+        shadowApp().grantPermissions(android.Manifest.permission.POST_NOTIFICATIONS);
+        new BootReceiver().onReceive(context,
+                new Intent(Intent.ACTION_BOOT_COMPLETED));
+        TokenStorage.setToken(context, "SYNTHETIC_TOKEN_2");
+        VkSenderService.notifyTokenChanged(context); // ручной ввод/импорт — тот же путь
+        VkSenderService.awaitSwitchIdleForTest();
+
+        assertNull("ни один вход не запустил сервис после неподтверждённого Start",
+                shadowApp().getNextStartedService());
+        assertFalse("кандидат от broadcast не записан",
+                prefs.getLong("candidate_bg_timestamp", 0) > 0);
+    }
+
+    @Test
+    public void staleServiceAfterFailedStartSendsNothing() {
+        prefs.edit().putBoolean(
+                VkSenderService.PREF_TRANSMISSION_ENABLED, false).commit();
+        installFailedStartOverride();
+        VkSenderService.requestStartTransmission(context);
+        VkSenderService.awaitSwitchIdleForTest();
+
+        // Запоздавший запуск сервиса после отказа записи — send не вызывается.
+        VkSenderService s = Robolectric.buildService(VkSenderService.class)
+                .create().get(); // gate: isTransmissionAllowed → stopSelf
+        int rc = s.onStartCommand(
+                autoUpdate(120, System.currentTimeMillis() - 60_000), 0, 1);
+        assertEquals(android.app.Service.START_NOT_STICKY, rc);
+        awaitWorkerIfAlive(s);
+        assertEquals("send после неподтверждённого Start не вызывается",
+                0, peers.size());
+        s.onDestroy();
+    }
+
+    /** Барьер на worker-потоке, если экземпляр дошёл до его создания. */
+    private void awaitWorkerIfAlive(VkSenderService s) {
+        android.os.Looper l = s.workerLooperForTest();
+        if (l == null) {
+            return; // экземпляр завершился в gate — worker не создан
+        }
+        CountDownLatch barrier = new CountDownLatch(1);
+        new android.os.Handler(l).post(barrier::countDown);
+        awaitLatch(barrier);
+    }
+
+    @Test
+    public void existingInstanceDoesNotSendViaStaleCallbackAfterFailedStart() {
+        // Уже работающий экземпляр (разрешение подтверждено миграцией).
+        VkSenderService s = startService();
+        VkSenderService.awaitSwitchIdleForTest();
+
+        installFailedStartOverride();
+        AtomicBoolean ok = new AtomicBoolean(true);
+        VkSenderService.requestStartTransmission(context, ok::set);
+        VkSenderService.awaitSwitchIdleForTest();
+        assertFalse(ok.get());
+
+        // Отложенная команда после отказа записи — отправки нет.
+        s.onStartCommand(
+                autoUpdate(120, System.currentTimeMillis() - 60_000), 0, 1);
+        awaitWorker(s);
+        assertEquals("отложенный callback обошёл неподтверждённое разрешение",
+                0, peers.size());
+        s.onDestroy();
+    }
+
+    @Test
+    public void successfulStartAfterFailureClearsDenial() {
+        prefs.edit().putBoolean(
+                VkSenderService.PREF_TRANSMISSION_ENABLED, false).commit();
+        AtomicInteger calls = new AtomicInteger();
+        VkSenderService.transmissionWriteOverride = () -> {
+            if (calls.getAndIncrement() == 0) {
+                prefs.edit().putBoolean(
+                        VkSenderService.PREF_TRANSMISSION_ENABLED, true).apply();
+                return false; // первая попытка — отказ с грязным кешем
+            }
+            return prefs.edit()
+                    .putBoolean(VkSenderService.PREF_TRANSMISSION_ENABLED, true)
+                    .commit(); // вторая — подтверждена
+        };
+        VkSenderService.requestStartTransmission(context);
+        VkSenderService.awaitSwitchIdleForTest();
+        assertFalse(VkSenderService.isTransmissionAllowed(context));
+
+        AtomicBoolean ok = new AtomicBoolean(false);
+        VkSenderService.requestStartTransmission(context, ok::set);
+        VkSenderService.awaitSwitchIdleForTest();
+        assertTrue("успешный актуальный Start разрешает работу", ok.get());
+        assertTrue(VkSenderService.isTransmissionAllowed(context));
+        assertNotNull(shadowApp().getNextStartedService());
+    }
+
+    @Test
+    public void failedMigrationWithDirtyCacheRetriesOnReads() {
+        // Ключ отсутствует, установка настроена; запись отказал, но кеш
+        // содержит ключ — contains() не должен считать миграцию завершённой.
+        AtomicInteger calls = new AtomicInteger();
+        VkSenderService.transmissionWriteOverride = () -> {
+            calls.incrementAndGet();
+            prefs.edit().putBoolean(
+                    VkSenderService.PREF_TRANSMISSION_ENABLED, true).apply();
+            return false;
+        };
+        // До первой попытки записи — прежний вывод из конфигурации.
+        assertTrue(VkSenderService.isTransmissionAllowed(context));
+        VkSenderService.awaitSwitchIdleForTest(); // попытка 1 отказала
+
+        // После отказа: кеш содержит true, но это не доказательство.
+        assertFalse("неподтверждённая инициализация не разрешает отправки",
+                VkSenderService.isTransmissionAllowed(context));
+        VkSenderService.awaitSwitchIdleForTest(); // попытка 2 — отказ
+        assertFalse(VkSenderService.isTransmissionAllowed(context));
+        VkSenderService.awaitSwitchIdleForTest(); // попытка 3 — отказ
+
+        // Каждое чтение — не более одной миграционной попытки (очередь не растёт)
+        assertEquals("миграционные попытки накапливаются", 3, calls.get());
+    }
+
+    @Test
+    public void migrationCompletesCorrectlyAfterWriteRecovery() {
+        AtomicInteger calls = new AtomicInteger();
+        VkSenderService.transmissionWriteOverride = () -> {
+            if (calls.getAndIncrement() == 0) {
+                prefs.edit().putBoolean(
+                        VkSenderService.PREF_TRANSMISSION_ENABLED, true).apply();
+                return false; // отказ, кеш true
+            }
+            return prefs.edit()
+                    .putBoolean(VkSenderService.PREF_TRANSMISSION_ENABLED, true)
+                    .commit();
+        };
+        assertTrue(VkSenderService.isTransmissionAllowed(context)); // legacy-вывод
+        VkSenderService.awaitSwitchIdleForTest(); // попытка 1 отказала
+
+        assertFalse("после отказа кеш не доказательство",
+                VkSenderService.isTransmissionAllowed(context));
+        VkSenderService.awaitSwitchIdleForTest(); // попытка 2 подтверждена
+
+        assertTrue("после подтверждения миграция даёт настроенной установке true",
+                VkSenderService.isTransmissionAllowed(context));
+        assertTrue(prefs.getBoolean(
+                VkSenderService.PREF_TRANSMISSION_ENABLED, false));
+        // дальнейшие настройки выбор не меняют
+        TokenStorage.setChatId(context, 0);
+        assertTrue(VkSenderService.isTransmissionAllowed(context));
+    }
+
+    @Test
+    public void savedDenyBlocksRestoredInstance() {
+        // Сохранённый запрет; «новый процесс» — все процессные флаги сброшены.
+        prefs.edit().putBoolean(
+                VkSenderService.PREF_TRANSMISSION_ENABLED, false).commit();
+        VkSenderService.resetTransmissionFlagsForTest();
+
+        VkSenderService s = Robolectric.buildService(VkSenderService.class)
+                .create().get(); // gate → stopSelf
+        s.onStartCommand(
+                autoUpdate(120, System.currentTimeMillis() - 60_000), 0, 1);
+        awaitWorkerIfAlive(s);
+        assertEquals(0, peers.size());
+        s.onDestroy();
     }
 
     @Test
