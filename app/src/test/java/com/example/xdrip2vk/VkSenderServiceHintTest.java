@@ -31,6 +31,8 @@ import org.robolectric.shadows.ShadowApplication;
 import java.util.ArrayList;
 import java.util.Collections;
 import java.util.List;
+import java.util.concurrent.CountDownLatch;
+import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicInteger;
 import java.util.concurrent.atomic.AtomicLong;
 
@@ -226,16 +228,30 @@ public class VkSenderServiceHintTest {
     @Test
     public void stopBeforeHintProcessingKeepsDenied() {
         VkSenderService s = startService();
-        s.onStartCommand(hintIntent(), 0, 1); // команда ждёт worker
+        // Блокировка гарантирует: hint-команда ещё ждёт, когда приходит Stop —
+        // иначе worker может исполнить её раньше (гонка на быстрых машинах).
+        CountDownLatch release = new CountDownLatch(1);
+        new android.os.Handler(s.workerLooperForTest())
+                .post(() -> await(release));
+        s.onStartCommand(hintIntent(), 0, 1); // команда ждёт worker за блокировкой
         // Stop до обработки — производственный путь; запрет действует при
         // исполнении задачи.
         VkSenderService.requestStopTransmission(context);
         VkSenderService.awaitSwitchIdleForTest();
+        release.countDown();
         idle(s);
 
         assertEquals(0, fetches.get());
         assertTrue(texts.isEmpty());
         s.onDestroy();
+    }
+
+    private void await(CountDownLatch l) {
+        try {
+            l.await(5, TimeUnit.SECONDS);
+        } catch (InterruptedException e) {
+            Thread.currentThread().interrupt();
+        }
     }
 
     @Test
@@ -315,10 +331,16 @@ public class VkSenderServiceHintTest {
         assertNotNull(started);
 
         VkSenderService s = startService();
+        // Блокировка держит worker: hint-команда ждёт обработки, когда
+        // приходит Stop — без гонки исполнения до запрета.
+        CountDownLatch release = new CountDownLatch(1);
+        new android.os.Handler(s.workerLooperForTest())
+                .post(() -> await(release));
         s.onStartCommand(started, 0, 1); // команда ждёт worker — не выполняется
         // Stop до выполнения — производственный путь пользователя.
         VkSenderService.requestStopTransmission(context);
         VkSenderService.awaitSwitchIdleForTest();
+        release.countDown();
         idle(s); // отменённая задача выходит по запрету и снимает маркер
         s.onDestroy();
 
