@@ -287,54 +287,105 @@ public class VkSenderService extends Service {
     /** Момент срабатывания уже назначенной проверки; 0 — не назначена. */
     private static volatile long retryScheduledFor;
 
+    /** Задача назначения проверки в очереди/в работе — входы её не накапливают. */
+    private static volatile boolean retryScheduleQueued;
+    private static final Object RETRY_SCHEDULE_LOCK = new Object();
+
+    /** Тестовая подмена записи счётчика бюджета (отказ/удержание записи). */
+    static volatile java.util.function.IntFunction<Boolean>
+            retryCountWriteOverride;
+
+    /** Требуется ли ещё проверка: нет запрета пользователя и подтверждённого запрета. */
+    private static boolean retryCheckWorthwhile() {
+        return !userStopInFlight && !startWriteDenied
+                && !(choiceConfirmed && !confirmedEnabled);
+    }
+
     /**
      * Одноразовый будильник повторной проверки: вход (boot/alarm/broadcast)
      * пришёл до подтверждения выбора. При срабатывании AlarmReceiver снова
      * выполняет gate — при подтверждённом разрешении запускает сервис, при
      * подтверждённом запрете (выбор пользователя) цепочка умирает.
-     * Бюджет ограничен и сохранён в prefs: после его исчерпания цепочка
-     * сама себя не назначает (новую попытку может начать явный Start).
-     * Сам перепроверяет допустимость: запрет пользователя, неподтверждённый
-     * Start и исчерпанный бюджет не назначают проверку.
+     * Порядок на switchExecutor (диск вне главного потока, сериализация
+     * резервирования): перепроверка → ПОДТВЕРЖДЁННАЯ запись расхода попытки
+     * → повторная перепроверка Stop/актуальности → назначение. Отказ записи
+     * счётчика — будильник не назначается, передача остаётся запрещённой.
+     * Прерывание после записи счётчика считает попытку израсходованной —
+     * бюджет не восстанавливается и не раздувается.
      */
     static void scheduleConfirmationRetry(Context context) {
         if (!isConfirmationPending()) {
             return;
         }
-        long now = System.currentTimeMillis();
-        if (retryScheduledFor > now) {
+        if (retryScheduledFor > System.currentTimeMillis()) {
             // проверка уже назначена — повторные входы её не отодвигают
             return;
         }
-        SharedPreferences p =
-                PreferenceManager.getDefaultSharedPreferences(context);
-        int attempt = p.getInt(PREF_CONFIRM_RETRY_COUNT, 0);
-        if (attempt >= CONFIRM_RETRY_DELAYS_MS.length) {
-            return; // бюджет исчерпан — передача остаётся запрещённой
-        }
-        AlarmManager am =
-                (AlarmManager) context.getSystemService(Context.ALARM_SERVICE);
-        if (am == null) {
-            return;
-        }
-        Intent i = new Intent(context, AlarmReceiver.class);
-        i.putExtra(EXTRA_CONFIRM_RETRY, true);
-        PendingIntent pi = PendingIntent.getBroadcast(context,
-                RETRY_ALARM_REQUEST_CODE, i,
-                PendingIntent.FLAG_UPDATE_CURRENT | PendingIntent.FLAG_IMMUTABLE);
-        long t = now + CONFIRM_RETRY_DELAYS_MS[attempt];
-        try {
-            // не exact: SCHEDULE_EXACT_ALARM на API 31+ не требуется
-            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.M) {
-                am.setAndAllowWhileIdle(AlarmManager.RTC_WAKEUP, t, pi);
-            } else {
-                am.set(AlarmManager.RTC_WAKEUP, t, pi);
+        synchronized (RETRY_SCHEDULE_LOCK) {
+            if (retryScheduleQueued) {
+                return; // задача уже в очереди — входы её не накапливают
             }
-        } catch (SecurityException e) {
-            am.set(AlarmManager.RTC_WAKEUP, t, pi);
+            retryScheduleQueued = true;
         }
-        retryScheduledFor = t;
-        p.edit().putInt(PREF_CONFIRM_RETRY_COUNT, attempt + 1).apply();
+        final Context app = context.getApplicationContext();
+        switchExecutor.execute(() -> {
+            try {
+                if (!retryCheckWorthwhile()
+                        || retryScheduledFor > System.currentTimeMillis()) {
+                    return; // пока ждали — Stop/запрет или чужое назначение
+                }
+                SharedPreferences p =
+                        PreferenceManager.getDefaultSharedPreferences(app);
+                int attempt = p.getInt(PREF_CONFIRM_RETRY_COUNT, 0);
+                if (attempt >= CONFIRM_RETRY_DELAYS_MS.length) {
+                    return; // бюджет исчерпан — передача остаётся запрещённой
+                }
+                // 1) расход попытки подтверждается на диске ДО назначения:
+                // завершение процесса после записи не возвращает попытку.
+                boolean budgetSaved = retryCountWriteOverride != null
+                        ? retryCountWriteOverride.apply(attempt + 1)
+                        : p.edit()
+                                .putInt(PREF_CONFIRM_RETRY_COUNT, attempt + 1)
+                                .commit();
+                if (!budgetSaved) {
+                    return; // отказ записи бюджета — будильник не назначается
+                }
+                // 2) за время записи мог прийти Stop/подтверждённый запрет —
+                // назначение пропускаем; попытка считается израсходованной.
+                if (!retryCheckWorthwhile()
+                        || retryScheduledFor > System.currentTimeMillis()) {
+                    return;
+                }
+                // 3) только теперь — назначение будильника.
+                AlarmManager am =
+                        (AlarmManager) app.getSystemService(Context.ALARM_SERVICE);
+                if (am == null) {
+                    return;
+                }
+                Intent i = new Intent(app, AlarmReceiver.class);
+                i.putExtra(EXTRA_CONFIRM_RETRY, true);
+                PendingIntent pi = PendingIntent.getBroadcast(app,
+                        RETRY_ALARM_REQUEST_CODE, i,
+                        PendingIntent.FLAG_UPDATE_CURRENT
+                                | PendingIntent.FLAG_IMMUTABLE);
+                long t = System.currentTimeMillis()
+                        + CONFIRM_RETRY_DELAYS_MS[attempt];
+                try {
+                    // не exact: SCHEDULE_EXACT_ALARM на API 31+ не требуется
+                    if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.M) {
+                        am.setAndAllowWhileIdle(
+                                AlarmManager.RTC_WAKEUP, t, pi);
+                    } else {
+                        am.set(AlarmManager.RTC_WAKEUP, t, pi);
+                    }
+                } catch (SecurityException e) {
+                    am.set(AlarmManager.RTC_WAKEUP, t, pi);
+                }
+                retryScheduledFor = t;
+            } finally {
+                retryScheduleQueued = false;
+            }
+        });
     }
 
     /** Сработал будильник повторной проверки — слот назначения свободен. */
@@ -572,6 +623,7 @@ public class VkSenderService extends Service {
         migrationUnconfirmed = false;
         migrationAttemptedValue = -1;
         retryScheduledFor = 0;
+        retryScheduleQueued = false;
         synchronized (STATE_OWNER_LOCK) {
             stateOwned = false;
             STATE_OWNER_LOCK.notifyAll();
