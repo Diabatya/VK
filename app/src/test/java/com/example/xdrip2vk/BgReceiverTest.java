@@ -100,8 +100,14 @@ public class BgReceiverTest {
         new BgReceiver().onReceive(context, xdripBroadcast());
         Intent svc = nextStarted();
         assertNotNull(svc);
-        // ровно один внешний extra — флаг сигнала
-        assertEquals(1, svc.getExtras().size());
+        // Только служебные поля: флаг сигнала и его поколение — extras
+        // broadcast (bg_value/timestamp/direction) не переносятся.
+        assertTrue(svc.getBooleanExtra("xdrip_hint", false));
+        assertTrue(svc.getLongExtra("xdrip_hint_gen", 0) > 0);
+        assertEquals(2, svc.getExtras().size());
+        assertNull(svc.getExtras().get("bg_value"));
+        assertNull(svc.getExtras().get("timestamp"));
+        assertNull(svc.getExtras().get("direction"));
         assertEquals(0, prefs.getLong("candidate_bg_timestamp", 0));
         assertEquals(0, prefs.getLong("last_bg_timestamp", 0));
     }
@@ -136,8 +142,9 @@ public class BgReceiverTest {
         assertNotNull(first);
         assertNull("повторные сигналы объединены", nextStarted());
 
-        // Пока обработка в полёте (inFlight), окно не ограничивает объединение.
-        mono.addAndGet(60_000);
+        // Пока обработка в полёте (маркер ожидания в пределах бэкстоп-окна
+        // 30 с), окно приёма не ограничивает объединение.
+        mono.addAndGet(20_000);
         new BgReceiver().onReceive(context, xdripBroadcast());
         assertNull("сигнал во время обработки объединён", nextStarted());
     }

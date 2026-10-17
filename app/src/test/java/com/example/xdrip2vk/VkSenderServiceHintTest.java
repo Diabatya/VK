@@ -5,7 +5,9 @@ import static org.robolectric.Shadows.shadowOf;
 
 import android.app.AlarmManager;
 import android.app.Application;
+import android.content.ComponentName;
 import android.content.Context;
+import android.content.ContextWrapper;
 import android.content.Intent;
 import android.content.SharedPreferences;
 
@@ -225,11 +227,10 @@ public class VkSenderServiceHintTest {
     public void stopBeforeHintProcessingKeepsDenied() {
         VkSenderService s = startService();
         s.onStartCommand(hintIntent(), 0, 1); // команда ждёт worker
-        // Stop до обработки: запрет должен действовать при исполнении.
-        prefs.edit()
-                .putBoolean(VkSenderService.PREF_TRANSMISSION_ENABLED, false)
-                .commit();
-        VkSenderService.resetTransmissionFlagsForTest(); // грязный кеш исключён
+        // Stop до обработки — производственный путь; запрет действует при
+        // исполнении задачи.
+        VkSenderService.requestStopTransmission(context);
+        VkSenderService.awaitSwitchIdleForTest();
         idle(s);
 
         assertEquals(0, fetches.get());
@@ -297,5 +298,187 @@ public class VkSenderServiceHintTest {
         assertNotNull(shadowApp().getNextStartedService());
         assertNull("серия сигналов объединена до одного запуска",
                 shadowApp().getNextStartedService());
+    }
+
+    // --- жизненный цикл маркера принятого сигнала ---
+
+    /**
+     * Воспроизведение отчёта: hint поставлен в очередь worker → Stop → Start →
+     * новый сигнал после интервала должен обрабатываться. Маркер снимается
+     * производственным кодом (без consumeHintForTest/reset посередине).
+     */
+    @Test
+    public void cancelledHintDoesNotWedgeChannel() {
+        new BgReceiver().onReceive(context,
+                new Intent(BgReceiver.ACTION_XDRIP_BG_ESTIMATE));
+        Intent started = shadowApp().getNextStartedService();
+        assertNotNull(started);
+
+        VkSenderService s = startService();
+        s.onStartCommand(started, 0, 1); // команда ждёт worker — не выполняется
+        // Stop до выполнения — производственный путь пользователя.
+        VkSenderService.requestStopTransmission(context);
+        VkSenderService.awaitSwitchIdleForTest();
+        idle(s); // отменённая задача выходит по запрету и снимает маркер
+        s.onDestroy();
+
+        // Start — производственный путь.
+        VkSenderService.requestStartTransmission(context);
+        VkSenderService.awaitSwitchIdleForTest();
+        assertNotNull(shadowApp().getNextStartedService()); // старт от Start
+
+        mono.addAndGet(16_000);
+        webReadings = Collections.singletonList(
+                sgv(118, System.currentTimeMillis() - 60_000));
+        new BgReceiver().onReceive(context,
+                new Intent(BgReceiver.ACTION_XDRIP_BG_ESTIMATE));
+        Intent started2 = shadowApp().getNextStartedService();
+        assertNotNull("канал не завис: новый сигнал запускает сервис", started2);
+
+        VkSenderService s2 = startService();
+        s2.onStartCommand(started2, 0, 1);
+        idle(s2);
+        assertEquals("опрос по новому сигналу выполнен", 1, fetches.get());
+        assertEquals(1, texts.size());
+        s2.onDestroy();
+    }
+
+    /**
+     * Hint-команда отклонена в onStartCommand при сохранённом запрете — маркер
+     * снят на точке отклонения, после возобновления канал работает.
+     */
+    @Test
+    public void hintRejectedAtEntryReleasesMarker() {
+        new BgReceiver().onReceive(context,
+                new Intent(BgReceiver.ACTION_XDRIP_BG_ESTIMATE));
+        Intent started = shadowApp().getNextStartedService();
+        assertNotNull(started);
+
+        // Экземпляр создан при разрешении; Stop — до доставки команды.
+        VkSenderService s = startService();
+        VkSenderService.requestStopTransmission(context);
+        VkSenderService.awaitSwitchIdleForTest();
+        s.onStartCommand(started, 0, 1); // запрет → отклонение до worker
+        s.onDestroy();
+
+        VkSenderService.requestStartTransmission(context);
+        VkSenderService.awaitSwitchIdleForTest();
+        shadowApp().getNextStartedService();
+
+        mono.addAndGet(16_000);
+        webReadings = Collections.singletonList(
+                sgv(118, System.currentTimeMillis() - 60_000));
+        new BgReceiver().onReceive(context,
+                new Intent(BgReceiver.ACTION_XDRIP_BG_ESTIMATE));
+        Intent started2 = shadowApp().getNextStartedService();
+        assertNotNull("отклонённая команда не оставила вечный маркер", started2);
+        VkSenderService s2 = startService();
+        s2.onStartCommand(started2, 0, 1);
+        idle(s2);
+        assertEquals(1, fetches.get());
+        s2.onDestroy();
+    }
+
+    /**
+     * Ошибка запуска сервиса (ограничение фонового запуска) — маркер снимается,
+     * следующий допустимый сигнал обрабатывается.
+     */
+    @Test
+    public void serviceStartFailureReleasesMarker() {
+        Context failing = new ContextWrapper(context) {
+            @Override
+            public ComponentName startForegroundService(Intent intent) {
+                throw new RuntimeException("simulated background start restriction");
+            }
+        };
+        VkSenderService.notifyXdripSignal(failing); // исключение поймано, маркер снят
+
+        mono.addAndGet(16_000);
+        new BgReceiver().onReceive(context,
+                new Intent(BgReceiver.ACTION_XDRIP_BG_ESTIMATE));
+        assertNotNull("следующий сигнал после ошибки запуска принят",
+                shadowApp().getNextStartedService());
+    }
+
+    /**
+     * Экземпляр завершён до обработки сигнала — маркер его поколения снят,
+     * новый экземпляр принимает новые сигналы.
+     */
+    @Test
+    public void destroyedInstanceReleasesPendingHint() {
+        new BgReceiver().onReceive(context,
+                new Intent(BgReceiver.ACTION_XDRIP_BG_ESTIMATE));
+        Intent started = shadowApp().getNextStartedService();
+        assertNotNull(started);
+
+        VkSenderService s = startService();
+        s.onStartCommand(started, 0, 1); // поколение записано, команда в очереди
+        s.onDestroy();                 // worker уходит до обработки
+
+        mono.addAndGet(16_000);
+        new BgReceiver().onReceive(context,
+                new Intent(BgReceiver.ACTION_XDRIP_BG_ESTIMATE));
+        assertNotNull("новый сигнал после гибели экземпляра принят",
+                shadowApp().getNextStartedService());
+    }
+
+    /**
+     * Запоздавшее завершение старого экземпляра не снимает маркер более нового
+     * сигнала: gen-проверка защищает новое поколение.
+     */
+    @Test
+    public void staleInstanceDestroyKeepsNewerMarker() {
+        webReadings = Collections.singletonList(
+                sgv(118, System.currentTimeMillis() - 60_000));
+        new BgReceiver().onReceive(context,
+                new Intent(BgReceiver.ACTION_XDRIP_BG_ESTIMATE));
+        Intent i1 = shadowApp().getNextStartedService();
+        VkSenderService s1 = startService();
+        s1.onStartCommand(i1, 0, 1);
+        idle(s1);
+        assertEquals(1, fetches.get()); // gen1 обработан s1
+
+        mono.addAndGet(16_000);
+        new BgReceiver().onReceive(context,
+                new Intent(BgReceiver.ACTION_XDRIP_BG_ESTIMATE));
+        Intent i2 = shadowApp().getNextStartedService();
+        assertNotNull(i2); // gen2 принят, команда ещё не доставлена
+
+        // Запоздавшая отмена старого экземпляра — маркер gen2 должен сохраниться.
+        s1.onDestroy();
+        new BgReceiver().onReceive(context,
+                new Intent(BgReceiver.ACTION_XDRIP_BG_ESTIMATE));
+        assertNull("маркер нового сигнала сохранён — повторный сигнал объединён",
+                shadowApp().getNextStartedService());
+
+        VkSenderService s2 = startService();
+        s2.onStartCommand(i2, 0, 1);
+        idle(s2);
+        assertEquals("gen2 доехал до нового экземпляра и обработан",
+                2, fetches.get());
+        s2.onDestroy();
+    }
+
+    /**
+     * Аварийный экземпляр (worker мёртв): команда сигнала отклоняется в
+     * onStartCommand с START_STICKY — маркер снимается, канал не зависает.
+     */
+    @Test
+    public void failedWorkerInstanceReleasesHint() {
+        new BgReceiver().onReceive(context,
+                new Intent(BgReceiver.ACTION_XDRIP_BG_ESTIMATE));
+        Intent started = shadowApp().getNextStartedService();
+        assertNotNull(started);
+
+        VkSenderService s = startService();
+        s.workerFailed = true;
+        s.onStartCommand(started, 0, 1);
+
+        mono.addAndGet(16_000);
+        new BgReceiver().onReceive(context,
+                new Intent(BgReceiver.ACTION_XDRIP_BG_ESTIMATE));
+        assertNotNull("сигнал после аварийного экземпляра принят",
+                shadowApp().getNextStartedService());
+        s.onDestroy();
     }
 }

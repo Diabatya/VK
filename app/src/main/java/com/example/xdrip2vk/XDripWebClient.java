@@ -115,7 +115,7 @@ public class XDripWebClient {
         return null;
     }
 
-    private static DeviceStatusData parseDeviceStatusJson(String json) {
+    static DeviceStatusData parseDeviceStatusJson(String json) {
         try {
             JSONArray jsonArray = new JSONArray(json);
 
@@ -152,12 +152,15 @@ public class XDripWebClient {
                     }
                 }
 
-                Logger.d(TAG, "Распознан статус: IoB=" + iob + ", CoB=" + cob);
+                Logger.d(TAG, "Статус устройства распознан: поля iob=" + (iob > 0)
+                        + ", cob=" + (cob > 0)); // значения IoB/CoB в лог не выводятся
                 return new DeviceStatusData(iob, cob);
             }
 
         } catch (JSONException e) {
-            Logger.e(TAG, "Ошибка разбора JSON статуса устройства от xDrip+: " + e.getMessage());
+            // e.getMessage() может содержать фрагмент ответа — в лог не выводим.
+            Logger.e(TAG, "Ошибка разбора JSON статуса устройства от xDrip+: "
+                    + e.getClass().getSimpleName());
         }
 
         return new DeviceStatusData(0, 0);

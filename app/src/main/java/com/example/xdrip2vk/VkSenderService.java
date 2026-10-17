@@ -182,6 +182,10 @@ public class VkSenderService extends Service {
         if (activeInstance == this) {
             isRunning = false; // сервис больше не считается работающим
         }
+        // Маркер, адресованный этому экземпляру, он уже не обработает —
+        // освобождаем; маркер более нового поколения (gen не совпадает) не
+        // трогаем.
+        releaseHintIfCurrent(instanceHintGen);
         handler = null; // поток мёртв — post'ы на него больше не принимаются
         releaseStateOwner(); // worker мёртв — записей состояния больше не будет
         stopSelf(); // упорядоченное завершение экземпляра на главном потоке
@@ -287,15 +291,31 @@ public class VkSenderService extends Service {
             {30_000, 60_000, 120_000, 240_000, 300_000};
     /** Сигнал xDrip → опрос веб-сервиса. Broadcast extras не переносятся. */
     private static final String EXTRA_XDRIP_HINT = "xdrip_hint";
+    /**
+     * Внутреннее служебное поле — поколение сигнала в команде сервиса. Нужно,
+     * чтобы запоздавшая отмена/завершение старого экземпляра не сняла маркер
+     * более нового принятого сигнала.
+     */
+    static final String EXTRA_HINT_GEN = "xdrip_hint_gen";
     /** Не более одной обработки сигнала за интервал (объединение серии). */
     static final long HINT_MIN_INTERVAL_MS = 15_000;
+    /**
+     * Бэкстоп ожидающего маркера: сигнал принят системой, но команда так и не
+     * дошла до обработки (потерян запуск). Бессрочного маркера быть не должно.
+     */
+    private static final long HINT_PENDING_TIMEOUT_MS = 30_000;
     private static final Object HINT_LOCK = new Object();
-    /** Сигнал принят и ждёт обработки сервисом — повторные объединяются. */
-    private static boolean hintInFlight;
+    private static long hintGenCounter;
+    /** Поколение принятого, но ещё не обработанного сигнала; 0 — ожидающего нет. */
+    private static long pendingHintGen;
+    /** Монотонное время принятия ожидающего сигнала (для бэкстоп-таймаута). */
+    private static long pendingHintAtMs;
     /** Монотонное время последнего принятого сигнала (receiver-лимит). */
     private static long lastHintAcceptedMs = -HINT_MIN_INTERVAL_MS;
     /** Монотонное время последнего реального опроса по сигналу (service-лимит). */
     private static long lastHintPollMs = -HINT_MIN_INTERVAL_MS;
+    /** Поколение сигнала, адресованное этому экземпляру и им не обработанное. */
+    private volatile long instanceHintGen;
     /** Подмена монотонных часов в тестах. */
     static volatile java.util.function.LongSupplier hintClockOverride;
 
@@ -305,35 +325,57 @@ public class VkSenderService extends Service {
     }
 
     /**
+     * Освободить ожидающий маркер, если он относится к указанному поколению.
+     * Запоздавшая отмена старого сигнала маркер более нового не снимает.
+     */
+    private static void releaseHintIfCurrent(long gen) {
+        if (gen == 0) {
+            return;
+        }
+        synchronized (HINT_LOCK) {
+            if (pendingHintGen == gen) {
+                pendingHintGen = 0;
+            }
+        }
+    }
+
+    /**
      * Недоверенный сигнал xDrip → команда сервису. Ограничение частоты и
      * объединение выполняются ДО запуска сервиса: поток broadcast не создаёт
      * очередь запусков и задач. Повторная проверка — в handleXdripHint.
      */
     static void notifyXdripSignal(Context context) {
         long now = hintElapsedMs();
+        long gen;
         synchronized (HINT_LOCK) {
-            if (hintInFlight || now - lastHintAcceptedMs < HINT_MIN_INTERVAL_MS) {
+            if (pendingHintGen != 0
+                    && now - pendingHintAtMs > HINT_PENDING_TIMEOUT_MS) {
+                pendingHintGen = 0; // принято, но до обработки не дошло — не вечно
+            }
+            if (pendingHintGen != 0
+                    || now - lastHintAcceptedMs < HINT_MIN_INTERVAL_MS) {
                 return; // серия сигналов объединяется в один опрос
             }
             lastHintAcceptedMs = now;
-            hintInFlight = true;
+            pendingHintGen = ++hintGenCounter;
+            pendingHintAtMs = now;
+            gen = pendingHintGen;
         }
         try {
             Intent i = new Intent(context, VkSenderService.class);
             i.putExtra(EXTRA_XDRIP_HINT, true);
+            i.putExtra(EXTRA_HINT_GEN, gen);
             context.startForegroundService(i);
         } catch (RuntimeException e) {
-            synchronized (HINT_LOCK) {
-                hintInFlight = false;
-            }
+            releaseHintIfCurrent(gen);
             Logger.w(TAG, "Не удалось запустить сервис по сигналу xDrip");
         }
     }
 
-    /** Тест: сервис взял сигнал в обработку — флаг in-flight снят. */
+    /** Тест: сервис взял сигнал в обработку — ожидающий маркер снят. */
     static void consumeHintForTest() {
         synchronized (HINT_LOCK) {
-            hintInFlight = false;
+            pendingHintGen = 0;
         }
     }
 
@@ -678,7 +720,9 @@ public class VkSenderService extends Service {
         retryScheduledFor = 0;
         retryScheduleQueued = false;
         synchronized (HINT_LOCK) {
-            hintInFlight = false;
+            pendingHintGen = 0;
+            pendingHintAtMs = 0;
+            hintGenCounter = 0;
             lastHintAcceptedMs = -HINT_MIN_INTERVAL_MS;
             lastHintPollMs = -HINT_MIN_INTERVAL_MS;
         }
@@ -784,27 +828,40 @@ public class VkSenderService extends Service {
     @Override
     public int onStartCommand(Intent intent, int flags, int startId) {
         Logger.d(TAG, "Команда старта сервиса");
+        // Поколение сигнала из команды — для освобождения маркера на всех
+        // точках выхода (отклонение, отмена, гибель экземпляра до обработки).
+        final long hintGen = intent != null
+                ? intent.getLongExtra(EXTRA_HINT_GEN, 0) : 0;
+        if (hintGen != 0) {
+            instanceHintGen = hintGen;
+        }
         if (workerFailed) {
             // Аварийный экземпляр: команду не «проглатываем» — START_STICKY
             // запрашивает у системы перезапуск рабочего экземпляра.
+            releaseHintIfCurrent(hintGen);
             return START_STICKY;
         }
         if (!isTransmissionAllowed(this)) {
             // Запоздавшая команда (в т.ч. восстановление с null intent) при
             // сохранённом запрете: экземпляр завершается, перезапуск не нужен.
+            releaseHintIfCurrent(hintGen);
             stopSelf();
             return START_NOT_STICKY;
         }
         isRunning = true;
 
         if (intent == null || handler == null) {
+            releaseHintIfCurrent(hintGen);
             return START_STICKY;
         }
         final Intent cmd = intent;
         // Сериализуем: никаких изменений состояния на главном потоке.
         handler.post(() -> {
             if (shuttingDown || !isTransmissionAllowed(this)) {
-                return; // завершение/запрет — queued intent обхода не даёт
+                // Завершение/запрет — queued intent обхода не даёт; принятый,
+                // но не обработанный сигнал не оставляет вечный маркер.
+                releaseHintIfCurrent(hintGen);
+                return;
             }
             boolean manualSend = cmd.getBooleanExtra("manual_send", false);
             boolean autoUpdate = cmd.getBooleanExtra("auto_update", false);
@@ -820,7 +877,7 @@ public class VkSenderService extends Service {
                 // xDrip — старый кеш неизвестного происхождения не источник.
                 pollXDrip(DeliveryCoordinator.Source.MANUAL, true);
             } else if (cmd.getBooleanExtra(EXTRA_XDRIP_HINT, false)) {
-                handleXdripHint();
+                handleXdripHint(hintGen);
             } else if (autoUpdate) {
                 SgvReading r = readingFromIntent(cmd);
                 if (r == null) {
@@ -861,9 +918,9 @@ public class VkSenderService extends Service {
      * передачи (Stop во время ожидания) и частота: запоздавшие дубли команды
      * не создают лишних опросов.
      */
-    private void handleXdripHint() {
+    private void handleXdripHint(long gen) {
+        releaseHintIfCurrent(gen);
         synchronized (HINT_LOCK) {
-            hintInFlight = false;
             long now = hintElapsedMs();
             if (now - lastHintPollMs < HINT_MIN_INTERVAL_MS) {
                 return;
@@ -996,6 +1053,11 @@ public class VkSenderService extends Service {
     @Override
     public void onDestroy() {
         shuttingDown = true; // новые poll/drain/send и перепланирование запрещены
+        // Если ожидающий маркер адресован этому экземпляру — его команда умрёт
+        // вместе с worker, обработки не будет: освобождаем. Маркер более нового
+        // поколения (адресованный новому экземпляру) не совпадает по gen и
+        // сохраняется.
+        releaseHintIfCurrent(instanceHintGen);
         // Передача владения новому экземпляру уже могла произойти: уведомление,
         // будильник и isRunning трогаем только если мы — активный экземпляр.
         final boolean wasActive = activeInstance == this;
