@@ -41,6 +41,11 @@ public class VkSenderServiceDeliveryTest {
         context = ApplicationProvider.getApplicationContext();
         prefs = PreferenceManager.getDefaultSharedPreferences(context);
         prefs.edit().clear().commit();
+        // Тесты не про разрешение: ключ подтверждён заранее — иначе
+        // чтение ставит миграционную запись в очередь и входы в окне
+        // записи недетерминированно получают запрет.
+        prefs.edit().putBoolean(
+                VkSenderService.PREF_TRANSMISSION_ENABLED, true).commit();
         VkSenderService.resetTransmissionFlagsForTest();
         TokenStorage.setToken(context, "SYNTHETIC_TOKEN");
         TokenStorage.setChatId(context, 777);

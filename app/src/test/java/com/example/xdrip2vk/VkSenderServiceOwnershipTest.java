@@ -113,6 +113,13 @@ public class VkSenderServiceOwnershipTest {
     }
 
     private VkSenderService startService() {
+        // Подтверждённое разрешение заранее: без ключа первое чтение ставит
+        // миграционную запись в очередь, и gate экземпляра в окне записи
+        // недетерминированно запрещает запуск.
+        if (!prefs.contains(VkSenderService.PREF_TRANSMISSION_ENABLED)) {
+            prefs.edit().putBoolean(
+                    VkSenderService.PREF_TRANSMISSION_ENABLED, true).commit();
+        }
         VkSenderService s = Robolectric.buildService(VkSenderService.class).create().get();
         idle(s);
         return s;
@@ -848,12 +855,23 @@ public class VkSenderServiceOwnershipTest {
         TokenStorage.setChatId(context, 0);
         List<Boolean> written = Collections.synchronizedList(new ArrayList<>());
         AtomicInteger calls = new AtomicInteger();
+        CountDownLatch retryEntered = new CountDownLatch(1);
+        CountDownLatch retryRelease = new CountDownLatch(1);
         VkSenderService.transmissionWriteOverride = (enabled, mark) -> {
             written.add(enabled);
             if (calls.getAndIncrement() == 0) {
                 prefs.edit().putBoolean(
                         VkSenderService.PREF_TRANSMISSION_ENABLED, enabled).apply();
                 return false; // попытка false отказала, кеш содержит ключ
+            }
+            // повторная запись удержана: кеш меняется до известного результата
+            prefs.edit().putBoolean(
+                    VkSenderService.PREF_TRANSMISSION_ENABLED, enabled).apply();
+            retryEntered.countDown();
+            try {
+                retryRelease.await(10, TimeUnit.SECONDS);
+            } catch (InterruptedException e) {
+                Thread.currentThread().interrupt();
             }
             return prefs.edit()
                     .putBoolean(VkSenderService.PREF_TRANSMISSION_ENABLED, enabled)
@@ -866,6 +884,10 @@ public class VkSenderServiceOwnershipTest {
         TokenStorage.setToken(context, "SYNTHETIC_TOKEN_2");
         TokenStorage.setChatId(context, 999);
         assertFalse(VkSenderService.isTransmissionAllowed(context)); // повтор
+        awaitLatch(retryEntered); // повторная запись выполняется
+        assertFalse("во время повторной записи разрешения нет",
+                VkSenderService.isTransmissionAllowed(context));
+        retryRelease.countDown();
         VkSenderService.awaitSwitchIdleForTest(); // попытка 2 подтверждена
 
         assertEquals("повтор пересчитал решение по новым настройкам",
@@ -880,12 +902,22 @@ public class VkSenderServiceOwnershipTest {
         // Существующая настроенная установка → исходное решение true.
         List<Boolean> written = Collections.synchronizedList(new ArrayList<>());
         AtomicInteger calls = new AtomicInteger();
+        CountDownLatch retryEntered = new CountDownLatch(1);
+        CountDownLatch retryRelease = new CountDownLatch(1);
         VkSenderService.transmissionWriteOverride = (enabled, mark) -> {
             written.add(enabled);
             if (calls.getAndIncrement() == 0) {
                 prefs.edit().putBoolean(
                         VkSenderService.PREF_TRANSMISSION_ENABLED, enabled).apply();
                 return false;
+            }
+            prefs.edit().putBoolean(
+                    VkSenderService.PREF_TRANSMISSION_ENABLED, enabled).apply();
+            retryEntered.countDown();
+            try {
+                retryRelease.await(10, TimeUnit.SECONDS);
+            } catch (InterruptedException e) {
+                Thread.currentThread().interrupt();
             }
             return prefs.edit()
                     .putBoolean(VkSenderService.PREF_TRANSMISSION_ENABLED, enabled)
@@ -898,6 +930,10 @@ public class VkSenderServiceOwnershipTest {
         TokenStorage.setChatId(context, 0);
         TokenStorage.setAlertChatId(context, 0);
         assertFalse(VkSenderService.isTransmissionAllowed(context)); // повтор
+        awaitLatch(retryEntered); // повторная запись выполняется
+        assertFalse("во время повторной записи разрешения нет",
+                VkSenderService.isTransmissionAllowed(context));
+        retryRelease.countDown();
         VkSenderService.awaitSwitchIdleForTest(); // попытка 2 подтверждена
 
         assertEquals("повтор пересчитал решение по новым настройкам",
