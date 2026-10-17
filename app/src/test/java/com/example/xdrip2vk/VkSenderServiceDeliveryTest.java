@@ -41,6 +41,7 @@ public class VkSenderServiceDeliveryTest {
         context = ApplicationProvider.getApplicationContext();
         prefs = PreferenceManager.getDefaultSharedPreferences(context);
         prefs.edit().clear().commit();
+        VkSenderService.resetTransmissionFlagsForTest();
         TokenStorage.setToken(context, "SYNTHETIC_TOKEN");
         TokenStorage.setChatId(context, 777);
         peers = new java.util.ArrayList<>();

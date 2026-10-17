@@ -281,19 +281,30 @@ public class MainActivity extends AppCompatActivity {
             }
         }
 
-        VkSenderService.requestStartTransmission(this);
+        // Сервис стартует только после ПОДТВЕРЖДЁННОЙ записи разрешения;
+        // блокирующий commit выполняется вне главного потока.
+        VkSenderService.requestStartTransmission(this, ok -> runOnUiThread(() -> {
+            if (!ok) {
+                Toast.makeText(this,
+                        "Не удалось сохранить разрешение — передача не включена",
+                        Toast.LENGTH_LONG).show();
+            }
+            updateStatus();
+        }));
         updateStatus();
     }
 
     private void stopVkSenderService() {
-        // Сначала подтверждённая запись запрета (внутри — блокировка
-        // текущего процесса до commit), затем завершение экземпляра.
-        boolean saved = VkSenderService.requestStopTransmission(this);
-        if (!saved) {
-            Toast.makeText(this,
-                    "Не удалось сохранить запрет — передача остановлена, но после перезапуска может возобновиться",
-                    Toast.LENGTH_LONG).show();
-        }
+        // Процессный запрет ставится немедленно; подтверждённая запись и
+        // завершение экземпляра — асинхронно, без блокировки главного потока.
+        VkSenderService.requestStopTransmission(this, saved -> runOnUiThread(() -> {
+            if (!saved) {
+                Toast.makeText(this,
+                        "Не удалось сохранить запрет — передача остановлена, но после перезапуска может возобновиться",
+                        Toast.LENGTH_LONG).show();
+            }
+            updateStatus();
+        }));
         updateStatus();
     }
 

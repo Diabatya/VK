@@ -46,6 +46,7 @@ public class VkSenderServiceAuthTest {
         context = ApplicationProvider.getApplicationContext();
         prefs = PreferenceManager.getDefaultSharedPreferences(context);
         prefs.edit().clear().commit();
+        VkSenderService.resetTransmissionFlagsForTest();
         TokenStorage.setToken(context, "SYNTHETIC_TOKEN_1");
         TokenStorage.setChatId(context, 777);
         rids = new ArrayList<>();

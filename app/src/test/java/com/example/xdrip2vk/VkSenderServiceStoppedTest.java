@@ -153,11 +153,29 @@ public class VkSenderServiceStoppedTest {
 
     /** Пользовательская остановка: запрет сохранён, экземпляр завершён. */
     private void stopTransmission(VkSenderService s) {
-        assertTrue(VkSenderService.requestStopTransmission(context));
+        final boolean[] saved = {false};
+        final java.util.concurrent.CountDownLatch latch =
+                new java.util.concurrent.CountDownLatch(1);
+        VkSenderService.requestStopTransmission(context, ok -> {
+            saved[0] = ok;
+            latch.countDown();
+        });
+        try {
+            latch.await(5, java.util.concurrent.TimeUnit.SECONDS);
+        } catch (InterruptedException e) {
+            Thread.currentThread().interrupt();
+        }
+        assertTrue(saved[0]);
         if (s != null) {
             s.onDestroy();
             idle(s);
         }
+    }
+
+    /** Явный запуск с ожиданием подтверждённой записи разрешения. */
+    private void startTransmission() {
+        VkSenderService.requestStartTransmission(context);
+        VkSenderService.awaitSwitchIdleForTest();
     }
 
     /** Обнулить backoff в последнем сохранённом снимке (модель «время прошло»). */
@@ -256,7 +274,7 @@ public class VkSenderServiceStoppedTest {
         VkSenderService s = startService();
         // команда принята и ждёт в очереди worker — остановка до её выполнения
         s.onStartCommand(autoUpdate(120, System.currentTimeMillis() - 60_000), 0, 1);
-        assertTrue(VkSenderService.requestStopTransmission(context));
+        stopTransmission(null);
         idle(s);
         assertEquals(0, peers.size());
         s.onDestroy();
@@ -314,7 +332,7 @@ public class VkSenderServiceStoppedTest {
         assertEquals(1, peers.size());
         assertTrue(s.lastDrainDelayMs > 0);
 
-        assertTrue(VkSenderService.requestStopTransmission(context));
+        stopTransmission(null);
         long delayAfterStop = s.lastDrainDelayMs;
         idleFor(s, java.time.Duration.ofSeconds(60)); // старый callback срабатывает
         assertEquals("callback после остановки не возобновляет отправки",
@@ -351,7 +369,7 @@ public class VkSenderServiceStoppedTest {
         // модель: backoff истёк за время остановки
         clearBackoffInSnapshot();
         rule = null;
-        VkSenderService.requestStartTransmission(context);
+        startTransmission();
 
         VkSenderService s2 = startService();
         assertEquals(2, peers.size());
@@ -374,7 +392,7 @@ public class VkSenderServiceStoppedTest {
         int last = writes.size() - 1;
         writes.set(last, writes.get(last).replaceAll("\"exp\":\\d+", "\"exp\":1"));
         rule = null;
-        VkSenderService.requestStartTransmission(context);
+        startTransmission();
 
         VkSenderService s2 = startService();
         assertEquals("просроченное за время остановки не отправляется",
@@ -386,8 +404,19 @@ public class VkSenderServiceStoppedTest {
     @Test
     public void stopWriteFailureIsHonestAndStillBlocks() {
         VkSenderService.transmissionWriteOverride = () -> false; // диск отказал
-        boolean saved = VkSenderService.requestStopTransmission(context);
-        assertFalse("отказ записи возвращается честно", saved);
+        final boolean[] saved = {true};
+        final java.util.concurrent.CountDownLatch latch =
+                new java.util.concurrent.CountDownLatch(1);
+        VkSenderService.requestStopTransmission(context, ok -> {
+            saved[0] = ok;
+            latch.countDown();
+        });
+        try {
+            latch.await(5, java.util.concurrent.TimeUnit.SECONDS);
+        } catch (InterruptedException e) {
+            Thread.currentThread().interrupt();
+        }
+        assertFalse("отказ записи возвращается честно", saved[0]);
         // текущий процесс всё равно блокирует передачу
         assertFalse(VkSenderService.isTransmissionAllowed(context));
     }
@@ -415,7 +444,7 @@ public class VkSenderServiceStoppedTest {
                 event("e0", now - 60_000),
                 event("e1", now - 30_000),
                 event("e2", now - 20_000));
-        VkSenderService.requestStartTransmission(context);
+        startTransmission();
 
         VkSenderService s2 = startService();
         s2.onStartCommand(pollNow(), 0, 1);
@@ -437,7 +466,7 @@ public class VkSenderServiceStoppedTest {
     @Test
     public void nullTreatmentsDoNotFinishResumeBaseline() {
         prefs.edit().putBoolean("show_treatments", true).commit();
-        VkSenderService.requestStartTransmission(context);
+        startTransmission();
         assertTrue(prefs.getBoolean("treatment_baseline_pending", false));
 
         VkSenderService s = startService();

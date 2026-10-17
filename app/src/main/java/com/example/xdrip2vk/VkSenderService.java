@@ -60,6 +60,27 @@ public class VkSenderService extends Service {
      * процессе блокируются сразу, не дожидаясь подтверждения записи.
      */
     private static volatile boolean userStopInFlight;
+
+    // ---- Передача владения состоянием доставки между экземплярами ----
+    // Старый экземпляр может ещё дожимать сетевую попытку и писать checkpoint,
+    // когда создан новый. Новый экземпляр НЕ загружает и не меняет очередь,
+    // пока прежний владелец не сохранит результат и не передаст владение.
+    private static final Object STATE_OWNER_LOCK = new Object();
+    private static boolean stateOwned;
+    /** Этот экземпляр держит владение состоянием доставки. */
+    private volatile boolean ownsState;
+    /** Активный (не завершающийся) экземпляр — владелец уведомления/будильника. */
+    private static volatile VkSenderService activeInstance;
+
+    // ---- Сериализация запросов Start/Stop ----
+    // Запись разрешения — потенциально блокирующий commit, выполняется НЕ на
+    // главном потоке. Все записи идут через один исполнитель; поколение
+    // отсекает устаревший Start, завершившийся после более нового Stop.
+    private static final Object SWITCH_LOCK = new Object();
+    private static long switchGeneration;
+    private static final java.util.concurrent.ExecutorService switchExecutor =
+            java.util.concurrent.Executors.newSingleThreadExecutor(
+                    r -> new Thread(r, "VkSwitchThread"));
     /** Оба пути смены токена (ручной ввод и импорт файла) приходят сюда. */
     public static final String ACTION_TOKEN_CHANGED =
             "com.example.xdrip2vk.action.TOKEN_CHANGED";
@@ -135,9 +156,50 @@ public class VkSenderService extends Service {
         Logger.e(TAG, "Критическая ошибка в фоновом потоке: "
                 + (ex == null ? "unknown" : ex.getMessage()));
         workerFailed = true;
-        isRunning = false; // сервис больше не считается работающим
+        if (activeInstance == this) {
+            isRunning = false; // сервис больше не считается работающим
+        }
         handler = null; // поток мёртв — post'ы на него больше не принимаются
+        releaseStateOwner(); // worker мёртв — записей состояния больше не будет
         stopSelf(); // упорядоченное завершение экземпляра на главном потоке
+    }
+
+    /**
+     * Дождаться передачи владения состоянием доставки и занять его.
+     * Вызывается с рабочего потока нового экземпляра: прежний владелец в это
+     * время может дожимать сетевую попытку — параллельная загрузка и запись
+     * очереди двумя экземплярами запрещена. Главный поток не блокируется.
+     * @return false — экземпляр завершается/умер до получения владения.
+     */
+    private boolean acquireStateOwner() {
+        synchronized (STATE_OWNER_LOCK) {
+            while (stateOwned && !shuttingDown && !workerFailed) {
+                try {
+                    STATE_OWNER_LOCK.wait(500);
+                } catch (InterruptedException e) {
+                    Thread.currentThread().interrupt();
+                    return false;
+                }
+            }
+            if (shuttingDown || workerFailed) {
+                return false;
+            }
+            stateOwned = true;
+            ownsState = true;
+            return true;
+        }
+    }
+
+    /** Передать владение: вызывается после последней записи состояния. */
+    private void releaseStateOwner() {
+        if (!ownsState) {
+            return; // чужое владение не трогаем
+        }
+        synchronized (STATE_OWNER_LOCK) {
+            ownsState = false;
+            stateOwned = false;
+            STATE_OWNER_LOCK.notifyAll();
+        }
     }
 
     // Ограниченный повтор записи при отказе диска — без посекундного цикла.
@@ -146,11 +208,13 @@ public class VkSenderService extends Service {
     private int persistRetries;
 
     /**
-     * Разрешила ли пользовательская настройка передачу. При отсутствии ключа
-     * — миграция: разрешено только для существующей настроенной установки
-     * (заданы токен и обычный чат); новая ненастроенная — выключена.
-     * Сам чтение ключ не создаёт: выбор записывается только явным
-     * «Запустить»/«Остановить», настройки токена/чатов его не меняют.
+     * Разрешила ли пользовательская настройка передачу. Ключ — сохранённый
+     * выбор пользователя; разрешение передачи и готовность конфигурации —
+     * разные признаки. При отсутствии ключа выполняется ОДНОРАЗОВАЯ
+     * инициализация: существующая настроенная установка (токен+чат) — true,
+     * новая — false; дальнейшие настройки выбор не меняют. Запись
+     * инициализации — асинхронно через switchExecutor; отказ не считается
+     * завершённым — следующее чтение повторит вывод и попытку.
      */
     public static boolean isTransmissionAllowed(Context context) {
         if (userStopInFlight) {
@@ -158,56 +222,142 @@ public class VkSenderService extends Service {
         }
         SharedPreferences p = PreferenceManager.getDefaultSharedPreferences(context);
         if (!p.contains(PREF_TRANSMISSION_ENABLED)) {
-            return !TokenStorage.getToken(context).isEmpty()
+            boolean legacy = !TokenStorage.getToken(context).isEmpty()
                     && TokenStorage.getChatId(context) > 0;
+            maybeInitTransmissionKey(context.getApplicationContext(), legacy);
+            return legacy;
         }
         return p.getBoolean(PREF_TRANSMISSION_ENABLED, false);
+    }
+
+    private static volatile boolean migrationInitQueued;
+
+    private static void maybeInitTransmissionKey(final Context app, final boolean legacy) {
+        if (migrationInitQueued) {
+            return;
+        }
+        migrationInitQueued = true;
+        switchExecutor.execute(() -> {
+            try {
+                if (!PreferenceManager.getDefaultSharedPreferences(app)
+                        .contains(PREF_TRANSMISSION_ENABLED)) {
+                    writeTransmissionEnabled(app, legacy, false);
+                }
+            } finally {
+                // отказ записи — ключ не появился, следующее чтение повторит
+                migrationInitQueued = false;
+            }
+        });
     }
 
     /** Тестовая подмена подтверждённой записи разрешения (отказ диска). */
     static volatile java.util.function.BooleanSupplier transmissionWriteOverride;
 
     /** Подтверждённая запись пользовательского выбора; возобновление помечает baseline терапии. */
-    private static boolean writeTransmissionEnabled(Context context, boolean enabled) {
+    private static boolean writeTransmissionEnabled(Context context, boolean enabled,
+                                                    boolean markBaselinePending) {
         if (transmissionWriteOverride != null) {
             return transmissionWriteOverride.getAsBoolean();
         }
         SharedPreferences.Editor e = PreferenceManager.getDefaultSharedPreferences(context)
                 .edit()
                 .putBoolean(PREF_TRANSMISSION_ENABLED, enabled);
-        if (enabled) {
+        if (markBaselinePending) {
             e.putBoolean(PREF_TREATMENT_BASELINE_PENDING, true);
         }
         return e.commit();
     }
 
+    private static long nextSwitchGeneration() {
+        synchronized (SWITCH_LOCK) {
+            return ++switchGeneration;
+        }
+    }
+
+    private static boolean isSwitchGenerationCurrent(long gen) {
+        synchronized (SWITCH_LOCK) {
+            return gen == switchGeneration;
+        }
+    }
+
     /**
-     * «Остановить»: сначала блокировка в этом процессе и подтверждённая
-     * запись запрета, затем завершение текущего экземпляра.
-     * @return true — запрет подтверждённо записан и переживёт перезапуск;
-     *         false — передача остановлена, но сохранение не подтверждено.
+     * «Остановить»: процессный запрет — немедленно на вызывающем потоке;
+     * подтверждённая запись и завершение экземпляра — на switchExecutor.
+     * @param done результат записи для UI (поток switchExecutor); null — без.
      */
-    public static boolean requestStopTransmission(Context context) {
+    public static void requestStopTransmission(Context context,
+                                               java.util.function.Consumer<Boolean> done) {
         userStopInFlight = true; // новые попытки блокируются до конца записи
-        boolean saved = writeTransmissionEnabled(context, false);
-        context.stopService(new Intent(context, VkSenderService.class));
-        return saved;
+        nextSwitchGeneration(); // устаревает любой ожидающий запрос Start
+        final Context app = context.getApplicationContext();
+        switchExecutor.execute(() -> {
+            boolean saved = writeTransmissionEnabled(app, false, false);
+            app.stopService(new Intent(app, VkSenderService.class));
+            if (done != null) {
+                done.accept(saved);
+            }
+        });
+    }
+
+    public static void requestStopTransmission(Context context) {
+        requestStopTransmission(context, null);
     }
 
     /**
-     * «Запустить»: сохранить разрешение и поднять рабочий экземпляр.
-     * Первый снимок терапии после возобновления становится baseline —
-     * история за время остановки не уходит бэклогом.
+     * «Запустить»: только после ПОДТВЕРЖДЁННОЙ записи разрешения снимается
+     * процессный запрет и стартует сервис. Устаревший запрос (пришёл более
+     * новый Stop/Start) не снимает запрет и не запускает передачу.
+     * Первый валидный снимок терапии после возобновления — baseline без бэклога.
+     * @param done true — разрешение записано и сервис запрошен; false — отказ
+     *             записи или запрос устарел (поток switchExecutor); null — без.
      */
-    public static void requestStartTransmission(Context context) {
-        userStopInFlight = false;
-        writeTransmissionEnabled(context, true);
-        context.startForegroundService(new Intent(context, VkSenderService.class));
+    public static void requestStartTransmission(Context context,
+                                                java.util.function.Consumer<Boolean> done) {
+        final Context app = context.getApplicationContext();
+        final long gen = nextSwitchGeneration();
+        switchExecutor.execute(() -> {
+            boolean ok = false;
+            // Запись успела, но пришёл более новый запрос — эффектов старого
+            // Start не применяем: запрет не снимаем, сервис не стартуем.
+            if (isSwitchGenerationCurrent(gen)
+                    && writeTransmissionEnabled(app, true, true)
+                    && isSwitchGenerationCurrent(gen)) {
+                userStopInFlight = false;
+                app.startForegroundService(new Intent(app, VkSenderService.class));
+                ok = true;
+            }
+            if (done != null) {
+                done.accept(ok);
+            }
+        });
     }
 
-    /** Сброс процессного флага запрета — только для тестов. */
+    public static void requestStartTransmission(Context context) {
+        requestStartTransmission(context, null);
+    }
+
+    /** Дождаться завершения всех запрошенных Start/Stop — только для тестов. */
+    static void awaitSwitchIdleForTest() {
+        final java.util.concurrent.CountDownLatch latch =
+                new java.util.concurrent.CountDownLatch(1);
+        switchExecutor.execute(latch::countDown);
+        try {
+            latch.await(10, java.util.concurrent.TimeUnit.SECONDS);
+        } catch (InterruptedException e) {
+            Thread.currentThread().interrupt();
+        }
+    }
+
+    /** Сброс процессных флагов и владения состоянием — только для тестов. */
     static void resetTransmissionFlagsForTest() {
+        awaitSwitchIdleForTest(); // сначала добить очередь — старые записи не протекают в следующий тест
         userStopInFlight = false;
+        activeInstance = null;
+        migrationInitQueued = false;
+        synchronized (STATE_OWNER_LOCK) {
+            stateOwned = false;
+            STATE_OWNER_LOCK.notifyAll();
+        }
     }
 
     /**
@@ -238,7 +388,6 @@ public class VkSenderService extends Service {
     public void onCreate() {
         super.onCreate();
         Logger.d(TAG, "Сервис создан");
-        isRunning = true;
         prefs = PreferenceManager.getDefaultSharedPreferences(this);
         alarmManager = (AlarmManager) getSystemService(Context.ALARM_SERVICE);
 
@@ -256,20 +405,26 @@ public class VkSenderService extends Service {
             stopSelf();
             return;
         }
+        isRunning = true;
+        activeInstance = this;
 
         handlerThread = new HandlerThread("VkSenderThread");
         handlerThread.setUncaughtExceptionHandler(this::onWorkerFailure);
         handlerThread.start();
         handler = new Handler(handlerThread.getLooper());
 
-        coordinator = DeliveryCoordinator.load(store().read());
-        coordinator.setCheckpoint(this::persistState);
-
         drainRunnable = this::drainAndSchedule;
         pollTask = this::pollXDrip;
 
         // Все изменения состояния — только на фоновом потоке, строго по очереди.
+        // Координатор загружается ПОСЛЕ передачи владения от прежнего
+        // экземпляра — иначе его устаревший снимок перезапишет наши записи.
         handler.post(() -> {
+            if (!acquireStateOwner()) {
+                return; // экземпляр завершается — владение не получено
+            }
+            coordinator = DeliveryCoordinator.load(store().read());
+            coordinator.setCheckpoint(this::persistState);
             if (prefs.getString(PREF_STATE, "").isEmpty()) {
                 // Миграция со схемы 4.3: старый UI-кеш last_bg_* мог содержать
                 // устаревшую глюкозу с ошибочно «текущим» временем. Он недоверен —
@@ -497,13 +652,21 @@ public class VkSenderService extends Service {
 
     @Override
     public void onDestroy() {
-        isRunning = false;
         shuttingDown = true; // новые poll/drain/send и перепланирование запрещены
-        cancelAlarms();
-        // Финальное сохранение и остановка worker — упорядоченно на том же
-        // потоке: задача встаёт в хвост ПОСЛЕ текущего обхода, уже начатая
-        // сетевая попытка успевает завершиться и сохранить результат
-        // (остаток обхода не отправляется — drain проверяет shuttingDown).
+        // Передача владения новому экземпляру уже могла произойти: уведомление,
+        // будильник и isRunning трогаем только если мы — активный экземпляр.
+        final boolean wasActive = activeInstance == this;
+        if (wasActive) {
+            isRunning = false;
+            activeInstance = null;
+            cancelAlarms();
+        }
+        // Финальное сохранение, передача владения и остановка worker —
+        // упорядоченно на том же потоке: задача встаёт в хвост ПОСЛЕ текущего
+        // обхода, уже начатая сетевая попытка успевает завершиться и сохранить
+        // результат (остаток обхода не отправляется — drain проверяет
+        // shuttingDown). Только после последней записи владение отпускается —
+        // новый экземпляр не загружает очередь параллельно с нами.
         // Главный поток сеть не ждёт.
         final Handler h = handler;
         final HandlerThread t = handlerThread;
@@ -515,23 +678,28 @@ public class VkSenderService extends Service {
                     if (coordinator != null) {
                         coordinator.persistNow();
                     }
+                    releaseStateOwner();
                     t.quitSafely();
                 });
             } catch (Exception ignored) {
                 // looper уже мёртв — хвостовую задачу поставить нельзя
             }
         }
-        if (!shutdownPosted && t != null) {
-            // worker уже мёртв (аварийное состояние): последнее подтверждённое
-            // состояние уже на диске — сериализовать coordinator с главного
-            // потока нельзя, просто завершаем поток.
-            t.quitSafely();
+        if (!shutdownPosted) {
+            // worker уже мёртв (аварийное состояние) или не создан: записей
+            // от нас больше не будет — владение можно отпустить сразу.
+            releaseStateOwner();
+            if (t != null) {
+                t.quitSafely();
+            }
         }
         if (wakeLock != null && wakeLock.isHeld()) {
             wakeLock.release();
         }
-        NotificationManager notificationManager = (NotificationManager) getSystemService(Context.NOTIFICATION_SERVICE);
-        notificationManager.cancel(NOTIFICATION_ID);
+        if (wasActive) {
+            NotificationManager notificationManager = (NotificationManager) getSystemService(Context.NOTIFICATION_SERVICE);
+            notificationManager.cancel(NOTIFICATION_ID);
+        }
         super.onDestroy();
     }
 
@@ -647,14 +815,17 @@ public class VkSenderService extends Service {
             DeliveryCoordinator.Config cfg = loadConfig();
             List<TreatmentEvent> treatments = treatmentsOverride != null
                     ? treatmentsOverride.get() : XDripWebClient.fetchTreatments();
-            if (prefs.getBoolean(PREF_TREATMENT_BASELINE_PENDING, false)) {
-                // Явное возобновление: первый ВАЛИДНЫЙ снимок — baseline без
-                // бэклога за время остановки. null/ошибка baseline не
-                // завершают — флаг и неинициализированность сохраняются.
-                if (treatments != null) {
-                    prefs.edit().remove(PREF_TREATMENT_BASELINE_PENDING).apply();
-                    coordinator.resetTreatmentsBaseline();
-                }
+            // Явное возобновление: первый ВАЛИДНЫЙ снимок — baseline без
+            // бэклога за время остановки. null/ошибка baseline не завершают.
+            // Признак снимается только ПОСЛЕ подтверждённой записи нового
+            // baseline: прерывание до записи — baseline не сменился, флаг
+            // жив; прерывание после записи, но до снятия флага — следующий
+            // старт просто повторит baseline по новому снимку (события не
+            // дублируются и не уходят бэклогом).
+            boolean baselinePending =
+                    prefs.getBoolean(PREF_TREATMENT_BASELINE_PENDING, false);
+            if (baselinePending && treatments != null) {
+                coordinator.resetTreatmentsBaseline();
             }
             boolean showTreatments = prefs.getBoolean(PREF_SHOW_TREATMENTS, false);
             coordinator.onTreatments(treatments, cfg,
@@ -662,7 +833,12 @@ public class VkSenderService extends Service {
                     showTreatments, now);
             // Не только added>0: baseline терапии, просмотренные ID и watermark
             // — тоже изменения, их нужно подтвердить на диске.
-            coordinator.persistNow();
+            boolean persisted = coordinator.persistNow();
+            if (baselinePending && treatments != null && persisted) {
+                // baseline и его просмотренные события подтверждены на диске —
+                // только теперь признак ожидания можно снять.
+                prefs.edit().remove(PREF_TREATMENT_BASELINE_PENDING).commit();
+            }
 
             if (isRunning && !shuttingDown) {
                 scheduleNextAlarm();
