@@ -14,4 +14,5 @@
     <string name="stop_service">Остановить сервис</string>
     <string name="open_settings">Настройки</string>
     <string name="status">Статус</string>
+    <string name="xdrip_webservice_note">Для передачи данных включите в xDrip+: Настройки → Inter-app settings → Web Service (локальный порт 17580). Open Web Service включать не нужно — доступ извне не используется.</string>
 </resources>

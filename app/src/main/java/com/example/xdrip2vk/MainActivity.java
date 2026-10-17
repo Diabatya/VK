@@ -236,26 +236,12 @@ public class MainActivity extends AppCompatActivity {
             chipStatus.setText("Сначала запустите передачу");
             return;
         }
-        SharedPreferences prefs = PreferenceManager.getDefaultSharedPreferences(this);
-        long lastTimestamp = prefs.getLong("last_bg_timestamp", 0);
-        float lastBg = prefs.getFloat("last_bg_value", 0);
-
-        if (lastBg > 0 && Float.isFinite(lastBg) && lastTimestamp > 0
-                && ReadingGate.check(lastTimestamp, System.currentTimeMillis())
-                        == ReadingGate.Verdict.FRESH) {
-            Intent intent = new Intent(this, VkSenderService.class);
-            intent.putExtra("manual_send", true);
-            // Контракт: bg_value — double в мг/дл, timestamp — epoch мс
-            intent.putExtra("bg_value", (double) lastBg);
-            intent.putExtra("timestamp", lastTimestamp);
-            intent.putExtra("direction", prefs.getString("last_bg_direction", ""));
-            startService(intent);
-            chipStatus.setText("Отправка...");
-        } else if (lastBg > 0 && lastTimestamp > 0) {
-            chipStatus.setText("Данные устарели");
-        } else {
-            chipStatus.setText("Нет данных для отправки");
-        }
+        // Ручная отправка получает актуальное показание из веб-сервиса xDrip
+        // внутри сервиса — кеш неизвестного происхождения не источник данных.
+        Intent intent = new Intent(this, VkSenderService.class);
+        intent.putExtra("manual_send", true);
+        startService(intent);
+        chipStatus.setText("Отправка...");
     }
 
     private void startVkSenderService() {

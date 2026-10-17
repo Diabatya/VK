@@ -47,7 +47,7 @@ public class XDripWebClient {
         if (responseData == null) {
             return result;
         }
-        Logger.d(TAG, "Ответ от xDrip+ (сахар): " + responseData);
+        Logger.d(TAG, "Ответ от xDrip+ (сахар): " + responseData.length() + " байт");
 
         result = XdripJson.parseSgv(responseData);
         Logger.d(TAG, "Распознано " + result.size() + " записей сахара");
@@ -66,7 +66,7 @@ public class XDripWebClient {
         if (responseData == null) {
             return null;
         }
-        Logger.d(TAG, "Ответ терапии от xDrip+: " + responseData);
+        Logger.d(TAG, "Ответ терапии от xDrip+: " + responseData.length() + " байт");
         return XdripJson.parseTreatments(responseData);
     }
 
@@ -77,7 +77,7 @@ public class XDripWebClient {
         if (responseData == null) {
             return new DeviceStatusData(0, 0);
         }
-        Logger.d(TAG, "Ответ статуса устройства от xDrip+: " + responseData);
+        Logger.d(TAG, "Ответ статуса устройства от xDrip+: " + responseData.length() + " байт");
         return parseDeviceStatusJson(responseData);
     }
 

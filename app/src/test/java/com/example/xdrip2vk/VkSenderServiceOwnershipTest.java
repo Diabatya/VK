@@ -14,6 +14,7 @@ import androidx.test.core.app.ApplicationProvider;
 
 import com.example.xdrip2vk.core.PendingMessage;
 import com.example.xdrip2vk.core.SendResult;
+import com.example.xdrip2vk.core.SgvReading;
 import com.example.xdrip2vk.core.TreatmentEvent;
 
 import org.junit.After;
@@ -229,15 +230,14 @@ public class VkSenderServiceOwnershipTest {
         stopTransmission();
         s1.onDestroy(); // хвостовая задача встаёт за текущий drain
         startTransmission();
-        // «новое сообщение» для нового владельца — кандидат-показание
-        prefs.edit()
-                .putFloat("candidate_bg_value", 130f)
-                .putLong("candidate_bg_timestamp", now - 10_000)
-                .putString("candidate_bg_direction", "Flat")
-                .commit();
-
+        // «новое сообщение» для нового владельца — опрос веб-сервиса
+        // (команда встаёт в очередь worker за задачей передачи владения)
+        VkSenderService.bgDataOverride = () -> Collections.singletonList(
+                new SgvReading(130, now - 10_000, "Flat", "t-handover"));
         VkSenderService s2 = Robolectric.buildService(VkSenderService.class)
                 .create().get();
+        s2.onStartCommand(new Intent(context, VkSenderService.class)
+                .putExtra("poll_now", true), 0, 9);
 
         // Пока старый владелец не закончил: новый не отправил ничего,
         // координатор не загружен, записей новых нет.
@@ -341,13 +341,14 @@ public class VkSenderServiceOwnershipTest {
         // getNextScheduledAlarm() в Robolectric изымает будильник — используем список
         int alarmsBefore = Shadows.shadowOf(am).getScheduledAlarms().size();
         assertTrue("будильник нового экземпляра запланирован", alarmsBefore > 0);
-        // Работа для нового владельца — записана ДО освобождения владения:
-        // хвост s1 исполняется на его реальном потоке, момент не контролируем.
-        prefs.edit()
-                .putFloat("candidate_bg_value", 130f)
-                .putLong("candidate_bg_timestamp", System.currentTimeMillis() - 10_000)
-                .putString("candidate_bg_direction", "Flat")
-                .commit();
+        // Работа для нового владельца — опрос веб-сервиса, поставленный ДО
+        // освобождения владения: хвост s1 исполняется на его реальном потоке,
+        // момент не контролируем.
+        VkSenderService.bgDataOverride = () -> Collections.singletonList(
+                new SgvReading(130, System.currentTimeMillis() - 10_000,
+                        "Flat", "t-alarm"));
+        s2.onStartCommand(new Intent(context, VkSenderService.class)
+                .putExtra("poll_now", true), 0, 9);
 
         s1.onDestroy(); // старый уходит — уведомление/будильник нового не его
 

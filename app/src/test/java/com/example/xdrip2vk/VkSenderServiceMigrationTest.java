@@ -12,6 +12,7 @@ import androidx.test.core.app.ApplicationProvider;
 import com.example.xdrip2vk.core.AuthContext;
 import com.example.xdrip2vk.core.DeliveryCoordinator;
 import com.example.xdrip2vk.core.SendResult;
+import com.example.xdrip2vk.core.SgvReading;
 
 import org.junit.After;
 import org.junit.Before;
@@ -77,6 +78,8 @@ public class VkSenderServiceMigrationTest {
     public void tearDown() {
         VkSenderService.senderOverride = null;
         VkSenderService.identityVerifierOverride = null;
+        VkSenderService.bgDataOverride = null;
+        VkSenderService.treatmentsOverride = null;
     }
 
     private VkSenderService startService() {
@@ -167,16 +170,20 @@ public class VkSenderServiceMigrationTest {
     }
 
     @Test
-    public void candidateFromReceiverInjectedOnStart() {
-        // новая схема: BgReceiver записал проверенного кандидата до старта сервиса
+    public void staleCandidateNotInjectedOnStart() {
+        // Схема candidate_bg_* заполнялась из недоверенного broadcast —
+        // путь восстановления удалён: кандидат не создаёт сообщение и
+        // ключи инвалидируются при инициализации сервиса.
         prefs.edit()
                 .putFloat("candidate_bg_value", 110f)
                 .putLong("candidate_bg_timestamp", System.currentTimeMillis() - 60_000)
                 .putString("candidate_bg_direction", "FortyFiveUp")
-                .apply();
+                .commit();
 
         VkSenderService s = startService();
-        assertEquals(1, sends.size());
+        assertTrue("старый кандидат не отправлен", sends.isEmpty());
+        assertEquals(0, prefs.getLong("candidate_bg_timestamp", 0));
+        assertEquals(0f, prefs.getFloat("candidate_bg_value", 0), 0.01f);
         s.onDestroy();
     }
 
@@ -208,18 +215,25 @@ public class VkSenderServiceMigrationTest {
     }
 
     @Test
-    public void fullChainReceiverCandidateColdStartOverflowRejected() {
-        // broadcast с конечным double, переполняющим float (1e40 → Infinity в кеше)
-        long ts = System.currentTimeMillis() - 60_000;
-        Intent i = new Intent("com.eveningoutpost.dexdrip.BgEstimate");
+    public void fullChainBroadcastHintColdStartNoDataInjection() {
+        // broadcast с любым содержимым — только сигнал: extras не пишутся
+        // и не переносятся; холодный запуск ничего не отправляет сам.
+        Intent i = new Intent(BgReceiver.ACTION_XDRIP_BG_ESTIMATE);
         i.putExtra("com.eveningoutpost.dexdrip.Extras.BgEstimate", 1e40);
-        i.putExtra("com.eveningoutpost.dexdrip.Extras.Time", ts);
+        i.putExtra("com.eveningoutpost.dexdrip.Extras.Time",
+                System.currentTimeMillis() - 60_000);
         new BgReceiver().onReceive(context, i);
 
-        // переполняющий кандидат даже не записан
         assertEquals(0, prefs.getFloat("candidate_bg_value", 0), 0.01f);
+        Intent started = Shadows.shadowOf((android.app.Application) context)
+                .getNextStartedService();
+        assertNotNull(started);
+        assertTrue(started.getBooleanExtra("xdrip_hint", false));
+        assertNull(started.getExtras().get("bg_value"));
 
-        // холодный запуск: обхода через injectSavedReading нет
+        // холодный запуск без данных веб-сервиса — отправок нет
+        VkSenderService.bgDataOverride = java.util.Collections::emptyList;
+        VkSenderService.treatmentsOverride = java.util.Collections::emptyList;
         VkSenderService s = startService();
         assertTrue(sends.isEmpty());
         assertEquals(0, prefs.getLong("last_bg_timestamp", 0));
@@ -227,17 +241,29 @@ public class VkSenderServiceMigrationTest {
     }
 
     @Test
-    public void fullChainReceiverCandidateColdStartValid() {
-        // та же цепочка с корректным показанием: отправка ровно один раз
-        long ts = System.currentTimeMillis() - 60_000;
-        Intent i = new Intent("com.eveningoutpost.dexdrip.BgEstimate");
-        i.putExtra("com.eveningoutpost.dexdrip.Extras.BgEstimate", 118.0);
-        i.putExtra("com.eveningoutpost.dexdrip.Extras.Time", ts);
-        i.putExtra("com.eveningoutpost.dexdrip.Extras.BgSlopeName", "SingleUp");
+    public void fullChainBroadcastHintColdStartWebData() {
+        // Полная цепочка новой модели: broadcast → сигнал → опрос
+        // веб-сервиса → отправка именно ответа сервиса.
+        Intent i = new Intent(BgReceiver.ACTION_XDRIP_BG_ESTIMATE);
+        i.putExtra("com.eveningoutpost.dexdrip.Extras.BgEstimate", 999.0);
+        i.putExtra("com.eveningoutpost.dexdrip.Extras.Time",
+                System.currentTimeMillis() + 3600_000);
         new BgReceiver().onReceive(context, i);
+        Intent started = Shadows.shadowOf((android.app.Application) context)
+                .getNextStartedService();
+        assertNotNull(started);
 
+        long ts = System.currentTimeMillis() - 60_000;
+        VkSenderService.bgDataOverride = () -> java.util.Collections
+                .singletonList(new SgvReading(118, ts, "SingleUp", "t1"));
+        VkSenderService.treatmentsOverride = java.util.Collections::emptyList;
         VkSenderService s = startService();
+        s.onStartCommand(started, 0, 1);
+        idle(s);
+
         assertEquals(1, sends.size());
+        assertTrue("отправлен ответ веб-сервиса, а не extras",
+                sends.get(0).text.contains("6.6"));
         assertEquals(118f, prefs.getFloat("last_bg_value", 0), 0.01f);
         assertEquals(ts, prefs.getLong("last_bg_timestamp", 0));
         s.onDestroy();

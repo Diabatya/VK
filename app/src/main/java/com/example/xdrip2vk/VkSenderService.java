@@ -14,6 +14,7 @@ import android.os.Handler;
 import android.os.HandlerThread;
 import android.os.IBinder;
 import android.os.PowerManager;
+import android.os.SystemClock;
 import android.os.Build;
 import androidx.core.app.NotificationCompat;
 import androidx.preference.PreferenceManager;
@@ -284,6 +285,58 @@ public class VkSenderService extends Service {
     /** Бюджет автоматических повторов: интервалы 30/60/120/240/300 секунд. */
     private static final long[] CONFIRM_RETRY_DELAYS_MS =
             {30_000, 60_000, 120_000, 240_000, 300_000};
+    /** Сигнал xDrip → опрос веб-сервиса. Broadcast extras не переносятся. */
+    private static final String EXTRA_XDRIP_HINT = "xdrip_hint";
+    /** Не более одной обработки сигнала за интервал (объединение серии). */
+    static final long HINT_MIN_INTERVAL_MS = 15_000;
+    private static final Object HINT_LOCK = new Object();
+    /** Сигнал принят и ждёт обработки сервисом — повторные объединяются. */
+    private static boolean hintInFlight;
+    /** Монотонное время последнего принятого сигнала (receiver-лимит). */
+    private static long lastHintAcceptedMs = -HINT_MIN_INTERVAL_MS;
+    /** Монотонное время последнего реального опроса по сигналу (service-лимит). */
+    private static long lastHintPollMs = -HINT_MIN_INTERVAL_MS;
+    /** Подмена монотонных часов в тестах. */
+    static volatile java.util.function.LongSupplier hintClockOverride;
+
+    private static long hintElapsedMs() {
+        java.util.function.LongSupplier c = hintClockOverride;
+        return c != null ? c.getAsLong() : SystemClock.elapsedRealtime();
+    }
+
+    /**
+     * Недоверенный сигнал xDrip → команда сервису. Ограничение частоты и
+     * объединение выполняются ДО запуска сервиса: поток broadcast не создаёт
+     * очередь запусков и задач. Повторная проверка — в handleXdripHint.
+     */
+    static void notifyXdripSignal(Context context) {
+        long now = hintElapsedMs();
+        synchronized (HINT_LOCK) {
+            if (hintInFlight || now - lastHintAcceptedMs < HINT_MIN_INTERVAL_MS) {
+                return; // серия сигналов объединяется в один опрос
+            }
+            lastHintAcceptedMs = now;
+            hintInFlight = true;
+        }
+        try {
+            Intent i = new Intent(context, VkSenderService.class);
+            i.putExtra(EXTRA_XDRIP_HINT, true);
+            context.startForegroundService(i);
+        } catch (RuntimeException e) {
+            synchronized (HINT_LOCK) {
+                hintInFlight = false;
+            }
+            Logger.w(TAG, "Не удалось запустить сервис по сигналу xDrip");
+        }
+    }
+
+    /** Тест: сервис взял сигнал в обработку — флаг in-flight снят. */
+    static void consumeHintForTest() {
+        synchronized (HINT_LOCK) {
+            hintInFlight = false;
+        }
+    }
+
     /** Момент срабатывания уже назначенной проверки; 0 — не назначена. */
     private static volatile long retryScheduledFor;
 
@@ -624,6 +677,12 @@ public class VkSenderService extends Service {
         migrationAttemptedValue = -1;
         retryScheduledFor = 0;
         retryScheduleQueued = false;
+        synchronized (HINT_LOCK) {
+            hintInFlight = false;
+            lastHintAcceptedMs = -HINT_MIN_INTERVAL_MS;
+            lastHintPollMs = -HINT_MIN_INTERVAL_MS;
+        }
+        hintClockOverride = null;
         synchronized (STATE_OWNER_LOCK) {
             stateOwned = false;
             STATE_OWNER_LOCK.notifyAll();
@@ -687,7 +746,7 @@ public class VkSenderService extends Service {
         handler = new Handler(handlerThread.getLooper());
 
         drainRunnable = this::drainAndSchedule;
-        pollTask = this::pollXDrip;
+        pollTask = () -> pollXDrip(DeliveryCoordinator.Source.AUTO, true);
 
         // Все изменения состояния — только на фоновом потоке, строго по очереди.
         // Координатор загружается ПОСЛЕ передачи владения от прежнего
@@ -709,7 +768,14 @@ public class VkSenderService extends Service {
                 editor.apply();
                 Logger.d(TAG, "Недоверенный кеш предыдущей версии очищен");
             }
-            injectSavedReading();
+            // Кандидат-кеш прежней схемы (candidate_bg_*) заполнялся из
+            // недоверенного broadcast — путь восстановления удалён, ключи
+            // инвалидируются, чтобы старый кандидат не создал сообщение.
+            prefs.edit()
+                    .remove("candidate_bg_value")
+                    .remove("candidate_bg_timestamp")
+                    .remove("candidate_bg_direction")
+                    .apply();
             drainAndSchedule();
         });
         scheduleNextAlarm();
@@ -749,20 +815,21 @@ public class VkSenderService extends Service {
                 // Не ждём следующего показания: проверка новой версии токена
                 // и возобновление допустимой очереди — сразу на рабочем потоке.
                 drainAndSchedule();
-            } else if (manualSend || autoUpdate) {
+            } else if (manualSend) {
+                // Ручная отправка берёт актуальное показание из веб-сервиса
+                // xDrip — старый кеш неизвестного происхождения не источник.
+                pollXDrip(DeliveryCoordinator.Source.MANUAL, true);
+            } else if (cmd.getBooleanExtra(EXTRA_XDRIP_HINT, false)) {
+                handleXdripHint();
+            } else if (autoUpdate) {
                 SgvReading r = readingFromIntent(cmd);
                 if (r == null) {
                     Logger.w(TAG, "Отклонено показание из intent: нет корректных данных");
-                    if (manualSend) {
-                        updateNotification("Данные устарели или некорректны, отправка отменена");
-                    }
                     return;
                 }
-                applyReading(r, manualSend
-                        ? DeliveryCoordinator.Source.MANUAL
-                        : DeliveryCoordinator.Source.AUTO);
+                applyReading(r, DeliveryCoordinator.Source.AUTO);
             } else if (pollNow) {
-                pollXDrip();
+                pollXDrip(DeliveryCoordinator.Source.AUTO, true);
             } else {
                 drainAndSchedule();
             }
@@ -790,21 +857,24 @@ public class VkSenderService extends Service {
     }
 
     /**
-     * Кандидат-показание, сохранённое BgReceiver, на случай рестарта сервиса
-     * без intent. Используется только candidate_* — входной снимок, записанный
-     * уже новой схемой после проверки. Устаревший last_bg_* версии 4.3 сюда
-     * не попадает и автоматически не отправляется.
+     * Обработка сигнала xDrip на рабочем потоке. Повторно проверяются запрет
+     * передачи (Stop во время ожидания) и частота: запоздавшие дубли команды
+     * не создают лишних опросов.
      */
-    private void injectSavedReading() {
-        float savedBg = prefs.getFloat("candidate_bg_value", 0);
-        long savedTs = prefs.getLong("candidate_bg_timestamp", 0);
-        // Кандидат проверяется ещё раз: повреждённый кеш (NaN/Infinity/<=0)
-        // не должен доходить до coordinator и очереди.
-        if (savedBg > 0 && Float.isFinite(savedBg) && savedTs > coordinator.getLastSeenBgMs()) {
-            String direction = prefs.getString("candidate_bg_direction", "");
-            applyReading(new SgvReading(savedBg, savedTs, direction, ""),
-                    DeliveryCoordinator.Source.AUTO);
+    private void handleXdripHint() {
+        synchronized (HINT_LOCK) {
+            hintInFlight = false;
+            long now = hintElapsedMs();
+            if (now - lastHintPollMs < HINT_MIN_INTERVAL_MS) {
+                return;
+            }
+            lastHintPollMs = now;
         }
+        if (!isTransmissionAllowed(this)) {
+            return;
+        }
+        // Опрос по сигналу не отодвигает периодический будильник.
+        pollXDrip(DeliveryCoordinator.Source.AUTO, false);
     }
 
     private void applyReading(SgvReading r, DeliveryCoordinator.Source src) {
@@ -815,7 +885,7 @@ public class VkSenderService extends Service {
         DeliveryCoordinator.ReadingOutcome outcome = coordinator.onReading(r, src, cfg, msgs, now);
         // Подтверждённая запись watermark/очереди/пропущенной тревоги — до drain.
         coordinator.persistNow();
-        Logger.d(TAG, "Показание " + r.sgvMgdl + " mg/dL @ " + r.timestampMs
+        Logger.d(TAG, "Показание @ " + r.timestampMs
                 + " (" + src + ") → " + outcome);
 
         if (outcome == DeliveryCoordinator.ReadingOutcome.ACCEPTED) {
@@ -1056,7 +1126,14 @@ public class VkSenderService extends Service {
         manager.notify(NOTIFICATION_ID, createNotification(text));
     }
 
-    private void pollXDrip() {
+    /**
+     * Опрос фиксированного локального веб-сервиса xDrip. Единственный путь
+     * показаний: недоверенный broadcast/кеши значений не используются.
+     * {@code rescheduleAlarm} — сдвигать ли периодический будильник (сигнальные
+     * опросы его не отодвигают).
+     */
+    private void pollXDrip(DeliveryCoordinator.Source src,
+                           boolean rescheduleAlarm) {
         if (!isRunning || shuttingDown || !isTransmissionAllowed(this)) return;
 
         boolean acquired = false;
@@ -1075,11 +1152,12 @@ public class VkSenderService extends Service {
 
             if (!dataList.isEmpty()) {
                 SgvReading latest = dataList.get(0);
-                Logger.d(TAG, "Получены данные от xDrip+: сахар=" + latest.sgvMgdl + ", время=" + latest.timestampMs);
-                applyReading(latest, DeliveryCoordinator.Source.AUTO);
+                Logger.d(TAG, "Получены данные от xDrip+: записей="
+                        + dataList.size() + ", время=" + latest.timestampMs);
+                applyReading(latest, src);
             } else {
                 Logger.w(TAG, "Не получены данные от xDrip+ (веб-сервер не отвечает)");
-                updateNotification("Нет связи с xDrip+: проверьте, что в xDrip+ включён веб-сервер на порту 17580");
+                updateNotification("Нет связи с xDrip+: включите Web service в Inter-app settings xDrip (порт 17580)");
             }
 
             // Новые записи терапии (инсулин/углеводы) — все события в окне, не только одно.
@@ -1113,7 +1191,7 @@ public class VkSenderService extends Service {
                 prefs.edit().remove(PREF_TREATMENT_BASELINE_PENDING).commit();
             }
 
-            if (isRunning && !shuttingDown) {
+            if (isRunning && !shuttingDown && rescheduleAlarm) {
                 scheduleNextAlarm();
             }
         } catch (Exception e) {
