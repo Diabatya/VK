@@ -13,6 +13,11 @@ public class AlarmReceiver extends BroadcastReceiver {
     public void onReceive(Context context, Intent intent) {
         Logger.d(TAG, "Получен сигнал alarm, запускаем сервис для опроса xDrip+");
 
+        if (intent != null && intent.getBooleanExtra("confirm_retry", false)) {
+            // сработал будильник повторной проверки — слот назначения свободен
+            VkSenderService.confirmationRetryFired();
+        }
+
         // Передача запрещена пользователем: alarm не возобновляет работу —
         // выход до WakeLock и запуска сервиса.
         if (!VkSenderService.isTransmissionAllowed(context)) {

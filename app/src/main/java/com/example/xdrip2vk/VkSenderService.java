@@ -270,31 +270,59 @@ public class VkSenderService extends Service {
     /**
      * Инициализация/повтор выбора запланирован, но ещё не подтверждён —
      * вход в этот момент запрещён, но событие не должно теряться навсегда.
+     * Процессный запрет пользователя (Stop) и неподтверждённый Start
+     * цепочку проверок не поддерживают.
      */
     static boolean isConfirmationPending() {
-        return migrationUnconfirmed;
+        return migrationUnconfirmed && !userStopInFlight && !startWriteDenied;
     }
 
     private static final int RETRY_ALARM_REQUEST_CODE = 1002;
-    private static final long CONFIRM_RETRY_MS = 30_000;
+    private static final String EXTRA_CONFIRM_RETRY = "confirm_retry";
+    /** Число уже назначенных автоматических проверок (переживает процесс). */
+    private static final String PREF_CONFIRM_RETRY_COUNT = "confirm_retry_count";
+    /** Бюджет автоматических повторов: интервалы 30/60/120/240/300 секунд. */
+    private static final long[] CONFIRM_RETRY_DELAYS_MS =
+            {30_000, 60_000, 120_000, 240_000, 300_000};
+    /** Момент срабатывания уже назначенной проверки; 0 — не назначена. */
+    private static volatile long retryScheduledFor;
 
     /**
      * Одноразовый будильник повторной проверки: вход (boot/alarm/broadcast)
      * пришёл до подтверждения выбора. При срабатывании AlarmReceiver снова
      * выполняет gate — при подтверждённом разрешении запускает сервис, при
      * подтверждённом запрете (выбор пользователя) цепочка умирает.
+     * Бюджет ограничен и сохранён в prefs: после его исчерпания цепочка
+     * сама себя не назначает (новую попытку может начать явный Start).
+     * Сам перепроверяет допустимость: запрет пользователя, неподтверждённый
+     * Start и исчерпанный бюджет не назначают проверку.
      */
     static void scheduleConfirmationRetry(Context context) {
+        if (!isConfirmationPending()) {
+            return;
+        }
+        long now = System.currentTimeMillis();
+        if (retryScheduledFor > now) {
+            // проверка уже назначена — повторные входы её не отодвигают
+            return;
+        }
+        SharedPreferences p =
+                PreferenceManager.getDefaultSharedPreferences(context);
+        int attempt = p.getInt(PREF_CONFIRM_RETRY_COUNT, 0);
+        if (attempt >= CONFIRM_RETRY_DELAYS_MS.length) {
+            return; // бюджет исчерпан — передача остаётся запрещённой
+        }
         AlarmManager am =
                 (AlarmManager) context.getSystemService(Context.ALARM_SERVICE);
         if (am == null) {
             return;
         }
         Intent i = new Intent(context, AlarmReceiver.class);
+        i.putExtra(EXTRA_CONFIRM_RETRY, true);
         PendingIntent pi = PendingIntent.getBroadcast(context,
                 RETRY_ALARM_REQUEST_CODE, i,
                 PendingIntent.FLAG_UPDATE_CURRENT | PendingIntent.FLAG_IMMUTABLE);
-        long t = System.currentTimeMillis() + CONFIRM_RETRY_MS;
+        long t = now + CONFIRM_RETRY_DELAYS_MS[attempt];
         try {
             // не exact: SCHEDULE_EXACT_ALARM на API 31+ не требуется
             if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.M) {
@@ -305,6 +333,38 @@ public class VkSenderService extends Service {
         } catch (SecurityException e) {
             am.set(AlarmManager.RTC_WAKEUP, t, pi);
         }
+        retryScheduledFor = t;
+        p.edit().putInt(PREF_CONFIRM_RETRY_COUNT, attempt + 1).apply();
+    }
+
+    /** Сработал будильник повторной проверки — слот назначения свободен. */
+    static void confirmationRetryFired() {
+        retryScheduledFor = 0;
+    }
+
+    /**
+     * Немедленная отмена цепочки повторных проверок (явный Stop): будильник
+     * снимается независимо от результата записи запрета, запоздавшие
+     * callbacks её не возобновляют.
+     */
+    static void cancelConfirmationRetry(Context context) {
+        retryScheduledFor = 0;
+        AlarmManager am =
+                (AlarmManager) context.getSystemService(Context.ALARM_SERVICE);
+        if (am == null) {
+            return;
+        }
+        Intent i = new Intent(context, AlarmReceiver.class);
+        PendingIntent pi = PendingIntent.getBroadcast(context,
+                RETRY_ALARM_REQUEST_CODE, i,
+                PendingIntent.FLAG_UPDATE_CURRENT | PendingIntent.FLAG_IMMUTABLE);
+        am.cancel(pi);
+    }
+
+    /** Цепочка завершена подтверждённым выбором — бюджет обнуляется. */
+    private static void resetConfirmRetryCount(Context context) {
+        PreferenceManager.getDefaultSharedPreferences(context)
+                .edit().putInt(PREF_CONFIRM_RETRY_COUNT, 0).apply();
     }
 
     private static volatile boolean migrationInitQueued;
@@ -341,6 +401,7 @@ public class VkSenderService extends Service {
                     if (!migrationUnconfirmed) {
                         choiceConfirmed = true;
                         confirmedEnabled = target;
+                        resetConfirmRetryCount(app); // цепочка завершена
                     }
                 }
                 // Иначе ключ подтверждён — либо ранее, либо подтверждённым
@@ -408,6 +469,9 @@ public class VkSenderService extends Service {
         userStopInFlight = true; // новые попытки блокируются до конца записи
         nextSwitchGeneration(); // устаревает любой ожидающий запрос Start
         final Context app = context.getApplicationContext();
+        // Цепочка проверок неподтверждённой инициализации прекращается
+        // немедленно — независимо от результата записи запрета.
+        cancelConfirmationRetry(app);
         switchExecutor.execute(() -> {
             boolean saved = writeTransmissionEnabled(app, false, false);
             if (saved) {
@@ -415,6 +479,7 @@ public class VkSenderService extends Service {
                 migrationUnconfirmed = false;
                 choiceConfirmed = true;
                 confirmedEnabled = false;
+                resetConfirmRetryCount(app);
             }
             app.stopService(new Intent(app, VkSenderService.class));
             if (done != null) {
@@ -457,6 +522,8 @@ public class VkSenderService extends Service {
                 startWriteDenied = false; // разрешение подтверждено на диске
                 choiceConfirmed = true;
                 confirmedEnabled = true;
+                resetConfirmRetryCount(app); // новая цепочка от подтверждённого выбора
+                cancelConfirmationRetry(app); // сервис запускает сам Start
                 app.startForegroundService(new Intent(app, VkSenderService.class));
                 ok = true;
             } else {
@@ -504,6 +571,7 @@ public class VkSenderService extends Service {
         migrationInitQueued = false;
         migrationUnconfirmed = false;
         migrationAttemptedValue = -1;
+        retryScheduledFor = 0;
         synchronized (STATE_OWNER_LOCK) {
             stateOwned = false;
             STATE_OWNER_LOCK.notifyAll();

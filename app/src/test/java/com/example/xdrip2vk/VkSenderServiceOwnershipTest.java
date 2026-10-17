@@ -25,6 +25,7 @@ import org.robolectric.RobolectricTestRunner;
 import org.robolectric.Shadows;
 import org.robolectric.annotation.Config;
 import org.robolectric.shadows.ShadowApplication;
+import org.robolectric.shadows.ShadowAlarmManager;
 
 import java.util.ArrayList;
 import java.util.Arrays;
@@ -954,6 +955,279 @@ public class VkSenderServiceOwnershipTest {
         assertFalse(prefs.getBoolean(
                 VkSenderService.PREF_TRANSMISSION_ENABLED, true));
         assertNull(shadowApp().getNextStartedService());
+    }
+
+    // ---------- 5.7 Бюджет и отмена цепочки повторных проверок ----------
+
+    private AlarmManager alarmManager() {
+        return (AlarmManager) context.getSystemService(Context.ALARM_SERVICE);
+    }
+
+    /** Счётчик назначенных автоматических проверок (prefs). */
+    private int retryCount() {
+        return prefs.getInt("confirm_retry_count", 0);
+    }
+
+    /** Сколько retry-будильников сейчас назначено (extra confirm_retry). */
+    private int retryAlarmsScheduled() {
+        int n = 0;
+        for (ShadowAlarmManager.ScheduledAlarm a
+                : Shadows.shadowOf(alarmManager()).getScheduledAlarms()) {
+            Intent saved = Shadows.shadowOf(a.operation).getSavedIntent();
+            if (saved != null && saved.getBooleanExtra("confirm_retry", false)) {
+                n++;
+            }
+        }
+        return n;
+    }
+
+    /**
+     * МОДЕЛИРОВАНИЕ срабатывания: изымает ближайший назначенный будильник,
+     * проверяет сохранённый intent (extras повторной проверки и класс
+     * получателя) и вызывает соответствующий receiver — PendingIntent.send
+     * в Robolectric manifest-receiver'ам не доставляет.
+     */
+    private void fireScheduledRetry() {
+        ShadowAlarmManager.ScheduledAlarm a =
+                Shadows.shadowOf(alarmManager()).getNextScheduledAlarm();
+        assertNotNull("повторная проверка не назначена", a);
+        Intent saved = Shadows.shadowOf(a.operation).getSavedIntent();
+        assertNotNull(saved);
+        assertTrue("назначенный будильник — не повторная проверка",
+                saved.getBooleanExtra("confirm_retry", false));
+        assertEquals(AlarmReceiver.class.getName(),
+                saved.getComponent().getClassName());
+        new AlarmReceiver().onReceive(context, saved);
+    }
+
+    @Test
+    public void firedRetryStartsAllowedWorkAfterConfirm() {
+        // Миграция ждала выполнения → вход назначил проверку → подтверждено.
+        CountDownLatch[] block = occupySwitchExecutor();
+        assertFalse(VkSenderService.isTransmissionAllowed(context));
+        new AlarmReceiver().onReceive(context, new Intent());
+        assertEquals(1, retryAlarmsScheduled());
+        assertEquals(1, retryCount());
+
+        block[1].countDown();
+        VkSenderService.awaitSwitchIdleForTest(); // миграция подтверждена
+        assertTrue(VkSenderService.isTransmissionAllowed(context));
+
+        fireScheduledRetry(); // срабатывание назначенного будильника
+        assertNotNull("сработавшая проверка запустила разрешённую работу",
+                shadowApp().getNextStartedService());
+        // разрешение подтверждено — новых повторов цепочка не назначает
+        new AlarmReceiver().onReceive(context, new Intent());
+        assertEquals(0, retryCount()); // бюджет обновлён подтверждением
+        assertFalse("после подтверждения цепочка новых проверок не ставит",
+                retryAlarmsScheduled() > 0);
+    }
+
+    @Test
+    public void retryChainBoundedByBudget() {
+        // Постоянный отказ записи: цепочка ограничена бюджетом.
+        VkSenderService.transmissionWriteOverride = (enabled, mark) -> {
+            prefs.edit().putBoolean(
+                    VkSenderService.PREF_TRANSMISSION_ENABLED, enabled).apply();
+            return false;
+        };
+        List<Long> delays = new ArrayList<>();
+        new AlarmReceiver().onReceive(context, new Intent()); // проверка 1
+        VkSenderService.awaitSwitchIdleForTest(); // запись отказала
+        {
+            ShadowAlarmManager.ScheduledAlarm a = Shadows
+                    .shadowOf(alarmManager()).peekNextScheduledAlarm();
+            assertNotNull(a);
+            delays.add(a.triggerAtTime - System.currentTimeMillis());
+        }
+        for (int i = 0; i < 5; i++) {
+            fireScheduledRetry(); // denied → назначает следующую
+            VkSenderService.awaitSwitchIdleForTest();
+            ShadowAlarmManager.ScheduledAlarm a = Shadows
+                    .shadowOf(alarmManager()).peekNextScheduledAlarm();
+            if (i < 4) {
+                assertNotNull("ожидалась проверка №" + (i + 2), a);
+                delays.add(a.triggerAtTime - System.currentTimeMillis());
+            }
+        }
+        assertEquals(5, retryCount());
+        assertEquals("бюджет исчерпан — цепочка себя не назначает",
+                0, retryAlarmsScheduled());
+        assertFalse(VkSenderService.isTransmissionAllowed(context));
+        // нарастающие интервалы ≈ 30/60/120/240/300 с (допуск на планирование)
+        long[] expect = {30_000, 60_000, 120_000, 240_000, 300_000};
+        for (int i = 0; i < 5; i++) {
+            long d = delays.get(i);
+            assertTrue("интервал повтора " + i + ": " + d,
+                    d >= expect[i] - 5_000 && d <= expect[i] + 5_000);
+        }
+        // Повторные входы и создание экземпляра бюджет не обнуляют.
+        new AlarmReceiver().onReceive(context, new Intent());
+        new BgReceiver().onReceive(context, bgIntent(120));
+        Robolectric.buildService(VkSenderService.class).create().get().onDestroy();
+        assertEquals(5, retryCount());
+        assertEquals(0, retryAlarmsScheduled());
+    }
+
+    @Test
+    public void stopCancelsRetryChainEvenOnWriteFailure() {
+        // Отказ записи: и миграции, и Stop — цепочка прекращается немедленно.
+        VkSenderService.transmissionWriteOverride = (enabled, mark) -> {
+            prefs.edit().putBoolean(
+                    VkSenderService.PREF_TRANSMISSION_ENABLED, enabled).apply();
+            return false;
+        };
+        new AlarmReceiver().onReceive(context, new Intent()); // проверка 1
+        VkSenderService.awaitSwitchIdleForTest();
+        assertEquals(1, retryAlarmsScheduled());
+        Intent lateFire = Shadows.shadowOf(
+                Shadows.shadowOf(alarmManager()).peekNextScheduledAlarm()
+                        .operation).getSavedIntent();
+
+        VkSenderService.requestStopTransmission(context); // запись тоже откажет
+        VkSenderService.awaitSwitchIdleForTest();
+        assertEquals("Stop отменил назначенную проверку независимо от записи",
+                0, retryAlarmsScheduled());
+        assertFalse(VkSenderService.isTransmissionAllowed(context));
+
+        // Запоздавшее срабатывание после Stop: send не вызывается и новый
+        // будильник не назначается (процессный запрет учтён).
+        new AlarmReceiver().onReceive(context, lateFire);
+        assertNull(shadowApp().getNextStartedService());
+        assertEquals(0, retryAlarmsScheduled());
+        // Обычные повторные входы цепочку не воскрешают.
+        new AlarmReceiver().onReceive(context, new Intent());
+        VkSenderService.notifyTokenChanged(context);
+        assertEquals(0, retryAlarmsScheduled());
+        assertEquals(1, retryCount());
+    }
+
+    @Test
+    public void failedStartDoesNotKeepRetryChain() {
+        // Неподтверждённая миграция → проверка назначена → Start отказал.
+        VkSenderService.transmissionWriteOverride = (enabled, mark) -> {
+            prefs.edit().putBoolean(
+                    VkSenderService.PREF_TRANSMISSION_ENABLED, enabled).apply();
+            return false;
+        };
+        new AlarmReceiver().onReceive(context, new Intent());
+        VkSenderService.awaitSwitchIdleForTest();
+        assertEquals(1, retryAlarmsScheduled());
+
+        AtomicBoolean ok = new AtomicBoolean(true);
+        VkSenderService.requestStartTransmission(context, ok::set);
+        VkSenderService.awaitSwitchIdleForTest();
+        assertFalse(ok.get()); // Start не подтверждён
+
+        // Сработавшая проверка: запрет есть, новой проверки нет.
+        fireScheduledRetry();
+        assertNull(shadowApp().getNextStartedService());
+        assertEquals("неуспешный Start не поддерживает цепочку",
+                0, retryAlarmsScheduled());
+    }
+
+    @Test
+    public void repeatedReadsAndBroadcastsDoNotPushOrResetRetry() {
+        // Повторные входы не отодвигают назначенную проверку и не обнуляют
+        // бюджет.
+        VkSenderService.transmissionWriteOverride = (enabled, mark) -> {
+            prefs.edit().putBoolean(
+                    VkSenderService.PREF_TRANSMISSION_ENABLED, enabled).apply();
+            return false;
+        };
+        new AlarmReceiver().onReceive(context, new Intent()); // проверка 1
+        ShadowAlarmManager.ScheduledAlarm first = Shadows
+                .shadowOf(alarmManager()).peekNextScheduledAlarm();
+        assertNotNull(first);
+        long at = first.triggerAtTime;
+
+        for (int i = 0; i < 4; i++) {
+            new BgReceiver().onReceive(context, bgIntent(120));
+            new AlarmReceiver().onReceive(context, new Intent());
+            VkSenderService.isTransmissionAllowed(context); // чтение UI
+            VkSenderService.isTransmissionAllowed(context);
+        }
+        ShadowAlarmManager.ScheduledAlarm still = Shadows
+                .shadowOf(alarmManager()).peekNextScheduledAlarm();
+        assertNotNull("назначенная проверка потеряна", still);
+        assertEquals("повторные входы отодвинули проверку",
+                at, still.triggerAtTime);
+        assertEquals(1, retryAlarmsScheduled());
+        assertEquals(1, retryCount());
+        VkSenderService.awaitSwitchIdleForTest(); // задачи записи завершены
+    }
+
+    @Test
+    public void restartKeepsRetryBudgetOfSameChain() {
+        // «Восстановление процесса»: static-флаги сброшены, а бюджет этой же
+        // цепочки сохранён — цепочка не начинается заново.
+        VkSenderService.transmissionWriteOverride = (enabled, mark) -> {
+            prefs.edit().putBoolean(
+                    VkSenderService.PREF_TRANSMISSION_ENABLED, enabled).apply();
+            return false;
+        };
+        new AlarmReceiver().onReceive(context, new Intent()); // проверка 1
+        VkSenderService.awaitSwitchIdleForTest();
+        fireScheduledRetry(); // проверка 2
+        VkSenderService.awaitSwitchIdleForTest();
+        assertEquals(2, retryCount());
+
+        // Новый процесс: процессные флаги сброшены; на реальном диске
+        // отказавший commit ключа не оставил — воспроизводим это удалением.
+        prefs.edit().remove(VkSenderService.PREF_TRANSMISSION_ENABLED).commit();
+        VkSenderService.resetTransmissionFlagsForTest();
+
+        new AlarmReceiver().onReceive(context, new Intent()); // проверка 3
+        ShadowAlarmManager.ScheduledAlarm after = Shadows
+                .shadowOf(alarmManager()).peekNextScheduledAlarm();
+        assertNotNull(after);
+        assertEquals("цепочка продолжилась не с первой попытки",
+                3, retryCount());
+        long delay = after.triggerAtTime - System.currentTimeMillis();
+        assertTrue("интервал третьей попытки (~120с), а не заново (~30с): "
+                + delay, delay > 60_000);
+        VkSenderService.awaitSwitchIdleForTest();
+    }
+
+    @Test
+    public void explicitStartAfterExhaustedBudgetRestoresWork() {
+        // Бюджет исчерпан отказами; явный актуальный Start инициирует
+        // новую попытку и восстанавливает работу.
+        VkSenderService.transmissionWriteOverride = (enabled, mark) -> {
+            prefs.edit().putBoolean(
+                    VkSenderService.PREF_TRANSMISSION_ENABLED, enabled).apply();
+            return false;
+        };
+        new AlarmReceiver().onReceive(context, new Intent());
+        for (int i = 0; i < 5; i++) {
+            VkSenderService.awaitSwitchIdleForTest();
+            fireScheduledRetry();
+        }
+        VkSenderService.awaitSwitchIdleForTest();
+        assertEquals(5, retryCount());
+        assertEquals(0, retryAlarmsScheduled());
+
+        // Запись восстановлена; явный Start подтверждает разрешение.
+        VkSenderService.transmissionWriteOverride =
+                (enabled, mark) -> prefs.edit()
+                        .putBoolean(VkSenderService.PREF_TRANSMISSION_ENABLED,
+                                enabled).commit();
+        AtomicBoolean ok = new AtomicBoolean(false);
+        VkSenderService.requestStartTransmission(context, ok::set);
+        VkSenderService.awaitSwitchIdleForTest();
+        assertTrue(ok.get());
+        assertTrue(VkSenderService.isTransmissionAllowed(context));
+        assertNotNull(shadowApp().getNextStartedService());
+        assertEquals("подтверждённый выбор обнуляет бюджет цепочки",
+                0, retryCount());
+    }
+
+    private Intent bgIntent(double bg) {
+        Intent i = new Intent("com.eveningoutpost.dexdrip.BgEstimate");
+        i.putExtra("com.eveningoutpost.dexdrip.Extras.BgEstimate", bg);
+        i.putExtra("com.eveningoutpost.dexdrip.Extras.Time",
+                System.currentTimeMillis() - 60_000);
+        return i;
     }
 
     // ---------- 6. Повтор миграции сохраняет исходное решение ----------
