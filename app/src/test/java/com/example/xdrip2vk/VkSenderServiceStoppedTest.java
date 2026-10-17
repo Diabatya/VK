@@ -403,7 +403,7 @@ public class VkSenderServiceStoppedTest {
 
     @Test
     public void stopWriteFailureIsHonestAndStillBlocks() {
-        VkSenderService.transmissionWriteOverride = () -> false; // диск отказал
+        VkSenderService.transmissionWriteOverride = (enabled, markBaselinePending) -> false; // диск отказал
         final boolean[] saved = {true};
         final java.util.concurrent.CountDownLatch latch =
                 new java.util.concurrent.CountDownLatch(1);

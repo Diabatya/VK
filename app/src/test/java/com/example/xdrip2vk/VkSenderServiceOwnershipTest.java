@@ -467,7 +467,7 @@ public class VkSenderServiceOwnershipTest {
 
     @Test
     public void startWriteFailureDoesNotStartService() {
-        VkSenderService.transmissionWriteOverride = () -> false; // диск отказал
+        VkSenderService.transmissionWriteOverride = (enabled, markBaselinePending) -> false; // диск отказал
         AtomicBoolean ok = new AtomicBoolean(true);
         VkSenderService.requestStartTransmission(context, ok::set);
         VkSenderService.awaitSwitchIdleForTest();
@@ -481,7 +481,7 @@ public class VkSenderServiceOwnershipTest {
     public void startWriteFailureWithChangedMemoryValueStillNotStarted() {
         // commit «неудачен», но значение в памяти уже true — повторное чтение
         // prefs не доказывает успешную запись: доверяем только коду возврата.
-        VkSenderService.transmissionWriteOverride = () -> {
+        VkSenderService.transmissionWriteOverride = (enabled, markBaselinePending) -> {
             prefs.edit().putBoolean(
                     VkSenderService.PREF_TRANSMISSION_ENABLED, true).apply();
             return false;
@@ -499,7 +499,7 @@ public class VkSenderServiceOwnershipTest {
 
     /** Модель отказа записи Start: commit меняет кеш на true, но возвращает false. */
     private void installFailedStartOverride() {
-        VkSenderService.transmissionWriteOverride = () -> {
+        VkSenderService.transmissionWriteOverride = (enabled, markBaselinePending) -> {
             prefs.edit().putBoolean(
                     VkSenderService.PREF_TRANSMISSION_ENABLED, true).apply();
             return false;
@@ -597,7 +597,7 @@ public class VkSenderServiceOwnershipTest {
         prefs.edit().putBoolean(
                 VkSenderService.PREF_TRANSMISSION_ENABLED, false).commit();
         AtomicInteger calls = new AtomicInteger();
-        VkSenderService.transmissionWriteOverride = () -> {
+        VkSenderService.transmissionWriteOverride = (enabled, markBaselinePending) -> {
             if (calls.getAndIncrement() == 0) {
                 prefs.edit().putBoolean(
                         VkSenderService.PREF_TRANSMISSION_ENABLED, true).apply();
@@ -624,7 +624,7 @@ public class VkSenderServiceOwnershipTest {
         // Ключ отсутствует, установка настроена; запись отказал, но кеш
         // содержит ключ — contains() не должен считать миграцию завершённой.
         AtomicInteger calls = new AtomicInteger();
-        VkSenderService.transmissionWriteOverride = () -> {
+        VkSenderService.transmissionWriteOverride = (enabled, markBaselinePending) -> {
             calls.incrementAndGet();
             prefs.edit().putBoolean(
                     VkSenderService.PREF_TRANSMISSION_ENABLED, true).apply();
@@ -648,7 +648,7 @@ public class VkSenderServiceOwnershipTest {
     @Test
     public void migrationCompletesCorrectlyAfterWriteRecovery() {
         AtomicInteger calls = new AtomicInteger();
-        VkSenderService.transmissionWriteOverride = () -> {
+        VkSenderService.transmissionWriteOverride = (enabled, markBaselinePending) -> {
             if (calls.getAndIncrement() == 0) {
                 prefs.edit().putBoolean(
                         VkSenderService.PREF_TRANSMISSION_ENABLED, true).apply();
@@ -690,6 +690,297 @@ public class VkSenderServiceOwnershipTest {
         s.onDestroy();
     }
 
+    // ---------- 5. Запрет во время неподтверждённой записи ----------
+
+    /** Все входы во время удержанной записи Start: разрешение не выдаётся. */
+    private void assertEntriesDeniedWhileWriteHeld() {
+        assertFalse("во время записи кеш prefs — не источник разрешения",
+                VkSenderService.isTransmissionAllowed(context));
+        new AlarmReceiver().onReceive(context, new Intent());
+        Intent bg = new Intent("com.eveningoutpost.dexdrip.BgEstimate");
+        bg.putExtra("com.eveningoutpost.dexdrip.Extras.BgEstimate", 120.0);
+        bg.putExtra("com.eveningoutpost.dexdrip.Extras.Time",
+                System.currentTimeMillis() - 60_000);
+        new BgReceiver().onReceive(context, bg);
+        // МОДЕЛИРОВАНИЕ boot — прямой вызов receiver; разрешение на
+        // уведомления выдано, чтобы дойти до проверки разрешения передачи.
+        shadowApp().grantPermissions(android.Manifest.permission.POST_NOTIFICATIONS);
+        new BootReceiver().onReceive(context,
+                new Intent(Intent.ACTION_BOOT_COMPLETED));
+        VkSenderService.notifyTokenChanged(context);
+        assertNull("вход обошёл неподтверждённую запись разрешения",
+                shadowApp().getNextStartedService());
+    }
+
+    @Test
+    public void startFromDisabledDeniedDuringWriteThenAllowedOnSuccess() {
+        prefs.edit().putBoolean(
+                VkSenderService.PREF_TRANSMISSION_ENABLED, false).commit();
+        CountDownLatch writeEntered = new CountDownLatch(1);
+        CountDownLatch writeRelease = new CountDownLatch(1);
+        VkSenderService.transmissionWriteOverride = (enabled, mark) -> {
+            prefs.edit().putBoolean(
+                    VkSenderService.PREF_TRANSMISSION_ENABLED, enabled).apply();
+            writeEntered.countDown(); // кеш уже true, результат ещё неизвестен
+            try {
+                writeRelease.await(10, TimeUnit.SECONDS);
+            } catch (InterruptedException e) {
+                Thread.currentThread().interrupt();
+            }
+            return true;
+        };
+        VkSenderService.requestStartTransmission(context);
+        awaitLatch(writeEntered); // запись Start выполняется
+
+        assertEntriesDeniedWhileWriteHeld();
+
+        writeRelease.countDown();
+        VkSenderService.awaitSwitchIdleForTest();
+        assertTrue("успешный актуальный Start разрешает работу",
+                VkSenderService.isTransmissionAllowed(context));
+        assertNotNull(shadowApp().getNextStartedService());
+    }
+
+    @Test
+    public void startFromDisabledDeniedDuringWriteAndStaysDeniedOnFailure() {
+        prefs.edit().putBoolean(
+                VkSenderService.PREF_TRANSMISSION_ENABLED, false).commit();
+        CountDownLatch writeEntered = new CountDownLatch(1);
+        CountDownLatch writeRelease = new CountDownLatch(1);
+        VkSenderService.transmissionWriteOverride = (enabled, mark) -> {
+            prefs.edit().putBoolean(
+                    VkSenderService.PREF_TRANSMISSION_ENABLED, enabled).apply();
+            writeEntered.countDown();
+            try {
+                writeRelease.await(10, TimeUnit.SECONDS);
+            } catch (InterruptedException e) {
+                Thread.currentThread().interrupt();
+            }
+            return false; // запись отказала ПОСЛЕ изменения кеша
+        };
+        VkSenderService.requestStartTransmission(context);
+        awaitLatch(writeEntered);
+
+        assertEntriesDeniedWhileWriteHeld();
+
+        writeRelease.countDown();
+        VkSenderService.awaitSwitchIdleForTest();
+        // Отказ оставляет запрет — кеш true не доказательство.
+        assertFalse(VkSenderService.isTransmissionAllowed(context));
+        new AlarmReceiver().onReceive(context, new Intent());
+        assertNull(shadowApp().getNextStartedService());
+    }
+
+    @Test
+    public void existingInstanceDoesNotSendDuringHeldStartWrite() {
+        // Подтверждённое разрешение → экземпляр жив; пользователь остановил
+        // передачу; теперь Start-запись удержана — отложенная команда
+        // существующего экземпляра не должна отправлять.
+        VkSenderService s = startService();
+        VkSenderService.awaitSwitchIdleForTest();
+        stopTransmission(); // подтверждённый запрет
+
+        CountDownLatch writeEntered = new CountDownLatch(1);
+        CountDownLatch writeRelease = new CountDownLatch(1);
+        VkSenderService.transmissionWriteOverride = (enabled, mark) -> {
+            prefs.edit().putBoolean(
+                    VkSenderService.PREF_TRANSMISSION_ENABLED, enabled).apply();
+            writeEntered.countDown();
+            try {
+                writeRelease.await(10, TimeUnit.SECONDS);
+            } catch (InterruptedException e) {
+                Thread.currentThread().interrupt();
+            }
+            return true;
+        };
+        VkSenderService.requestStartTransmission(context);
+        awaitLatch(writeEntered); // запись удержана
+
+        s.onStartCommand(
+                autoUpdate(120, System.currentTimeMillis() - 60_000), 0, 1);
+        awaitWorkerIfAlive(s);
+        assertEquals("существующий экземпляр отправил во время записи Start",
+                0, peers.size());
+
+        writeRelease.countDown();
+        VkSenderService.awaitSwitchIdleForTest();
+        // После подтверждённого запуска экземпляр возобновляет очередь.
+        s.onStartCommand(
+                autoUpdate(130, System.currentTimeMillis() - 10_000), 0, 2);
+        awaitWorkerIfAlive(s);
+        assertEquals(1, peers.size());
+        s.onDestroy();
+    }
+
+    @Test
+    public void initialMigrationDeniesDuringWrite() {
+        // Ключа нет, установка настроена; запись инициализации удержана —
+        // до подтверждения отправок нет.
+        CountDownLatch writeEntered = new CountDownLatch(1);
+        CountDownLatch writeRelease = new CountDownLatch(1);
+        VkSenderService.transmissionWriteOverride = (enabled, mark) -> {
+            prefs.edit().putBoolean(
+                    VkSenderService.PREF_TRANSMISSION_ENABLED, enabled).apply();
+            writeEntered.countDown();
+            try {
+                writeRelease.await(10, TimeUnit.SECONDS);
+            } catch (InterruptedException e) {
+                Thread.currentThread().interrupt();
+            }
+            return true;
+        };
+        assertTrue(VkSenderService.isTransmissionAllowed(context)); // legacy-вывод
+        awaitLatch(writeEntered); // запись инициализации выполняется
+
+        assertEntriesDeniedWhileWriteHeld();
+
+        writeRelease.countDown();
+        VkSenderService.awaitSwitchIdleForTest();
+        assertTrue(VkSenderService.isTransmissionAllowed(context));
+    }
+
+    // ---------- 6. Повтор миграции сохраняет исходное решение ----------
+
+    @Test
+    public void newInstallMigrationRetryKeepsOriginalChoice() {
+        // Новая установка: токен пустой, чат 0 → исходное решение false.
+        TokenStorage.setToken(context, "");
+        TokenStorage.setChatId(context, 0);
+        List<Boolean> written = Collections.synchronizedList(new ArrayList<>());
+        AtomicInteger calls = new AtomicInteger();
+        VkSenderService.transmissionWriteOverride = (enabled, mark) -> {
+            written.add(enabled);
+            if (calls.getAndIncrement() == 0) {
+                prefs.edit().putBoolean(
+                        VkSenderService.PREF_TRANSMISSION_ENABLED, enabled).apply();
+                return false; // попытка false отказала, кеш содержит ключ
+            }
+            return prefs.edit()
+                    .putBoolean(VkSenderService.PREF_TRANSMISSION_ENABLED, enabled)
+                    .commit();
+        };
+        assertFalse(VkSenderService.isTransmissionAllowed(context));
+        VkSenderService.awaitSwitchIdleForTest(); // попытка 1 отказала
+
+        // Пользователь заполняет настройки, НЕ нажимая «Запустить».
+        TokenStorage.setToken(context, "SYNTHETIC_TOKEN_2");
+        TokenStorage.setChatId(context, 999);
+        assertFalse(VkSenderService.isTransmissionAllowed(context)); // повтор
+        VkSenderService.awaitSwitchIdleForTest(); // попытка 2 подтверждена
+
+        assertEquals("повтор пересчитал решение по новым настройкам",
+                Arrays.asList(false, false), written);
+        assertFalse("исходный выбор новой установки сохранён",
+                prefs.getBoolean(VkSenderService.PREF_TRANSMISSION_ENABLED, true));
+        assertFalse(VkSenderService.isTransmissionAllowed(context));
+    }
+
+    @Test
+    public void existingInstallMigrationRetryKeepsOriginalChoice() {
+        // Существующая настроенная установка → исходное решение true.
+        List<Boolean> written = Collections.synchronizedList(new ArrayList<>());
+        AtomicInteger calls = new AtomicInteger();
+        VkSenderService.transmissionWriteOverride = (enabled, mark) -> {
+            written.add(enabled);
+            if (calls.getAndIncrement() == 0) {
+                prefs.edit().putBoolean(
+                        VkSenderService.PREF_TRANSMISSION_ENABLED, enabled).apply();
+                return false;
+            }
+            return prefs.edit()
+                    .putBoolean(VkSenderService.PREF_TRANSMISSION_ENABLED, enabled)
+                    .commit();
+        };
+        assertTrue(VkSenderService.isTransmissionAllowed(context));
+        VkSenderService.awaitSwitchIdleForTest(); // попытка 1 отказала
+
+        // Смена аккаунта между попытками — чат сброшен.
+        TokenStorage.setChatId(context, 0);
+        TokenStorage.setAlertChatId(context, 0);
+        assertFalse(VkSenderService.isTransmissionAllowed(context)); // повтор
+        VkSenderService.awaitSwitchIdleForTest(); // попытка 2 подтверждена
+
+        assertEquals("повтор пересчитал решение по новым настройкам",
+                Arrays.asList(true, true), written);
+        assertTrue("исходный выбор существующей установки сохранён",
+                prefs.getBoolean(VkSenderService.PREF_TRANSMISSION_ENABLED, false));
+        assertTrue(VkSenderService.isTransmissionAllowed(context));
+        // Отсутствие чата отдельно препятствует отправке — разрешение и
+        // готовность конфигурации разные признаки.
+        VkSenderService s = startService();
+        s.onStartCommand(
+                autoUpdate(120, System.currentTimeMillis() - 60_000), 0, 1);
+        awaitWorker(s);
+        assertEquals("без чата отправки нет даже при разрешённой передаче",
+                0, peers.size());
+        s.onDestroy();
+    }
+
+    @Test
+    public void explicitStopDuringUnconfirmedMigrationKeepsUserChoice() {
+        // Миграция отказала (кеш true); пользователь явно остановил —
+        // подтверждённый Stop приоритетнее устаревшей миграции.
+        AtomicInteger calls = new AtomicInteger();
+        VkSenderService.transmissionWriteOverride = (enabled, mark) -> {
+            if (calls.getAndIncrement() == 0) {
+                prefs.edit().putBoolean(
+                        VkSenderService.PREF_TRANSMISSION_ENABLED, enabled).apply();
+                return false; // попытка миграции true отказала
+            }
+            return prefs.edit()
+                    .putBoolean(VkSenderService.PREF_TRANSMISSION_ENABLED, enabled)
+                    .commit();
+        };
+        assertTrue(VkSenderService.isTransmissionAllowed(context));
+        VkSenderService.awaitSwitchIdleForTest(); // попытка 1 отказала
+
+        stopTransmission(); // подтверждённый явный Stop
+        VkSenderService.awaitSwitchIdleForTest();
+
+        // Чтение не запускает устаревшую миграцию поверх явного выбора.
+        assertFalse(VkSenderService.isTransmissionAllowed(context));
+        VkSenderService.awaitSwitchIdleForTest();
+        assertFalse("устаревшая миграция перезаписала явный Stop",
+                prefs.getBoolean(VkSenderService.PREF_TRANSMISSION_ENABLED, true));
+    }
+
+    @Test
+    public void stopDuringHeldStartKeepsDenied() {
+        // Start-запись удержана; пришёл Stop — после освобождения записи
+        // передача остаётся запрещённой.
+        prefs.edit().putBoolean(
+                VkSenderService.PREF_TRANSMISSION_ENABLED, false).commit();
+        CountDownLatch writeEntered = new CountDownLatch(1);
+        CountDownLatch writeRelease = new CountDownLatch(1);
+        VkSenderService.transmissionWriteOverride = (enabled, mark) -> {
+            prefs.edit().putBoolean(
+                    VkSenderService.PREF_TRANSMISSION_ENABLED, enabled).apply();
+            writeEntered.countDown();
+            try {
+                writeRelease.await(10, TimeUnit.SECONDS);
+            } catch (InterruptedException e) {
+                Thread.currentThread().interrupt();
+            }
+            return prefs.edit()
+                    .putBoolean(VkSenderService.PREF_TRANSMISSION_ENABLED, enabled)
+                    .commit(); // запись Start успешна, но запрос уже устарел
+        };
+        VkSenderService.requestStartTransmission(context);
+        awaitLatch(writeEntered); // запись Start удержана
+
+        VkSenderService.requestStopTransmission(context); // более новый Stop
+        // Во время записи процессный запрет немедленный.
+        assertFalse(VkSenderService.isTransmissionAllowed(context));
+        writeRelease.countDown();
+        VkSenderService.awaitSwitchIdleForTest();
+
+        assertFalse("поздний результат Start не отменил более новый Stop",
+                VkSenderService.isTransmissionAllowed(context));
+        assertFalse(prefs.getBoolean(
+                VkSenderService.PREF_TRANSMISSION_ENABLED, true));
+        assertNull(shadowApp().getNextStartedService());
+    }
+
     @Test
     public void staleStartSupersededByStopKeepsStopped() {
         // Запись Start удерживается: за это время приходит Stop.
@@ -698,7 +989,7 @@ public class VkSenderServiceOwnershipTest {
         AtomicInteger writeCalls = new AtomicInteger();
         // Подмена выполняет реальную запись: override — BooleanSupplier без
         // аргументов, порядок вызовов известен (0 = Start→true, 1 = Stop→false).
-        VkSenderService.transmissionWriteOverride = () -> {
+        VkSenderService.transmissionWriteOverride = (enabled, markBaselinePending) -> {
             if (writeCalls.getAndIncrement() == 0) {
                 writeStarted.countDown();
                 try {
@@ -734,7 +1025,7 @@ public class VkSenderServiceOwnershipTest {
 
     @Test
     public void failedStopThenFailedStartKeepsProcessBlock() {
-        VkSenderService.transmissionWriteOverride = () -> false;
+        VkSenderService.transmissionWriteOverride = (enabled, markBaselinePending) -> false;
         AtomicBoolean stopSaved = new AtomicBoolean(true);
         VkSenderService.requestStopTransmission(context, stopSaved::set);
         VkSenderService.awaitSwitchIdleForTest();

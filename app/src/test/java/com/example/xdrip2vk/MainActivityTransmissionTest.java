@@ -118,7 +118,7 @@ public class MainActivityTransmissionTest {
 
     @Test
     public void stopButtonHonestOnWriteFailure() {
-        VkSenderService.transmissionWriteOverride = () -> false;
+        VkSenderService.transmissionWriteOverride = (enabled, markBaselinePending) -> false;
         MainActivity a = activity();
         a.findViewById(R.id.btn_stop_service).performClick();
         // передача в процессе заблокирована, а статус — «остановлено»

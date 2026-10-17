@@ -70,6 +70,19 @@ public class VkSenderService extends Service {
      */
     private static volatile boolean startWriteDenied;
 
+    /**
+     * На switchExecutor выполняется запись пользовательского выбора (Start/
+     * Stop/миграция). Пока запись не завершена, кеш prefs мог быть уже
+     * изменён ещё не подтверждённым commit — он не является источником
+     * разрешения: действует последнее ПОДТВЕРЖДЁННОЕ состояние.
+     */
+    private static volatile boolean switchWriteInFlight;
+
+    /** Выбор подтверждён на диске в этом процессе (или прочитан до записей). */
+    private static volatile boolean choiceConfirmed;
+    /** Значение последнего подтверждённого выбора. */
+    private static volatile boolean confirmedEnabled;
+
     // ---- Передача владения состоянием доставки между экземплярами ----
     // Старый экземпляр может ещё дожимать сетевую попытку и писать checkpoint,
     // когда создан новый. Новый экземпляр НЕ загружает и не меняет очередь,
@@ -231,6 +244,13 @@ public class VkSenderService extends Service {
             // изменённый в памяти prefs отказавшим commit — не доказательство
             return false;
         }
+        if (switchWriteInFlight) {
+            // Запись выбора выполняется прямо сейчас: кеш prefs уже может
+            // содержать неподтверждённое значение — источником разрешения
+            // служит последнее подтверждённое состояние (из выключенного/
+            // неинициализированного состояния передача запрещена до успеха).
+            return choiceConfirmed && confirmedEnabled;
+        }
         SharedPreferences p = PreferenceManager.getDefaultSharedPreferences(context);
         if (!p.contains(PREF_TRANSMISSION_ENABLED) || migrationUnconfirmed) {
             boolean legacy = !TokenStorage.getToken(context).isEmpty()
@@ -239,7 +259,10 @@ public class VkSenderService extends Service {
             // Неподтверждённая инициализация не разрешает новые отправки.
             return !migrationUnconfirmed && legacy;
         }
-        return p.getBoolean(PREF_TRANSMISSION_ENABLED, false);
+        boolean v = p.getBoolean(PREF_TRANSMISSION_ENABLED, false);
+        choiceConfirmed = true;
+        confirmedEnabled = v; // чистое чтение — значение подтверждено диском
+        return v;
     }
 
     private static volatile boolean migrationInitQueued;
@@ -257,27 +280,27 @@ public class VkSenderService extends Service {
             try {
                 SharedPreferences p =
                         PreferenceManager.getDefaultSharedPreferences(app);
-                if (!p.contains(PREF_TRANSMISSION_ENABLED)) {
-                    migrationAttemptedValue = legacy ? 1 : 0;
-                    migrationUnconfirmed =
-                            !writeTransmissionEnabled(app, legacy, false);
-                } else if (migrationUnconfirmed) {
-                    // Ключ в памяти появился от отказавшего commit или от
-                    // подтверждённой пользовательской записи. Если значение
-                    // сменилось — выбор пользователя, миграцию не перетираем;
-                    // если совпадает с попыткой — запись могла не дойти до
-                    // диска, повторяем.
-                    int current =
-                            p.getBoolean(PREF_TRANSMISSION_ENABLED, false) ? 1 : 0;
-                    if (current == migrationAttemptedValue) {
-                        migrationUnconfirmed =
-                                !writeTransmissionEnabled(app, legacy, false);
-                    } else {
-                        migrationUnconfirmed = false;
+                if (!p.contains(PREF_TRANSMISSION_ENABLED)
+                        || migrationUnconfirmed) {
+                    if (migrationAttemptedValue < 0) {
+                        // Исходное решение миграции фиксируется при первой
+                        // попытке — все повторы сохраняют тот же выбор
+                        // независимо от дальнейших настроек токена/чатов.
+                        migrationAttemptedValue = legacy ? 1 : 0;
                     }
-                } else {
-                    migrationUnconfirmed = false; // ключ подтверждён другой записью
+                    // contains() после отказа не завершает инициализацию —
+                    // значение в памяти могло остаться от отказавшего commit.
+                    boolean target = migrationAttemptedValue != 0;
+                    migrationUnconfirmed =
+                            !writeTransmissionEnabled(app, target, false);
+                    if (!migrationUnconfirmed) {
+                        choiceConfirmed = true;
+                        confirmedEnabled = target;
+                    }
                 }
+                // Иначе ключ подтверждён — либо ранее, либо подтверждённым
+                // явным Start/Stop (он снимает migrationUnconfirmed при своей
+                // успешной записи): устаревшая миграция его не перетирает.
             } finally {
                 // отказ записи — инициализация не завершена, повтор при
                 // следующем чтении (цикла по таймеру нет)
@@ -286,22 +309,36 @@ public class VkSenderService extends Service {
         });
     }
 
-    /** Тестовая подмена подтверждённой записи разрешения (отказ диска). */
-    static volatile java.util.function.BooleanSupplier transmissionWriteOverride;
+    /**
+     * Тестовая подмена записи разрешения: (enabled, markBaselinePending) →
+     * результат записи. Позволяет моделировать отказ commit с уже изменённым
+     * кешем prefs.
+     */
+    static volatile java.util.function.BiFunction<Boolean, Boolean, Boolean>
+            transmissionWriteOverride;
 
-    /** Подтверждённая запись пользовательского выбора; возобновление помечает baseline терапии. */
+    /**
+     * Подтверждённая запись пользовательского выбора; возобновление помечает
+     * baseline терапии. На время записи выставляется switchWriteInFlight —
+     * кеш prefs в этот момент не является источником разрешения.
+     */
     private static boolean writeTransmissionEnabled(Context context, boolean enabled,
                                                     boolean markBaselinePending) {
-        if (transmissionWriteOverride != null) {
-            return transmissionWriteOverride.getAsBoolean();
+        switchWriteInFlight = true;
+        try {
+            if (transmissionWriteOverride != null) {
+                return transmissionWriteOverride.apply(enabled, markBaselinePending);
+            }
+            SharedPreferences.Editor e = PreferenceManager.getDefaultSharedPreferences(context)
+                    .edit()
+                    .putBoolean(PREF_TRANSMISSION_ENABLED, enabled);
+            if (markBaselinePending) {
+                e.putBoolean(PREF_TREATMENT_BASELINE_PENDING, true);
+            }
+            return e.commit();
+        } finally {
+            switchWriteInFlight = false;
         }
-        SharedPreferences.Editor e = PreferenceManager.getDefaultSharedPreferences(context)
-                .edit()
-                .putBoolean(PREF_TRANSMISSION_ENABLED, enabled);
-        if (markBaselinePending) {
-            e.putBoolean(PREF_TREATMENT_BASELINE_PENDING, true);
-        }
-        return e.commit();
     }
 
     private static long nextSwitchGeneration() {
@@ -328,6 +365,12 @@ public class VkSenderService extends Service {
         final Context app = context.getApplicationContext();
         switchExecutor.execute(() -> {
             boolean saved = writeTransmissionEnabled(app, false, false);
+            if (saved) {
+                // Подтверждённый явный Stop — приоритет над миграцией.
+                migrationUnconfirmed = false;
+                choiceConfirmed = true;
+                confirmedEnabled = false;
+            }
             app.stopService(new Intent(app, VkSenderService.class));
             if (done != null) {
                 done.accept(saved);
@@ -353,13 +396,22 @@ public class VkSenderService extends Service {
         final long gen = nextSwitchGeneration();
         switchExecutor.execute(() -> {
             boolean ok = false;
+            boolean writeOk = false;
+            if (isSwitchGenerationCurrent(gen)) {
+                writeOk = writeTransmissionEnabled(app, true, true);
+                if (writeOk) {
+                    // Подтверждённый явный выбор — приоритет над миграцией:
+                    // повторная попытка миграции его не перезапишет.
+                    migrationUnconfirmed = false;
+                }
+            }
             // Запись успела, но пришёл более новый запрос — эффектов старого
             // Start не применяем: запрет не снимаем, сервис не стартуем.
-            if (isSwitchGenerationCurrent(gen)
-                    && writeTransmissionEnabled(app, true, true)
-                    && isSwitchGenerationCurrent(gen)) {
+            if (writeOk && isSwitchGenerationCurrent(gen)) {
                 userStopInFlight = false;
                 startWriteDenied = false; // разрешение подтверждено на диске
+                choiceConfirmed = true;
+                confirmedEnabled = true;
                 app.startForegroundService(new Intent(app, VkSenderService.class));
                 ok = true;
             } else {
@@ -395,6 +447,9 @@ public class VkSenderService extends Service {
         awaitSwitchIdleForTest(); // сначала добить очередь — старые записи не протекают в следующий тест
         userStopInFlight = false;
         startWriteDenied = false;
+        switchWriteInFlight = false;
+        choiceConfirmed = false;
+        confirmedEnabled = false;
         activeInstance = null;
         migrationInitQueued = false;
         migrationUnconfirmed = false;
