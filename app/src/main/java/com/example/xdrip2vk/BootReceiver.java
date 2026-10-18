@@ -41,19 +41,31 @@ public class BootReceiver extends BroadcastReceiver {
             // после READY-снимка с токеном и чатом.
             Credentials creds = Credentials.get(context);
             if (creds.snapshot().configured()) {
-                startService(context);
+                startServiceIfAllowed(context);
             } else {
                 final Context app = context.getApplicationContext();
                 creds.resolveOnBackground(s -> {
                     if (s.configured()) {
-                        startService(app);
+                        startServiceIfAllowed(app);
                     }
                 });
             }
         }
     }
 
-    private static void startService(Context context) {
+    /**
+     * Одно правило запуска по реквизитам для синхронной ветки и
+     * отложенного callback'а: действующее разрешение перепроверяется
+     * непосредственно перед startForegroundService — за время чтения
+     * пользователь мог остановить передачу, и запоздавший READY не
+     * отменяет Stop (включая процессный запрет при отказе записи Stop).
+     * Отказавший запуск не назначает новых попыток подтверждения —
+     * цепочка принадлежит свежим входам, а не устаревшему callback'у.
+     */
+    private static void startServiceIfAllowed(Context context) {
+        if (!VkSenderService.isTransmissionAllowed(context)) {
+            return;
+        }
         Intent serviceIntent = new Intent(context, VkSenderService.class);
         context.startForegroundService(serviceIntent);
     }
