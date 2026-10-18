@@ -49,6 +49,13 @@ public class VkSenderService extends Service {
     private static final String PREF_CONFIRMED_SENDER_FP = "confirmed_sender_fp";
     private static final String PREF_LAST_SENDER = "last_active_sender";
     /**
+     * Незавершённый переход владельца: "fp|owner|oldChat|oldAlert" —
+     * версия токена, новый владелец и адресаты на момент начала
+     * перехода (они и есть потенциально унаследованные). Пишется
+     * commit()'ом до первой команды сброса, стирается при завершении.
+     */
+    private static final String PREF_OWNER_TRANSITION = "owner_transition";
+    /**
      * Сохранённое разрешение пользователя на передачу — источник выбора
      * пользователя, не состояние процесса. Отсутствие ключа — установка до
      * введения ключа: разрешено только если заданы токен и обычный чат
@@ -990,9 +997,25 @@ public class VkSenderService extends Service {
     private DeliveryCoordinator.Config loadConfig() {
         Credentials.Snapshot snap = Credentials.get(this).resolveBlocking();
         boolean ready = snap.sendPermitted();
+        String token = ready ? snap.token : "";
+        AuthContext auth = currentAuthContext(token);
+        // Переход владельца завершается ДО чтения LAST_SENDER и постановки
+        // новых сообщений: peerOwner привязывается к владельцу чатов в
+        // момент постановки — незавершённый переход не должен приписать
+        // новые сообщения прежнему аккаунту.
+        if (auth.verified
+                && !auth.senderId.equals(prefs.getString(PREF_LAST_SENDER, ""))) {
+            ensureOwnerTransition(auth);
+            // Условный сброс мог изменить адресаты — снимок перечитывается:
+            // сообщение не ставится на уже очищенный унаследованный чат.
+            snap = Credentials.get(this).resolveBlocking();
+            ready = snap.sendPermitted();
+            token = ready ? snap.token : "";
+            // Токен мог смениться за время перехода — auth по свежему.
+            auth = currentAuthContext(token);
+        }
         long chatId = ready ? snap.chatId : 0;
         long alertChatId = ready ? snap.alertChatId : 0;
-        String token = ready ? snap.token : "";
         boolean alertEnabled = prefs.getBoolean(PREF_ALERT_ENABLED, false);
         AlertThresholds thresholds = AlertThresholds.orDefault(
                 prefs.getString(PREF_ALERT_MIN_BG, AlertThresholds.DEFAULT_MIN_STR),
@@ -1008,7 +1031,7 @@ public class VkSenderService extends Service {
                 chatId > 0 ? String.valueOf(chatId) : "",
                 alertChatId != 0 ? String.valueOf(alertChatId) : "",
                 alertEnabled, configured, thresholds,
-                currentAuthContext(token),
+                auth,
                 prefs.getString(PREF_LAST_SENDER, ""));
     }
 
@@ -1358,25 +1381,67 @@ public class VkSenderService extends Service {
     }
 
     /**
+     * Записанный переход владельца: версия токена, новый владелец и
+     * адресаты на момент начала перехода. Поля old* — то, что может
+     * быть унаследовано от прежнего аккаунта.
+     */
+    private static final class OwnerTransition {
+        final String fp;
+        final String owner;
+        final long oldChat;
+        final long oldAlert;
+
+        OwnerTransition(String fp, String owner, long oldChat, long oldAlert) {
+            this.fp = fp;
+            this.owner = owner;
+            this.oldChat = oldChat;
+            this.oldAlert = oldAlert;
+        }
+
+        String encode() {
+            return fp + "|" + owner + "|" + oldChat + "|" + oldAlert;
+        }
+
+        static OwnerTransition decode(String s) {
+            if (s == null) {
+                return null;
+            }
+            String[] p = s.split("\\|", -1);
+            if (p.length != 4 || p[0].isEmpty() || p[1].isEmpty()) {
+                return null;
+            }
+            try {
+                return new OwnerTransition(p[0], p[1],
+                        Long.parseLong(p[2]), Long.parseLong(p[3]));
+            } catch (NumberFormatException e) {
+                return null;
+            }
+        }
+    }
+
+    /**
      * Переход адресатов при смене аккаунта — три различимых состояния:
      * «личность подтверждена» (CONFIRMED_SENDER/_FP соответствуют fp),
-     * «сброс не подтверждён» (LAST_SENDER != владелец) и «переход
-     * завершён» (LAST_SENDER == владелец).
+     * «сброс не подтверждён» (LAST_SENDER != владелец; этап хранится в
+     * PREF_OWNER_TRANSITION) и «переход завершён» (LAST_SENDER ==
+     * владелец, маркер стёрт).
      *
      * Вызывается при каждом обходе с verified auth, а не один раз при
      * подтверждении: commit=false оставляет переход незавершённым, а
      * более поздние resolve завершают ожидающий сброс — здесь фиксируется
-     * завершение БЕЗ повторного стирания чатов.
+     * завершение.
      *
-     * Правила: LAST_SENDER меняется только когда сброс этой версии
-     * токена подтверждён или видимо применён на диске (оба адресата 0 —
-     * унаследованных адресатов не осталось). Ненулевые адресаты при
-     * незавершённом переходе могли унаследоваться — выполняется
-     * подтверждённый clearChatIdsAsync именно для этого fp: устаревший
-     * вызов новую версию не трогает. Пока переход не завершён, старые
-     * адресаты не становятся чатами нового владельца. Единицы, пороги и
-     * имя устройства сохраняются. Старая очередь хранится в coordinator
-     * со своим владельцем до истечения.
+     * Протокол: маркер перехода пишется commit()'ом ДО первой команды
+     * сброса — после прерывания процесса известно, какие значения были
+     * на момент начала перехода. Сам сброс — условный
+     * clearInheritedChatIdsAsync(fp, old*): обнуляются только поля, до
+     * сих пор равные записанным старым значениям; адресаты, явно
+     * выбранные после подтверждённого сброса, не стираются. READY этой
+     * команды — подтверждённый результат именно для этой версии токена:
+     * унаследованных значений на диске не осталось. LAST_SENDER меняется
+     * только после READY и только если fp всё ещё актуален — устаревший
+     * переход новой версии не касается. ownerMatches не ослаблен, старая
+     * очередь хранится в coordinator со своим владельцем до истечения.
      */
     private void ensureOwnerTransition(AuthContext auth) {
         if (!auth.verified) {
@@ -1384,10 +1449,17 @@ public class VkSenderService extends Service {
         }
         String prev = prefs.getString(PREF_LAST_SENDER, "");
         if (auth.senderId.equals(prev)) {
-            return; // переход завершён или не требуется
+            // Переход завершён или не требуется — стёрли бы маркер, если
+            // он относится к этой версии; чужой не трогаем.
+            OwnerTransition done = readOwnerTransition();
+            if (done != null && done.fp.equals(auth.tokenFp)) {
+                prefs.edit().remove(PREF_OWNER_TRANSITION).apply();
+            }
+            return;
         }
         if (prev.isEmpty()) {
-            prefs.edit().putString(PREF_LAST_SENDER, auth.senderId).apply();
+            prefs.edit().putString(PREF_LAST_SENDER, auth.senderId)
+                    .remove(PREF_OWNER_TRANSITION).apply();
             return;
         }
         Credentials creds = Credentials.get(this);
@@ -1399,25 +1471,45 @@ public class VkSenderService extends Service {
                 || !auth.tokenFp.equals(Fingerprint.of(snap.token))) {
             return;
         }
-        if (snap.chatId == 0 && snap.alertChatId == 0) {
-            // Сброс уже применён на диске (повтором незавершённой операции
-            // или до потери фиксации) — завершаем, ничего не стирая.
-            prefs.edit().putString(PREF_LAST_SENDER, auth.senderId).apply();
-            return;
+        OwnerTransition t = readOwnerTransition();
+        if (t == null || !t.fp.equals(auth.tokenFp)
+                || !t.owner.equals(auth.senderId)) {
+            // Новый переход: фиксируем текущие адресаты как потенциально
+            // унаследованные ДО первой команды сброса — иначе после
+            // прерывания новый выбор не отличить от наследия.
+            t = new OwnerTransition(auth.tokenFp, auth.senderId,
+                    snap.chatId, snap.alertChatId);
+            if (!prefs.edit()
+                    .putString(PREF_OWNER_TRANSITION, t.encode())
+                    .commit()) {
+                return; // маркер не записан — переход не начинаем
+            }
         }
         try {
             CredentialStore.Resolution r = creds
-                    .clearChatIdsAsync(auth.tokenFp)
+                    .clearInheritedChatIdsAsync(
+                            auth.tokenFp, t.oldChat, t.oldAlert)
                     .get(30, java.util.concurrent.TimeUnit.SECONDS);
-            if (r != null && r.status == CredentialStore.Status.READY) {
-                prefs.edit().putString(PREF_LAST_SENDER, auth.senderId).apply();
-                Logger.w(TAG, "Подтверждён другой владелец токена — чаты нужно выбрать заново");
+            if (r != null && r.status == CredentialStore.Status.READY
+                    && auth.tokenFp.equals(currentTokenFp())) {
+                // Сброс этой версии подтверждён и токен не сменился.
+                prefs.edit()
+                        .putString(PREF_LAST_SENDER, auth.senderId)
+                        .remove(PREF_OWNER_TRANSITION)
+                        .apply();
+                Logger.w(TAG, "Подтверждён другой владелец токена — чаты выбираются заново");
             }
-            // Сброс не подтверждён — LAST_SENDER не меняем: прежние
-            // адресаты не становятся чатами нового владельца.
+            // Сброс не подтверждён или токен сменился — LAST_SENDER не
+            // меняем: прежние адресаты не становятся чатами нового
+            // владельца, маркер ждёт следующего обхода.
         } catch (Exception e) {
             Logger.e(TAG, "Сброс чатов при смене владельца не подтверждён");
         }
+    }
+
+    private OwnerTransition readOwnerTransition() {
+        return OwnerTransition.decode(
+                prefs.getString(PREF_OWNER_TRANSITION, null));
     }
 
     private void drainAndSchedule() {

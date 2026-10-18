@@ -27,8 +27,11 @@ import org.robolectric.annotation.Config;
 
 import java.util.ArrayList;
 import java.util.List;
+import java.util.concurrent.CountDownLatch;
 import java.util.concurrent.Future;
 import java.util.concurrent.TimeUnit;
+import java.util.concurrent.atomic.AtomicBoolean;
+import java.util.concurrent.atomic.AtomicInteger;
 
 /**
  * Интеграционные проверки задания 2Г.4: настоящий сервис + настоящий
@@ -366,6 +369,8 @@ public class CredentialsServiceIntegrationTest {
     /**
      * Новый экземпляр сервиса продолжает незавершённый переход: pending
      * операция в общем координаторе переживает экземпляр сервиса.
+     * Это тот же процесс — координатор не сбрасывается (настоящий новый
+     * процесс моделируется CredHelper.recreate в других тестах).
      */
     @Test
     public void newServiceInstanceCompletesPendingTransition() throws Exception {
@@ -392,8 +397,8 @@ public class CredentialsServiceIntegrationTest {
         s2.onDestroy();
         failing.set(false);
 
-        // «Новый процесс» приложения: тот же backend/координатор
-        // (pending живёт в нём), сервис — новый экземпляр.
+        // Тот же процесс: общий координатор и его pending-операция живы,
+        // новый экземпляр сервиса подхватывает завершение перехода.
         VkSenderService s3 = startService();
         bareDrain(s3);
         assertEquals("user:2", prefs.getString(LAST_SENDER, ""));
@@ -512,5 +517,413 @@ public class CredentialsServiceIntegrationTest {
                 CredHelper.getToken(context));
         assertEquals(777, CredHelper.getChatId(context));
         s2.onDestroy();
+    }
+
+    // ==================== 2Г.4Б.1: новый выбор после подтверждённого сброса ====================
+
+    /**
+     * Точное воспроизведение 2Г.4Б.1: после отказа первого commit сброса
+     * запись восстановлена, resolveAsync завершает pending-сброс, затем
+     * БЕЗ промежуточного обхода сервиса выбрана новая беседа 888.
+     * Следующий обход обязан завершить переход, НЕ стирая 888; новое
+     * показание доставлено в 888 ровно один раз.
+     */
+    @Test
+    public void newSelectionAfterConfirmedResetNotErased() throws Exception {
+        CredHelper.setToken(context, "SYNTH_TOKEN_A");
+        CredHelper.setChatId(context, 777);
+        VkSenderService s = startService();
+        s.onStartCommand(autoUpdate(120, System.currentTimeMillis() - 60_000), 0, 1);
+        idle(s);
+        assertEquals(1, sends.size());
+        s.onDestroy();
+
+        CredHelper.setToken(context, "SYNTH_TOKEN_B");
+        VkSenderService.identityVerifierOverride =
+                token -> token.equals("SYNTH_TOKEN_B") ? "user:2" : "user:1";
+        AtomicBoolean failing = new AtomicBoolean(true);
+        installFailingPutBackend(failing);
+
+        sends.clear();
+        VkSenderService s2 = startService();
+        s2.onStartCommand(autoUpdate(121, System.currentTimeMillis() - 30_000), 0, 2);
+        idle(s2);
+        assertTrue("сброс не подтверждён — отправок нет", sends.isEmpty());
+        assertEquals("user:1", prefs.getString(LAST_SENDER, ""));
+        assertEquals("user:2", prefs.getString(CONFIRMED_SENDER, ""));
+        assertTrue("маркер перехода записан до первого сброса",
+                prefs.contains("owner_transition"));
+
+        // Восстановление записи: resolve завершает ожидающий сброс.
+        failing.set(false);
+        assertEquals(CredentialStore.Status.READY, Credentials.get(context)
+                .resolveAsync().get(10, TimeUnit.SECONDS).status);
+        assertEquals(0, CredHelper.getChatId(context));
+
+        // Явный выбор новой беседы БЕЗ промежуточного обхода сервиса.
+        assertEquals(CredentialStore.Status.READY, Credentials.get(context)
+                .setChatIdAsync(888,
+                        com.example.xdrip2vk.core.Fingerprint.of("SYNTH_TOKEN_B"))
+                .get(10, TimeUnit.SECONDS).status);
+
+        // Следующий обход с cached verified: завершение перехода не
+        // стирает 888, новое свежее показание уходит в него один раз.
+        s2.onStartCommand(autoUpdate(122, System.currentTimeMillis()), 0, 4);
+        idle(s2);
+        assertEquals("user:2", prefs.getString(LAST_SENDER, ""));
+        assertEquals("выбранный чат сохранён", 888,
+                CredHelper.getChatId(context));
+        assertEquals(1, sends.size());
+        assertTrue(sends.get(0).startsWith("888|"));
+
+        // Повторные обходы не стирают выбранные чаты и не шлют повторно.
+        bareDrain(s2);
+        bareDrain(s2);
+        assertEquals(888, CredHelper.getChatId(context));
+        assertEquals(1, sends.size());
+        s2.onDestroy();
+    }
+
+    /**
+     * То же для тревожного адресата с отрицательным peer_id: выбор -999
+     * после подтверждённого сброса не стирается завершением перехода.
+     */
+    @Test
+    public void alertSelectionAfterConfirmedResetNotErased() throws Exception {
+        CredHelper.setToken(context, "SYNTH_TOKEN_A");
+        CredHelper.setChatId(context, 777);
+        CredHelper.setAlertChatId(context, -555);
+        VkSenderService s = startService();
+        s.onStartCommand(autoUpdate(120, System.currentTimeMillis() - 60_000), 0, 1);
+        idle(s);
+        assertEquals(1, sends.size());
+        s.onDestroy();
+
+        CredHelper.setToken(context, "SYNTH_TOKEN_B");
+        VkSenderService.identityVerifierOverride =
+                token -> token.equals("SYNTH_TOKEN_B") ? "user:2" : "user:1";
+        AtomicBoolean failing = new AtomicBoolean(true);
+        installFailingPutBackend(failing);
+
+        sends.clear();
+        VkSenderService s2 = startService();
+        s2.onStartCommand(autoUpdate(121, System.currentTimeMillis() - 30_000), 0, 2);
+        idle(s2);
+        assertTrue(sends.isEmpty());
+        assertEquals("user:1", prefs.getString(LAST_SENDER, ""));
+
+        failing.set(false);
+        assertEquals(CredentialStore.Status.READY, Credentials.get(context)
+                .resolveAsync().get(10, TimeUnit.SECONDS).status);
+        assertEquals(0, CredHelper.getAlertChatId(context));
+
+        // Новый выбор тревожного адресата без обхода сервиса.
+        assertEquals(CredentialStore.Status.READY, Credentials.get(context)
+                .setAlertChatIdAsync(-999,
+                        com.example.xdrip2vk.core.Fingerprint.of("SYNTH_TOKEN_B"))
+                .get(10, TimeUnit.SECONDS).status);
+
+        bareDrain(s2);
+        assertEquals("user:2", prefs.getString(LAST_SENDER, ""));
+        assertEquals("тревожный адресат сохранён", -999,
+                CredHelper.getAlertChatId(context));
+        s2.onDestroy();
+    }
+
+    /**
+     * commit=false с изменённым кешем: snapshot читает новые значения,
+     * но commit не подтверждён. Восстановление и новый выбор не теряются.
+     */
+    @Test
+    public void dirtyCacheCommitFalseThenSelectionSurvives() throws Exception {
+        CredHelper.setToken(context, "SYNTH_TOKEN_A");
+        CredHelper.setChatId(context, 777);
+        VkSenderService s = startService();
+        s.onStartCommand(autoUpdate(120, System.currentTimeMillis() - 60_000), 0, 1);
+        idle(s);
+        assertEquals(1, sends.size());
+        s.onDestroy();
+
+        CredHelper.setToken(context, "SYNTH_TOKEN_B");
+        VkSenderService.identityVerifierOverride =
+                token -> token.equals("SYNTH_TOKEN_B") ? "user:2" : "user:1";
+        CredHelper.HookedBackend hb = new CredHelper.HookedBackend(
+                new AndroidCredentialBackend(context,
+                        c -> CredHelper.enc(context)));
+        AtomicBoolean failing = new AtomicBoolean(true);
+        hb.putOverride = (t, c, a, st) -> {
+            if (failing.get()) {
+                // Кеш изменён, commit()=false: грязный кеш не подтверждён.
+                CredHelper.enc(context).edit()
+                        .putString("vk_token", t)
+                        .putLong("vk_chat_id", c)
+                        .putLong("alert_chat_id", a)
+                        .putString("cred_service_state", st)
+                        .apply();
+                return false;
+            }
+            return hb.d.putCredentials(t, c, a, st);
+        };
+        CredentialStore.resetCoordinatorForTest(hb);
+        Credentials.resetForTest();
+        Credentials.backendForTest = hb;
+        Credentials.permitMainBlockingForTest = true;
+
+        sends.clear();
+        VkSenderService s2 = startService();
+        s2.onStartCommand(autoUpdate(121, System.currentTimeMillis() - 30_000), 0, 2);
+        idle(s2);
+        assertTrue(sends.isEmpty());
+        assertEquals("user:1", prefs.getString(LAST_SENDER, ""));
+
+        // Восстановление: pending повторяет реальный commit.
+        failing.set(false);
+        assertEquals(CredentialStore.Status.READY, Credentials.get(context)
+                .resolveAsync().get(10, TimeUnit.SECONDS).status);
+
+        assertEquals(CredentialStore.Status.READY, Credentials.get(context)
+                .setChatIdAsync(888,
+                        com.example.xdrip2vk.core.Fingerprint.of("SYNTH_TOKEN_B"))
+                .get(10, TimeUnit.SECONDS).status);
+
+        s2.onStartCommand(autoUpdate(122, System.currentTimeMillis()), 0, 4);
+        idle(s2);
+        assertEquals("user:2", prefs.getString(LAST_SENDER, ""));
+        assertEquals(888, CredHelper.getChatId(context));
+        assertEquals(1, sends.size());
+        assertTrue(sends.get(0).startsWith("888|"));
+        s2.onDestroy();
+    }
+
+    /**
+     * «Новый процесс» (CredHelper.recreate — координатор и pending
+     * потеряны) после подтверждённого сброса и нового выбора, но до
+     * завершения перехода: адресаты сохранены, переход завершается.
+     */
+    @Test
+    public void recreatedServiceKeepsSelectionAfterConfirmedReset() throws Exception {
+        CredHelper.setToken(context, "SYNTH_TOKEN_A");
+        CredHelper.setChatId(context, 777);
+        VkSenderService s = startService();
+        s.onStartCommand(autoUpdate(120, System.currentTimeMillis() - 60_000), 0, 1);
+        idle(s);
+        assertEquals(1, sends.size());
+        s.onDestroy();
+
+        CredHelper.setToken(context, "SYNTH_TOKEN_B");
+        VkSenderService.identityVerifierOverride =
+                token -> token.equals("SYNTH_TOKEN_B") ? "user:2" : "user:1";
+        AtomicBoolean failing = new AtomicBoolean(true);
+        installFailingPutBackend(failing);
+
+        sends.clear();
+        VkSenderService s2 = startService();
+        s2.onStartCommand(autoUpdate(121, System.currentTimeMillis() - 30_000), 0, 2);
+        idle(s2);
+        assertTrue(sends.isEmpty());
+        s2.onDestroy();
+
+        failing.set(false);
+        assertEquals(CredentialStore.Status.READY, Credentials.get(context)
+                .resolveAsync().get(10, TimeUnit.SECONDS).status);
+        assertEquals(CredentialStore.Status.READY, Credentials.get(context)
+                .setChatIdAsync(888,
+                        com.example.xdrip2vk.core.Fingerprint.of("SYNTH_TOKEN_B"))
+                .get(10, TimeUnit.SECONDS).status);
+
+        // Настоящий «новый процесс»: координатор и pending сброшены,
+        // файлы и маркер перехода сохранены.
+        CredHelper.recreate(context);
+        VkSenderService s3 = startService();
+        bareDrain(s3);
+
+        assertEquals("user:2", prefs.getString(LAST_SENDER, ""));
+        assertEquals("выбор пережил пересоздание сервиса", 888,
+                CredHelper.getChatId(context));
+        s3.onStartCommand(autoUpdate(122, System.currentTimeMillis()), 0, 4);
+        idle(s3);
+        assertEquals(1, sends.size());
+        assertTrue(sends.get(0).startsWith("888|"));
+        s3.onDestroy();
+    }
+
+    /**
+     * «Новый процесс» с НЕподтверждённым сбросом (pending потерян, диск
+     * хранит старые адресаты): условный сброс по маркеру реально очищает
+     * унаследованные поля и завершает переход.
+     */
+    @Test
+    public void inheritedChatsClearedAfterRecreation() throws Exception {
+        CredHelper.setToken(context, "SYNTH_TOKEN_A");
+        CredHelper.setChatId(context, 777);
+        CredHelper.setAlertChatId(context, -555);
+        VkSenderService s = startService();
+        s.onStartCommand(autoUpdate(120, System.currentTimeMillis() - 60_000), 0, 1);
+        idle(s);
+        assertEquals(1, sends.size());
+        s.onDestroy();
+
+        CredHelper.setToken(context, "SYNTH_TOKEN_B");
+        VkSenderService.identityVerifierOverride =
+                token -> token.equals("SYNTH_TOKEN_B") ? "user:2" : "user:1";
+        AtomicBoolean failing = new AtomicBoolean(true);
+        installFailingPutBackend(failing);
+
+        sends.clear();
+        VkSenderService s2 = startService();
+        s2.onStartCommand(autoUpdate(121, System.currentTimeMillis() - 30_000), 0, 2);
+        idle(s2);
+        assertTrue(sends.isEmpty());
+        s2.onDestroy();
+
+        // Новый процесс без восстановления записи: pending потерян, диск
+        // хранит унаследованные 777/-555, маркер перехода сохранён.
+        // Подменяемый backend заменяется на обычный — запись работает.
+        CredHelper.recreate(context);
+        VkSenderService s3 = startService();
+        bareDrain(s3);
+
+        assertEquals("user:2", prefs.getString(LAST_SENDER, ""));
+        assertEquals("унаследованный чат сброшен", 0,
+                CredHelper.getChatId(context));
+        assertEquals("унаследованный alert сброшен", 0,
+                CredHelper.getAlertChatId(context));
+        assertTrue(sends.isEmpty());
+        s3.onDestroy();
+    }
+
+    /**
+     * Реальная замена токена ВО ВРЕМЯ удержанной операции восстановления:
+     * latch внутри commit сброса версии B, настоящий setTokenAsync(C)
+     * ждёт в очереди координатора, latch освобождается. Устаревший
+     * переход B не фиксирует LAST_SENDER и не затрагивает версию C;
+     * переход выполняется заново под подтверждённым владельцем C.
+     */
+    @Test
+    public void tokenReplacedWhileResetHeldKeepsNewVersion() throws Exception {
+        CredHelper.setToken(context, "SYNTH_TOKEN_A");
+        CredHelper.setChatId(context, 777);
+        VkSenderService s = startService();
+        s.onStartCommand(autoUpdate(120, System.currentTimeMillis() - 60_000), 0, 1);
+        idle(s);
+        assertEquals(1, sends.size());
+        s.onDestroy();
+
+        CredHelper.setToken(context, "SYNTH_TOKEN_B");
+        // Для C личность подтверждается только после allowC: иначе drain,
+        // продолжившийся после освобождения put, сам бы завершил переход
+        // до наших проверок.
+        final AtomicBoolean allowC = new AtomicBoolean(false);
+        VkSenderService.identityVerifierOverride = token ->
+                token.equals("SYNTH_TOKEN_B") ? "user:2"
+                        : (token.equals("SYNTH_TOKEN_C") && allowC.get())
+                                ? "user:3" : null;
+
+        final CountDownLatch putEntered = new CountDownLatch(1);
+        final CountDownLatch putRelease = new CountDownLatch(1);
+        final AtomicBoolean once = new AtomicBoolean(true);
+        CredHelper.HookedBackend hb = new CredHelper.HookedBackend(
+                new AndroidCredentialBackend(context,
+                        c -> CredHelper.enc(context)));
+        final AtomicBoolean heldUntilRelease = new AtomicBoolean(false);
+        hb.putOverride = (t, c, a, st) -> {
+            if (once.getAndSet(false)) {
+                putEntered.countDown();
+                try {
+                    heldUntilRelease.set(
+                            putRelease.await(60, TimeUnit.SECONDS));
+                } catch (InterruptedException e) {
+                    Thread.currentThread().interrupt();
+                }
+            }
+            return hb.d.putCredentials(t, c, a, st);
+        };
+        CredentialStore.resetCoordinatorForTest(hb);
+        Credentials.resetForTest();
+        Credentials.backendForTest = hb;
+        Credentials.permitMainBlockingForTest = true;
+
+        sends.clear();
+        VkSenderService s2 = startService();
+        s2.onStartCommand(autoUpdate(121, System.currentTimeMillis() - 30_000), 0, 2);
+        // Drain на отдельном потоке: операция сброса встанет внутри put.
+        Thread pump = new Thread(
+                () -> Shadows.shadowOf(s2.workerLooperForTest()).idle());
+        pump.start();
+        assertTrue("операция сброса удержана внутри commit",
+                putEntered.await(10, TimeUnit.SECONDS));
+
+        // Замена токена во время удержанной операции: команда ставится
+        // за удержанной операцией в том же координаторе.
+        Future<CredentialStore.Resolution> fC =
+                Credentials.get(context).setTokenAsync("SYNTH_TOKEN_C");
+        putRelease.countDown();
+        assertEquals(CredentialStore.Status.READY,
+                fC.get(10, TimeUnit.SECONDS).status);
+        pump.join(15_000);
+        Credentials.get(context).awaitPublishIdleForTest();
+        assertTrue("операция была удержана до замены токена",
+                heldUntilRelease.get());
+
+        // Устаревший переход B не применён к новой версии.
+        assertEquals("устаревший переход не зафиксировал LAST_SENDER",
+                "user:1", prefs.getString(LAST_SENDER, ""));
+        assertEquals("SYNTH_TOKEN_C", CredHelper.getToken(context));
+        assertTrue("чат 777 не ушёл устаревшему переходу",
+                sends.isEmpty());
+
+        // Переход заново под подтверждённым владельцем C.
+        allowC.set(true);
+        bareDrain(s2);
+        assertEquals("user:3", prefs.getString(LAST_SENDER, ""));
+        assertEquals(0, CredHelper.getChatId(context));
+        assertEquals("SYNTH_TOKEN_C", CredHelper.getToken(context));
+        s2.onDestroy();
+    }
+
+    /**
+     * После завершения перехода повторные обходы не выполняют ни одной
+     * записи сброса: ни одного putCredentials не вызывается.
+     */
+    @Test
+    public void completedTransitionIssuesNoResetWrites() throws Exception {
+        // Переход уже завершён: B/user:2, чат 888 выбран под этой версией.
+        CredHelper.setToken(context, "SYNTH_TOKEN_B");
+        CredHelper.setChatId(context, 888);
+        prefs.edit()
+                .putString(CONFIRMED_SENDER, "user:2")
+                .putString(CONFIRMED_SENDER_FP,
+                        com.example.xdrip2vk.core.Fingerprint.of("SYNTH_TOKEN_B"))
+                .putString(LAST_SENDER, "user:2")
+                .commit();
+        VkSenderService.identityVerifierOverride =
+                token -> token.equals("SYNTH_TOKEN_B") ? "user:2" : "user:1";
+        final AtomicInteger puts = new AtomicInteger();
+        CredHelper.HookedBackend hb = new CredHelper.HookedBackend(
+                new AndroidCredentialBackend(context,
+                        c -> CredHelper.enc(context)));
+        hb.putOverride = (t, c, a, st) -> {
+            puts.incrementAndGet();
+            return hb.d.putCredentials(t, c, a, st);
+        };
+        CredentialStore.resetCoordinatorForTest(hb);
+        Credentials.resetForTest();
+        Credentials.backendForTest = hb;
+        Credentials.permitMainBlockingForTest = true;
+
+        sends.clear();
+        VkSenderService s = startService();
+        bareDrain(s);
+        bareDrain(s);
+        s.onStartCommand(autoUpdate(122, System.currentTimeMillis()), 0, 4);
+        idle(s);
+        bareDrain(s);
+
+        assertEquals("ни одной записи реквизитов после завершения",
+                0, puts.get());
+        assertEquals(888, CredHelper.getChatId(context));
+        assertEquals(1, sends.size());
+        assertTrue(sends.get(0).startsWith("888|"));
+        s.onDestroy();
     }
 }

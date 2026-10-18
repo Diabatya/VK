@@ -200,6 +200,26 @@ public final class CredentialStore implements AutoCloseable {
     }
 
     /**
+     * Условный сброс унаследованных адресатов (2Г.4Б.1): обнуляет только
+     * те поля, которые до сих пор равны oldChatId/oldAlertChatId — то есть
+     * не были перезаписаны явным новым выбором после начала перехода
+     * владельца. Поля, отличающиеся от записанных старых значений,
+     * сохраняются. Если унаследованных значений уже нет — READY без
+     * записи: текущее состояние диска само подтверждено чтением.
+     * fingerprint обязателен: команда не применяется к другой версии
+     * токена (STALE_TOKEN без записи).
+     */
+    public synchronized Future<Resolution> clearInheritedChatIdsAsync(
+            String expectedTokenFingerprint,
+            long oldChatId, long oldAlertChatId) {
+        if (closed) {
+            throw new IllegalStateException("credential store closed");
+        }
+        return coord.submit(() -> doClearInherited(
+                expectedTokenFingerprint, oldChatId, oldAlertChatId));
+    }
+
+    /**
      * Закрытие handle: идемпотентно и потокобезопасно; состояние
      * координатора сохраняется, общий worker продолжает поставленные
      * задачи — выполняющийся commit не прерывается.
@@ -631,6 +651,54 @@ public final class CredentialStore implements AutoCloseable {
                 ? alertChatId : enc.effectiveAlertChatId();
         return startSave(snap, meta,
                 plan(enc.token.string, chat, alert));
+    }
+
+    /**
+     * Условный сброс адресатов перехода владельца: те же проверки, что у
+     * doUpdateFields, но обнуляется только поле, до сих пор равное
+     * записанному старому значению. Старые адресаты не становятся
+     * адресатами нового владельца, а явно выбранные после начала
+     * перехода — не стираются повторным сбросом.
+     */
+    private Resolution doClearInherited(String expectedFingerprint,
+                                        long oldChatId,
+                                        long oldAlertChatId) {
+        Source[] snap = snapshots();
+        PendingOp op = coord.pending;
+        if (op != null) {
+            return incompleteFor(op);
+        }
+        ServiceState meta = serviceState(Role.ENCRYPTED);
+        if (meta == ServiceState.INVALID) {
+            return new Resolution(Status.BLOCKED,
+                    Reason.SERVICE_STATE_INVALID, Pending.NONE, "", 0, 0);
+        }
+        if (meta == ServiceState.DELETED) {
+            return deleted(Pending.NONE); // без токена выбора нет
+        }
+        Outcome o = check(snap);
+        if (o.verdict != Verdict.READY_SECURED) {
+            Status st = o.verdict == Verdict.EMPTY
+                    ? Status.EMPTY : Status.BLOCKED;
+            return new Resolution(st, o.reason, Pending.NONE, "", 0, 0);
+        }
+        Source enc = sourceOf(snap, Role.ENCRYPTED);
+        if (!Fingerprint.of(enc.token.string).equals(expectedFingerprint)) {
+            // Список загружался другим токеном — данные устарели.
+            return new Resolution(Status.BLOCKED, Reason.STALE_TOKEN,
+                    Pending.NONE, "", 0, 0);
+        }
+        long curChat = enc.effectiveChatId();
+        long curAlert = enc.effectiveAlertChatId();
+        long chat = curChat == oldChatId ? 0 : curChat;
+        long alert = curAlert == oldAlertChatId ? 0 : curAlert;
+        if (chat == curChat && alert == curAlert) {
+            // Унаследованных значений на диске уже нет — подтверждённое
+            // состояние, повторная запись не нужна.
+            return new Resolution(Status.READY, Reason.NONE, Pending.NONE,
+                    enc.token.string, curChat, curAlert);
+        }
+        return startSave(snap, meta, plan(enc.token.string, chat, alert));
     }
 
     private Resolution incompleteFor(PendingOp op) {

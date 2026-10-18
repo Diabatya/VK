@@ -430,6 +430,20 @@ public final class Credentials {
     }
 
     /**
+     * Условный сброс унаследованных адресатов перехода владельца
+     * (2Г.4Б.1): обнуляет только поля, до сих пор равные oldChatId/
+     * oldAlertChatId; явно выбранные после начала перехода адресаты
+     * сохраняются. READY команды означает: на диске для этой версии
+     * токена записанных старых адресатов не осталось.
+     */
+    public Future<Resolution> clearInheritedChatIdsAsync(
+            String expectedTokenFingerprint,
+            long oldChatId, long oldAlertChatId) {
+        return issue(true, () -> store.clearInheritedChatIdsAsync(
+                expectedTokenFingerprint, oldChatId, oldAlertChatId)).future;
+    }
+
+    /**
      * Команда записи; callback получает исход ИМЕННО этой команды
      * ({@link CommandResult}) на главном потоке.
      */
