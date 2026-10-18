@@ -71,6 +71,7 @@ public class CredentialStoreTest {
         final java.util.Set<Integer> failReadOn = new java.util.HashSet<>();
         int writeCalls, clearCalls;
         final AtomicInteger snapshots = new AtomicInteger();
+        int snapshotTrigger = -1;   // номер вызова snapshot для onNthSnapshot
         Runnable onNthSnapshot;
         volatile String threadName;
         // Удержание записи для тестов передачи worker без sleep.
@@ -154,8 +155,8 @@ public class CredentialStoreTest {
                 throw new RuntimeException("snapshot failed");
             }
             int n = snapshots.incrementAndGet();
-            if (onNthSnapshot != null && n == 4) {
-                onNthSnapshot.run(); // изменение до перепроверки очистки
+            if (onNthSnapshot != null && n == snapshotTrigger) {
+                onNthSnapshot.run(); // изменение до перепроверки/проверки
             }
             if (readState.get(role) != Read.READABLE
                     || failReadOn.contains(n)) {
@@ -386,6 +387,7 @@ public class CredentialStoreTest {
         // операция блокируется до новой проверки.
         FakeBackend b = new FakeBackend();
         b.seed(Role.PLAIN, T_A, 5L, null);
+        b.snapshotTrigger = 4; // перепроверка PLAIN в clearOnce
         b.onNthSnapshot = () -> {
             b.cache.get(Role.PLAIN).put("token", V.str(T_B));
             b.disk.get(Role.PLAIN).put("token", V.str(T_B));
@@ -919,6 +921,200 @@ public class CredentialStoreTest {
             fail("ожидался отказ после close");
         } catch (IllegalStateException expected) {
         }
+    }
+
+    // --- регрессии 2Г.3Б.3: подтверждённое назначение перед очисткой ---
+
+    @Test
+    public void vanishedDestinationKeepsLegacyCopy() throws Exception {
+        // Точное воспроизведение: запись ок, очистка plain commit=false,
+        // затем encrypted исчез из кеша и диска. Удалять последнюю копию
+        // plain нельзя.
+        FakeBackend b = new FakeBackend();
+        b.seed(Role.PLAIN, T_A, 5L, null);
+        b.failClearOn.add(1);
+        CredentialStore store = new CredentialStore(b);
+        try {
+            assertEquals(Status.INCOMPLETE, await(store).status);
+            // Назначение исчезло из кеша и диска.
+            b.cache.get(Role.ENCRYPTED).clear();
+            b.disk.get(Role.ENCRYPTED).clear();
+
+            Resolution r = await(store);
+            assertEquals(Status.INCOMPLETE, r.status);
+            assertEquals(Reason.DESTINATION_MISMATCH, r.reason);
+            assertEquals(T_A, b.disk.get(Role.PLAIN).get("token").s);
+            assertEquals(1, b.clearCalls); // повторный remove не выполнялся
+        } finally {
+            store.close();
+        }
+    }
+
+    @Test
+    public void destinationVanishedBeforeFirstClear() throws Exception {
+        FakeBackend b = new FakeBackend();
+        b.seed(Role.PLAIN, T_A, 5L, null);
+        b.snapshotTrigger = 5; // проверка назначения в clearOnce
+        b.onNthSnapshot = () -> {
+            b.cache.get(Role.ENCRYPTED).clear();
+            b.disk.get(Role.ENCRYPTED).clear();
+        };
+        CredentialStore store = new CredentialStore(b);
+        try {
+            Resolution r = await(store);
+            assertEquals(Status.INCOMPLETE, r.status);
+            assertEquals(Reason.DESTINATION_MISMATCH, r.reason);
+            assertEquals(0, b.clearCalls);
+            assertEquals(T_A, b.disk.get(Role.PLAIN).get("token").s);
+        } finally {
+            store.close();
+        }
+    }
+
+    @Test
+    public void destinationChangedTokenBlocksClear() throws Exception {
+        FakeBackend b = new FakeBackend();
+        b.seed(Role.PLAIN, T_A, 5L, null);
+        b.snapshotTrigger = 5;
+        b.onNthSnapshot = () -> {
+            b.cache.get(Role.ENCRYPTED).put("token", V.str(T_B));
+            b.disk.get(Role.ENCRYPTED).put("token", V.str(T_B));
+        };
+        Resolution r = await(new CredentialStore(b));
+        assertEquals(Status.INCOMPLETE, r.status);
+        assertEquals(Reason.DESTINATION_MISMATCH, r.reason);
+        assertEquals(0, b.clearCalls);
+        assertEquals(T_B, b.disk.get(Role.ENCRYPTED).get("token").s);
+        assertEquals(T_A, b.disk.get(Role.PLAIN).get("token").s);
+    }
+
+    @Test
+    public void destinationChangedChatIdBlocksClear() throws Exception {
+        FakeBackend b = new FakeBackend();
+        b.seed(Role.PLAIN, T_A, 5L, null);
+        b.snapshotTrigger = 5;
+        b.onNthSnapshot = () -> {
+            b.cache.get(Role.ENCRYPTED).put("chat", V.num(9L));
+            b.disk.get(Role.ENCRYPTED).put("chat", V.num(9L));
+        };
+        Resolution r = await(new CredentialStore(b));
+        assertEquals(Status.INCOMPLETE, r.status);
+        assertEquals(Reason.DESTINATION_MISMATCH, r.reason);
+        assertEquals(0, b.clearCalls);
+    }
+
+    @Test
+    public void destinationChangedAlertBlocksClear() throws Exception {
+        FakeBackend b = new FakeBackend();
+        b.seed(Role.PLAIN, T_A, 5L, -2L);
+        b.snapshotTrigger = 5;
+        b.onNthSnapshot = () -> {
+            b.cache.get(Role.ENCRYPTED).put("alert", V.num(-7L));
+            b.disk.get(Role.ENCRYPTED).put("alert", V.num(-7L));
+        };
+        Resolution r = await(new CredentialStore(b));
+        assertEquals(Status.INCOMPLETE, r.status);
+        assertEquals(Reason.DESTINATION_MISMATCH, r.reason);
+        assertEquals(0, b.clearCalls);
+    }
+
+    @Test
+    public void destinationUnreadableBlocksClear() throws Exception {
+        FakeBackend b = new FakeBackend();
+        b.seed(Role.PLAIN, T_A, 5L, null);
+        b.failReadOn.add(5); // снимок назначения перед очисткой
+        Resolution r = await(new CredentialStore(b));
+        assertEquals(Status.INCOMPLETE, r.status);
+        assertEquals(Reason.SOURCE_UNAVAILABLE, r.reason);
+        assertEquals(Pending.UNREADABLE, r.pending);
+        assertEquals(0, b.clearCalls);
+        assertEquals(T_A, b.disk.get(Role.PLAIN).get("token").s);
+    }
+
+    @Test
+    public void destinationChangedBetweenPlainAndDefaultClear()
+            throws Exception {
+        // Копии в трёх источниках: PLAIN очищен, перед очисткой DEFAULT
+        // назначение исчезло — default не удалён.
+        FakeBackend b = new FakeBackend();
+        b.seed(Role.ENCRYPTED, T_A, 5L, null);
+        b.seed(Role.PLAIN, T_A, 5L, null);
+        b.seed(Role.DEFAULT, T_A, 5L, null);
+        // clearOnce(DEFAULT): снимок default=#6, проверка назначения=#7
+        b.snapshotTrigger = 7;
+        b.onNthSnapshot = () -> {
+            b.cache.get(Role.ENCRYPTED).clear();
+            b.disk.get(Role.ENCRYPTED).clear();
+        };
+        Resolution r = await(new CredentialStore(b));
+        assertEquals(Status.INCOMPLETE, r.status);
+        assertEquals(Reason.DESTINATION_MISMATCH, r.reason);
+        assertTrue(b.disk.get(Role.PLAIN).isEmpty());      // уже подтверждено
+        assertEquals(T_A, b.disk.get(Role.DEFAULT).get("token").s); // цел
+    }
+
+    @Test
+    public void alreadyEncryptedVanishedBlocksClear() throws Exception {
+        // Дедупликация без новой записи: исчезнувшая копия не основание.
+        FakeBackend b = new FakeBackend();
+        b.seed(Role.ENCRYPTED, T_A, 5L, null);
+        b.seed(Role.PLAIN, T_A, 5L, null);
+        b.snapshotTrigger = 5; // проверка назначения в clearOnce
+        b.onNthSnapshot = () -> {
+            b.cache.get(Role.ENCRYPTED).clear();
+            b.disk.get(Role.ENCRYPTED).clear();
+        };
+        Resolution r = await(new CredentialStore(b));
+        assertEquals(Status.INCOMPLETE, r.status);
+        assertEquals(Reason.DESTINATION_MISMATCH, r.reason);
+        assertEquals(0, b.clearCalls);
+        assertEquals(T_A, b.disk.get(Role.PLAIN).get("token").s);
+    }
+
+    @Test
+    public void alreadyEncryptedUnreadableBlocksClear() throws Exception {
+        FakeBackend b = new FakeBackend();
+        b.seed(Role.ENCRYPTED, T_A, 5L, null);
+        b.seed(Role.PLAIN, T_A, 5L, null);
+        b.failReadOn.add(5); // проверка назначения недоступна
+        Resolution r = await(new CredentialStore(b));
+        assertEquals(Status.INCOMPLETE, r.status);
+        assertEquals(Pending.UNREADABLE, r.pending);
+        assertEquals(0, b.clearCalls);
+    }
+
+    @Test
+    public void differentValidTokenBeforeFinishIsNotReady() throws Exception {
+        // После успешной записи+очистки перед finish появился другой
+        // корректный encrypted-токен: READY с ним не возвращаем.
+        FakeBackend b = new FakeBackend();
+        b.seed(Role.PLAIN, T_A, 5L, null);
+        b.snapshotTrigger = 6; // снимок enc в finish
+        b.onNthSnapshot = () -> {
+            b.cache.get(Role.ENCRYPTED).put("token", V.str(T_B));
+            b.disk.get(Role.ENCRYPTED).put("token", V.str(T_B));
+        };
+        CredentialStore store = new CredentialStore(b);
+        try {
+            Resolution r = await(store);
+            assertEquals(Status.INCOMPLETE, r.status);
+            assertEquals(Reason.DESTINATION_MISMATCH, r.reason);
+            assertFalse(r.sendPermitted());
+            assertNotEquals(T_B, r.token);
+        } finally {
+            store.close();
+        }
+    }
+
+    @Test
+    public void unchangedDestinationCompletesMigration() throws Exception {
+        // Назначение подтверждено и неизменно — операция завершается.
+        FakeBackend b = new FakeBackend();
+        b.seed(Role.PLAIN, T_A, 5L, null);
+        Resolution r = await(new CredentialStore(b));
+        assertEquals(Status.READY, r.status);
+        assertEquals(T_A, r.token);
+        assertTrue(b.disk.get(Role.PLAIN).isEmpty());
     }
 
     @Test

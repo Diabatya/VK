@@ -170,6 +170,9 @@ public final class CredentialStore implements AutoCloseable {
         }
         PendingOp op = new PendingOp(snap, plan);
         op.pendingClears.addAll(plan.clearSources); // всё плановое — долг
+        // Однозначная существующая encrypted-копия = подтверждённое назначение.
+        op.destinationConfirmed =
+                !plan.token.isEmpty() && plan.alreadyEncrypted;
         coord.pending = op;
 
         if (!plan.token.isEmpty() && !plan.alreadyEncrypted) {
@@ -178,6 +181,7 @@ public final class CredentialStore implements AutoCloseable {
                 return new Resolution(Status.INCOMPLETE, o.reason,
                         Pending.DESTINATION_WRITE, "", 0, 0);
             }
+            op.destinationConfirmed = true;
         }
         for (Role role : new ArrayList<>(op.pendingClears)) {
             Resolution r = clearOnce(op, role, o.reason);
@@ -215,10 +219,16 @@ public final class CredentialStore implements AutoCloseable {
                     return changed();
                 }
             } else if (role == Role.ENCRYPTED) {
-                // Назначение: исходное состояние или значения нашего плана
-                // (неподтверждённая запись могла остаться в кеше).
-                if (!sameCredentials(stored, cur)
+                if (op.plan != null && !op.plan.token.isEmpty()
+                        && op.destinationConfirmed) {
+                    // Подтверждённое назначение: исходное пустое состояние
+                    // больше недопустимо — только ожидаемые реквизиты.
+                    if (!matchesPlan(cur, op.plan)) {
+                        return destinationMismatch();
+                    }
+                } else if (!sameCredentials(stored, cur)
                         && !matchesPlan(cur, op.plan)) {
+                    // Неподтверждённая запись: исходник или наш грязный кеш.
                     return changed();
                 }
             } else if (!sameCredentials(stored, cur)) {
@@ -232,6 +242,7 @@ public final class CredentialStore implements AutoCloseable {
                         Pending.DESTINATION_WRITE, "", 0, 0);
             }
             op.destinationUnconfirmed = false;
+            op.destinationConfirmed = true;
         }
         for (Role role : new ArrayList<>(op.pendingClears)) {
             Resolution r = clearOnce(op, role, Reason.NONE);
@@ -249,6 +260,40 @@ public final class CredentialStore implements AutoCloseable {
         // операция останавливается, состояние сохраняется.
         return new Resolution(Status.INCOMPLETE, Reason.NONE,
                 Pending.SOURCE_CHANGED, "", 0, 0);
+    }
+
+    private Resolution destinationMismatch() {
+        // Назначение исчезло или изменилось после подтверждения: очистку
+        // не продолжать, старым планом не восстанавливать — это может
+        // быть отдельное изменение. PendingOp сохраняется.
+        return new Resolution(Status.INCOMPLETE, Reason.DESTINATION_MISMATCH,
+                Pending.SOURCE_CHANGED, "", 0, 0);
+    }
+
+    /**
+     * Проверка назначения перед КАЖДОЙ очисткой legacy для плана с
+     * непустым токеном: подтверждено, читаемо, типы корректны и
+     * реквизиты совпадают с ожидаемыми. Это дополнительная проверка —
+     * она не заменяет commit и не делает грязный кеш подтверждённым.
+     */
+    private Resolution checkDestination(PendingOp op) {
+        Plan plan = op.plan;
+        if (plan == null || plan.token.isEmpty()) {
+            return null;
+        }
+        if (!op.destinationConfirmed) {
+            return new Resolution(Status.INCOMPLETE, Reason.NONE,
+                    Pending.DESTINATION_WRITE, "", 0, 0);
+        }
+        Source enc = backendSnapshotSafe(Role.ENCRYPTED);
+        Resolution bad = unreadable(enc, Pending.UNREADABLE);
+        if (bad != null) {
+            return bad;
+        }
+        if (!matchesPlan(enc, plan)) {
+            return destinationMismatch();
+        }
+        return null;
     }
 
     /**
@@ -288,6 +333,12 @@ public final class CredentialStore implements AutoCloseable {
         if (!sameCredentials(stored, cur) && hasCredentials(cur)) {
             return changed();
         }
+        // Назначение проверяется перед каждой очисткой: если оно исчезло,
+        // удаление legacy уничтожило бы последнюю копию токена.
+        Resolution dest = checkDestination(op);
+        if (dest != null) {
+            return dest;
+        }
         if (!remove(role)) {
             return new Resolution(Status.INCOMPLETE, reason,
                     Pending.SOURCE_CLEAR, "", 0, 0);
@@ -300,6 +351,12 @@ public final class CredentialStore implements AutoCloseable {
         Outcome after = CredentialAudit.check(enc,
                 snapshot(Role.PLAIN), snapshot(Role.DEFAULT));
         if (after.verdict == Verdict.READY_SECURED) {
+            // READY только с реквизитами именно этой операции: иной
+            // появившийся encrypted-токен результатом не признаём.
+            if (plan != null && !plan.token.isEmpty()
+                    && !matchesPlan(enc, plan)) {
+                return destinationMismatch();
+            }
             coord.pending = null;
             return new Resolution(Status.READY, after.reason, Pending.NONE,
                     enc.token.string, enc.effectiveChatId(),

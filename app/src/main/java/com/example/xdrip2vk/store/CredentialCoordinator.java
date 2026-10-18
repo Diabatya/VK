@@ -44,6 +44,13 @@ final class CredentialCoordinator {
         final Plan plan;
         /** Запись назначения не подтверждена — кеш не доказательство. */
         boolean destinationUnconfirmed;
+        /**
+         * Назначение подтверждено: commit записи завершился true либо это
+         * ранее существовавшая однозначная encrypted-копия. После этого
+         * исходное пустое состояние назначения больше не допустимо:
+         * до каждой очистки оно обязано читаться и совпадать с планом.
+         */
+        boolean destinationConfirmed;
         /** Очистка не подтверждена commit — обязан повторить реально. */
         final Set<Role> pendingClears = EnumSet.noneOf(Role.class);
         /** Очистка подтверждена — источник обязан оставаться пустым. */
