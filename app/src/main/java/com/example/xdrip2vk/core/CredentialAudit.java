@@ -5,11 +5,19 @@ import java.util.List;
 import java.util.Objects;
 
 /**
- * Ядро проверки сохранённых реквизитов трёх источников (задание 2Г.3А).
+ * Ядро проверки сохранённых реквизитов трёх источников (задание 2Г.3А.1).
  * Чистая Java без Android: получает неизменяемые снимки encrypted
  * (secure_tokens), plain (secure_tokens_plain) и default (legacy-ключи
  * общих настроек). Не открывает файлы, не обращается к Keystore, не пишет
  * настройки, не удаляет ключи и не делает сетевых запросов.
+ *
+ * Источник определяется только его {@link Role}: check принимает три
+ * снимка в любом порядке и требует ровно по одному ENCRYPTED, PLAIN и
+ * DEFAULT — иначе блокирующий INVALID_INPUT.
+ *
+ * Тип значения фиксирован записью: токен допускает только строку или
+ * отсутствие, адресаты — только long или отсутствие. Числовой токен,
+ * строковый (в т.ч. пустой) адресат и WRONG_TYPE → CORRUPT.
  *
  * Право использовать токен для отправки даёт только {@link Verdict#READY_SECURED}.
  * MIGRATION_REQUIRED возвращает план для будущего исполнителя — данные плана
@@ -28,7 +36,7 @@ public final class CredentialAudit {
         READABLE, UNAVAILABLE, CORRUPT
     }
 
-    /** Роль источника в модели хранения. */
+    /** Роль источника в модели хранения — единственное основание выбора. */
     public enum Role {
         ENCRYPTED, PLAIN, DEFAULT
     }
@@ -41,7 +49,7 @@ public final class CredentialAudit {
         READY_SECURED,
         /** Однозначные legacy-данные/одинаковые копии — нужен перенос/очистка. */
         MIGRATION_REQUIRED,
-        /** Значения расходятся или происхождение неоднозначно. */
+        /** Значения расходятся или происхождение/структура неоднозначны. */
         CONFLICT,
         /** Необходимый источник недоступен — достоверного решения нет. */
         UNAVAILABLE,
@@ -52,6 +60,8 @@ public final class CredentialAudit {
     /** Фиксированные коды причин — без исходных значений. */
     public enum Reason {
         NONE,
+        /** Нарушена структура входа: null или дубль/пропуск роли. */
+        INVALID_INPUT,
         /** Ни один источник не содержит ключей реквизитов. */
         NO_CREDENTIALS,
         /** Токен+адресаты только в encrypted. */
@@ -60,13 +70,13 @@ public final class CredentialAudit {
         LEGACY_ONLY,
         /** Одинаковые реквизиты в нескольких источниках — дедупликация. */
         DUPLICATE_COPIES,
-        /** Адресаты без токена — очистка осиротевших ключей. */
+        /** Ключи-остатки без непустого токена — очистка. */
         ORPHAN_ADDRESSES,
         /** Encrypted недоступен — legacy не выбирается для отправки. */
         ENCRYPTED_UNAVAILABLE,
         /** Plain/default недоступен — однозначность не доказана. */
         SOURCE_UNAVAILABLE,
-        /** Источник повреждён (чтение или тип значения). */
+        /** Источник повреждён (чтение или тип значения поля). */
         SOURCE_CORRUPT,
         /** Разные непустые токены. */
         TOKEN_MISMATCH,
@@ -80,10 +90,15 @@ public final class CredentialAudit {
 
     /** Одно значение ключа в снимке источника. */
     public static final class Entry {
+        /** Тип записи значения — отдельно от значения и от Kind. */
+        public enum Type {
+            NONE, STRING, NUMBER
+        }
+
         public enum Kind {
             /** Ключа нет. */
             ABSENT,
-            /** Ключ есть, значение — пустая строка (только для токена). */
+            /** Ключ есть, значение — пустая строка (допустимо только у токена). */
             EMPTY,
             /** Ключ есть, значение присутствует. */
             PRESENT,
@@ -92,40 +107,43 @@ public final class CredentialAudit {
         }
 
         public final Kind kind;
-        /** Строковое значение (токен) — только при PRESENT. */
+        /** Заявленный тип значения; тип не выводится из string/number. */
+        public final Type type;
+        /** Строковое значение — только при type=STRING. */
         public final String string;
-        /** Числовое значение (адресат) — только при PRESENT. */
+        /** Числовое значение — только при type=NUMBER. */
         public final long number;
 
-        private Entry(Kind kind, String s, long n) {
+        private Entry(Kind kind, Type type, String s, long n) {
             this.kind = kind;
+            this.type = type;
             this.string = s;
             this.number = n;
         }
 
         public static Entry absent() {
-            return new Entry(Kind.ABSENT, "", 0);
+            return new Entry(Kind.ABSENT, Type.NONE, "", 0);
         }
 
         public static Entry string(String v) {
             String s = v == null ? "" : v.trim(); // нормализация — прежний trim
             if (s.isEmpty()) {
-                return new Entry(Kind.EMPTY, "", 0);
+                return new Entry(Kind.EMPTY, Type.STRING, "", 0);
             }
-            return new Entry(Kind.PRESENT, s, 0);
+            return new Entry(Kind.PRESENT, Type.STRING, s, 0);
         }
 
         public static Entry number(long v) {
-            return new Entry(Kind.PRESENT, "", v);
+            return new Entry(Kind.PRESENT, Type.NUMBER, "", v);
         }
 
         public static Entry wrongType() {
-            return new Entry(Kind.WRONG_TYPE, "", 0);
+            return new Entry(Kind.WRONG_TYPE, Type.NONE, "", 0);
         }
 
         @Override
         public String toString() {
-            return "Entry{" + kind + "}";
+            return "Entry{" + kind + "," + type + "}";
         }
     }
 
@@ -170,10 +188,23 @@ public final class CredentialAudit {
                     || alertChatId.kind != Entry.Kind.ABSENT;
         }
 
-        boolean hasWrongType() {
-            return token.kind == Entry.Kind.WRONG_TYPE
-                    || chatId.kind == Entry.Kind.WRONG_TYPE
-                    || alertChatId.kind == Entry.Kind.WRONG_TYPE;
+        /** Токен: только строка или отсутствие. */
+        private static boolean badToken(Entry e) {
+            return e.kind == Entry.Kind.WRONG_TYPE
+                    || (e.kind != Entry.Kind.ABSENT
+                            && e.type != Entry.Type.STRING);
+        }
+
+        /** Адресат: только long или отсутствие. Пустая строка — повреждение. */
+        private static boolean badAddress(Entry e) {
+            return e.kind == Entry.Kind.WRONG_TYPE
+                    || (e.kind != Entry.Kind.ABSENT
+                            && e.type != Entry.Type.NUMBER);
+        }
+
+        boolean hasFieldTypeMismatch() {
+            return badToken(token) || badAddress(chatId)
+                    || badAddress(alertChatId);
         }
 
         boolean hasAddressWithoutToken() {
@@ -196,8 +227,9 @@ public final class CredentialAudit {
         @Override
         public String toString() {
             return "Source{" + role + "," + read + ",token=" + token.kind
-                    + ",chat=" + chatId.kind + ",alert=" + alertChatId.kind
-                    + "}";
+                    + "/" + token.type + ",chat=" + chatId.kind + "/"
+                    + chatId.type + ",alert=" + alertChatId.kind + "/"
+                    + alertChatId.type + "}";
         }
     }
 
@@ -206,7 +238,10 @@ public final class CredentialAudit {
         public final String token;
         public final long chatId;
         public final long alertChatId;
-        /** Роли источников, подлежащих очистке после подтверждённой записи. */
+        /**
+         * Роли источников, подлежащих очистке после подтверждённой записи.
+         * Без повторов, стабильный порядок ролей: ENCRYPTED, PLAIN, DEFAULT.
+         */
         public final List<Role> clearSources;
         /** true — запись в encrypted не требуется (данные уже там). */
         public final boolean alreadyEncrypted;
@@ -266,17 +301,52 @@ public final class CredentialAudit {
     }
 
     /**
-     * Проверка трёх снимков. Детерминирована: без приоритета обхода —
-     * все комбинации сводятся к одной таблице решений.
+     * Проверка трёх снимков в любом порядке. Сначала структура входа и
+     * разрешение источников по Role, затем содержательная проверка.
      */
-    public static Outcome check(Source enc, Source plain, Source def) {
+    public static Outcome check(Source s1, Source s2, Source s3) {
+        Source enc = null, plain = null, def = null;
+        for (Source s : new Source[]{s1, s2, s3}) {
+            if (s == null || s.role == null || s.read == null) {
+                return new Outcome(Verdict.CONFLICT, Reason.INVALID_INPUT,
+                        null);
+            }
+            switch (s.role) {
+                case ENCRYPTED:
+                    if (enc != null) {
+                        return invalid();
+                    }
+                    enc = s;
+                    break;
+                case PLAIN:
+                    if (plain != null) {
+                        return invalid();
+                    }
+                    plain = s;
+                    break;
+                case DEFAULT:
+                    if (def != null) {
+                        return invalid();
+                    }
+                    def = s;
+                    break;
+                default:
+                    return invalid();
+            }
+        }
+        if (enc == null || plain == null || def == null) {
+            return invalid();
+        }
+
+        // Канонический порядок обхода — по ролям, не по позиции аргумента.
         Source[] all = {enc, plain, def};
 
         // 1. Повреждение: источник с потенциальными реквизитами нельзя
         // подменять другим — никакой подстановки.
         for (Source s : all) {
-            if (s.read == Read.CORRUPT || s.hasWrongType()) {
-                return new Outcome(Verdict.CORRUPT, Reason.SOURCE_CORRUPT, null);
+            if (s.read == Read.CORRUPT || s.hasFieldTypeMismatch()) {
+                return new Outcome(Verdict.CORRUPT, Reason.SOURCE_CORRUPT,
+                        null);
             }
         }
 
@@ -293,20 +363,16 @@ public final class CredentialAudit {
 
         // 3. Все READABLE — полная таблица по содержимому.
         List<Source> tokenHolders = new ArrayList<>();
-        List<Source> emptyTokenHolders = new ArrayList<>();
-        List<Source> orphanAddressHolders = new ArrayList<>();
         boolean anyKey = false;
+        boolean hasOrphanAddresses = false;
         for (Source s : all) {
             if (s.hasKey()) {
                 anyKey = true;
             }
             if (s.token.kind == Entry.Kind.PRESENT) {
                 tokenHolders.add(s);
-            } else if (s.token.kind == Entry.Kind.EMPTY) {
-                emptyTokenHolders.add(s);
-            }
-            if (s.hasAddressWithoutToken()) {
-                orphanAddressHolders.add(s);
+            } else if (s.hasAddressWithoutToken()) {
+                hasOrphanAddresses = true;
             }
         }
         if (!anyKey) {
@@ -315,37 +381,33 @@ public final class CredentialAudit {
 
         // Адресаты без токена при наличии хотя бы одного непустого токена —
         // смешивать нельзя, происхождение не доказано.
-        if (!tokenHolders.isEmpty() && !orphanAddressHolders.isEmpty()) {
+        if (!tokenHolders.isEmpty() && hasOrphanAddresses) {
             return new Outcome(Verdict.CONFLICT, Reason.SPLIT_CREDENTIALS,
                     null);
         }
 
         if (tokenHolders.isEmpty()) {
-            // Непустого токена нет нигде: реквизитов для отправки нет.
-            // Осиротевшие адресаты/пустые записи — только очистка.
-            if (!orphanAddressHolders.isEmpty()
-                    || !emptyTokenHolders.isEmpty()) {
-                if (!orphanAddressHolders.isEmpty()) {
-                    List<Role> clear = new ArrayList<>();
-                    for (Source s : orphanAddressHolders) {
-                        clear.add(s.role);
-                    }
-                    for (Source s : emptyTokenHolders) {
-                        clear.add(s.role);
-                    }
-                    return new Outcome(Verdict.MIGRATION_REQUIRED,
+            // Непустого токена нет нигде: осиротевшие адресаты и пустые
+            // записи токена — остатки на очистку, не реквизиты.
+            List<Role> clear = new ArrayList<>();
+            for (Source s : all) { // канонический порядок, без повторов
+                if (s.hasKey()) {
+                    clear.add(s.role);
+                }
+            }
+            return clear.isEmpty()
+                    ? new Outcome(Verdict.EMPTY, Reason.NO_CREDENTIALS, null)
+                    : new Outcome(Verdict.MIGRATION_REQUIRED,
                             Reason.ORPHAN_ADDRESSES,
                             new Plan("", 0, 0, clear, false));
-                }
-                return new Outcome(Verdict.EMPTY, Reason.NO_CREDENTIALS, null);
-            }
-            return new Outcome(Verdict.EMPTY, Reason.NO_CREDENTIALS, null);
         }
 
         // Пустой сохранённый токен рядом с непустым: удаление не доказано.
-        if (!emptyTokenHolders.isEmpty()) {
-            return new Outcome(Verdict.CONFLICT,
-                    Reason.EMPTY_TOKEN_AMBIGUITY, null);
+        for (Source s : all) {
+            if (s.token.kind == Entry.Kind.EMPTY) {
+                return new Outcome(Verdict.CONFLICT,
+                        Reason.EMPTY_TOKEN_AMBIGUITY, null);
+            }
         }
 
         // Разные непустые токены — блокирующий конфликт.
@@ -388,16 +450,22 @@ public final class CredentialAudit {
         // писать не нужно, только очистить остальные.
         boolean encHolder = false;
         List<Role> clear = new ArrayList<>();
-        for (Source s : tokenHolders) {
-            if (s.role == Role.ENCRYPTED) {
-                encHolder = true;
-            } else {
-                clear.add(s.role);
+        for (Source s : all) { // канонический порядок ролей
+            if (s.token.kind == Entry.Kind.PRESENT) {
+                if (s.role == Role.ENCRYPTED) {
+                    encHolder = true;
+                } else {
+                    clear.add(s.role);
+                }
             }
         }
         return new Outcome(Verdict.MIGRATION_REQUIRED,
                 Reason.DUPLICATE_COPIES,
                 new Plan(first, base.effectiveChatId(),
                         base.effectiveAlertChatId(), clear, encHolder));
+    }
+
+    private static Outcome invalid() {
+        return new Outcome(Verdict.CONFLICT, Reason.INVALID_INPUT, null);
     }
 }

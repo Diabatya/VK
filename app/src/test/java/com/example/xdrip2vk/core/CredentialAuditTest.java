@@ -305,6 +305,181 @@ public class CredentialAuditTest {
                 .sendPermitted());
     }
 
+    // --- регрессии 2Г.3А.1: обход типов ---
+
+    @Test
+    public void regressionA_numericTokenNotReadySecured() {
+        // Воспроизведение: числовой «токен» давал READY_SECURED.
+        Source enc = Source.of(Role.ENCRYPTED, Read.READABLE,
+                Entry.number(123), Entry.number(777), Entry.absent());
+        Outcome o = CredentialAudit.check(enc, ok(Role.PLAIN),
+                ok(Role.DEFAULT));
+        assertEquals(Verdict.CORRUPT, o.verdict);
+        assertEquals(Reason.SOURCE_CORRUPT, o.reason);
+        assertFalse(o.sendPermitted());
+        assertNull(o.plan);
+    }
+
+    @Test
+    public void regressionB_stringAddressNotReadySecured() {
+        // Воспроизведение: строковый «адресат» давал READY_SECURED.
+        Source enc = Source.of(Role.ENCRYPTED, Read.READABLE,
+                Entry.string("SYNTH_TOKEN"), Entry.string("unexpected"),
+                Entry.absent());
+        Outcome o = CredentialAudit.check(enc, ok(Role.PLAIN),
+                ok(Role.DEFAULT));
+        assertEquals(Verdict.CORRUPT, o.verdict);
+        assertFalse(o.sendPermitted());
+        assertNull(o.plan);
+    }
+
+    @Test
+    public void emptyStringTypeInAddressIsCorrupt() {
+        Source enc = Source.of(Role.ENCRYPTED, Read.READABLE,
+                Entry.string(T_A), Entry.number(5), Entry.string(""));
+        Outcome o = CredentialAudit.check(enc, ok(Role.PLAIN),
+                ok(Role.DEFAULT));
+        assertEquals(Verdict.CORRUPT, o.verdict);
+        assertFalse(o.sendPermitted());
+    }
+
+    @Test
+    public void wrongTypeDoesNotBecomeEmptyTokenOrZeroAddress() {
+        // Неправильный тип ≠ «нет токена» / «адресат 0»: не READY и не
+        // тихое слияние — только CORRUPT.
+        Source enc = Source.of(Role.ENCRYPTED, Read.READABLE,
+                Entry.wrongType(), Entry.number(5), Entry.absent());
+        Outcome o = CredentialAudit.check(enc, ok(Role.PLAIN),
+                ok(Role.DEFAULT));
+        assertEquals(Verdict.CORRUPT, o.verdict);
+        assertFalse(o.sendPermitted());
+    }
+
+    // --- структура входа и роли ---
+
+    @Test
+    public void nullSourceIsInvalidInput() {
+        Outcome o = CredentialAudit.check(null, ok(Role.PLAIN),
+                ok(Role.DEFAULT));
+        assertEquals(Verdict.CONFLICT, o.verdict);
+        assertEquals(Reason.INVALID_INPUT, o.reason);
+        assertNull(o.plan);
+        assertFalse(o.sendPermitted());
+    }
+
+    @Test
+    public void nullRoleIsInvalidInput() {
+        Source bad = Source.of(null, Read.READABLE, Entry.absent(),
+                Entry.absent(), Entry.absent());
+        Outcome o = CredentialAudit.check(bad, ok(Role.PLAIN),
+                ok(Role.DEFAULT));
+        assertEquals(Reason.INVALID_INPUT, o.reason);
+    }
+
+    @Test
+    public void duplicatedRoleIsInvalidInput() {
+        Outcome o = CredentialAudit.check(ok(Role.PLAIN), ok(Role.PLAIN),
+                ok(Role.DEFAULT));
+        assertEquals(Reason.INVALID_INPUT, o.reason);
+        assertFalse(o.sendPermitted());
+    }
+
+    @Test
+    public void roleDecidesSourceNotPosition() {
+        // Воспроизведённая ошибка: результат зависел от позиции аргумента.
+        Source enc = creds(Role.ENCRYPTED, T_A, 5L, null);
+        Source unavail = Source.unavailable(Role.PLAIN);
+        Source def = ok(Role.DEFAULT);
+        Outcome a = CredentialAudit.check(enc, unavail, def);
+        Outcome b = CredentialAudit.check(unavail, enc, def);
+        assertEquals(a, b);
+        assertEquals(Reason.SOURCE_UNAVAILABLE, a.reason);
+    }
+
+    @Test
+    public void encryptedUnavailableMatchesRoleRegardlessOfPosition() {
+        Source unavail = Source.unavailable(Role.ENCRYPTED);
+        Source plain = creds(Role.PLAIN, T_A, 5L, null);
+        Source def = ok(Role.DEFAULT);
+        assertEquals(Reason.ENCRYPTED_UNAVAILABLE,
+                CredentialAudit.check(unavail, plain, def).reason);
+        assertEquals(Reason.ENCRYPTED_UNAVAILABLE,
+                CredentialAudit.check(plain, unavail, def).reason);
+        assertEquals(Reason.ENCRYPTED_UNAVAILABLE,
+                CredentialAudit.check(plain, def, unavail).reason);
+    }
+
+    // --- шесть перестановок с полным сравнением результата ---
+
+    private static void assertSameOutcome(Outcome a, Outcome b) {
+        assertEquals(a.verdict, b.verdict);
+        assertEquals(a.reason, b.reason);
+        assertEquals(a.plan == null, b.plan == null);
+        if (a.plan != null) {
+            assertEquals(a.plan.token, b.plan.token);
+            assertEquals(a.plan.chatId, b.plan.chatId);
+            assertEquals(a.plan.alertChatId, b.plan.alertChatId);
+            assertEquals(a.plan.alreadyEncrypted, b.plan.alreadyEncrypted);
+            assertEquals(a.plan.clearSources, b.plan.clearSources);
+        }
+    }
+
+    private static void checkAllPermutations(Source s1, Source s2, Source s3) {
+        Outcome base = CredentialAudit.check(s1, s2, s3);
+        assertSameOutcome(base, CredentialAudit.check(s1, s3, s2));
+        assertSameOutcome(base, CredentialAudit.check(s2, s1, s3));
+        assertSameOutcome(base, CredentialAudit.check(s2, s3, s1));
+        assertSameOutcome(base, CredentialAudit.check(s3, s1, s2));
+        assertSameOutcome(base, CredentialAudit.check(s3, s2, s1));
+    }
+
+    @Test
+    public void allPermutationsAgree() {
+        checkAllPermutations(creds(Role.ENCRYPTED, T_A, 5L, null),
+                ok(Role.PLAIN), ok(Role.DEFAULT));           // READY_SECURED
+        checkAllPermutations(ok(Role.ENCRYPTED),
+                creds(Role.PLAIN, T_A, 5L, -1L),
+                ok(Role.DEFAULT));                          // MIGRATION legacy
+        checkAllPermutations(creds(Role.ENCRYPTED, T_A, 5L, 0L),
+                creds(Role.PLAIN, T_A, 5L, 0L),
+                ok(Role.DEFAULT));                          // копии
+        checkAllPermutations(creds(Role.ENCRYPTED, T_A, 5L, null),
+                creds(Role.PLAIN, T_B, 5L, null),
+                ok(Role.DEFAULT));                          // токены
+        checkAllPermutations(creds(Role.ENCRYPTED, T_A, 5L, null),
+                creds(Role.PLAIN, T_A, 6L, null),
+                ok(Role.DEFAULT));                          // адресаты
+        checkAllPermutations(Source.unavailable(Role.ENCRYPTED),
+                creds(Role.PLAIN, T_A, 5L, null),
+                ok(Role.DEFAULT));                          // enc UNAVAILABLE
+        checkAllPermutations(creds(Role.ENCRYPTED, T_A, 5L, null),
+                Source.unavailable(Role.PLAIN),
+                ok(Role.DEFAULT));                          // plain UNAVAILABLE
+        checkAllPermutations(creds(Role.ENCRYPTED, T_A, 5L, null),
+                Source.corrupt(Role.PLAIN),
+                ok(Role.DEFAULT));                          // CORRUPT
+    }
+
+    @Test
+    public void clearSourcesHasNoDuplicatesAndStableRoleOrder() {
+        // Пустой токен и адресаты в одном источнике — роль не дублируется.
+        Source def = Source.of(Role.DEFAULT, Read.READABLE,
+                Entry.string(""), Entry.number(5), Entry.absent());
+        Outcome o = CredentialAudit.check(ok(Role.ENCRYPTED),
+                ok(Role.PLAIN), def);
+        assertEquals(Verdict.MIGRATION_REQUIRED, o.verdict);
+        assertEquals(java.util.Collections.singletonList(Role.DEFAULT),
+                o.plan.clearSources);
+
+        // Три одинаковые копии: канонический порядок PLAIN, DEFAULT.
+        Outcome o2 = CredentialAudit.check(
+                creds(Role.ENCRYPTED, T_A, 5L, null),
+                creds(Role.PLAIN, T_A, 5L, null),
+                creds(Role.DEFAULT, T_A, 5L, null));
+        assertEquals(java.util.Arrays.asList(Role.PLAIN, Role.DEFAULT),
+                o2.plan.clearSources);
+    }
+
     @Test
     public void secretsAbsentFromToString() {
         Source s = creds(Role.ENCRYPTED, T_A, 5L, null);
