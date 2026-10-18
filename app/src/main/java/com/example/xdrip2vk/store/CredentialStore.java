@@ -269,24 +269,33 @@ public final class CredentialStore implements AutoCloseable {
             }
             Source stored = sourceOf(op.snapshot, role);
             if (role == Role.ENCRYPTED) {
-                // Исходник или наши новые реквизиты из грязного кеша.
-                if (!sameCredentials(stored, cur)
+                if (op.destinationConfirmed) {
+                    // Запись подтверждена: допустимы только реквизиты
+                    // плана — исходное состояние снова недопустимо и
+                    // повторной записи ради исправления не будет.
+                    if (!matchesPlan(cur, op.plan)) {
+                        return destinationMismatch();
+                    }
+                } else if (!sameCredentials(stored, cur)
                         && !matchesPlan(cur, op.plan)) {
+                    // Исходник или наши новые реквизиты из грязного кеша.
                     return changed();
                 }
             } else if (!sameCredentials(stored, cur)) {
                 return changed();
             }
         }
-        m = markerChanged(op); // перед повторным commit
-        if (m != null) {
-            return m;
+        if (!op.destinationConfirmed) {
+            m = markerChanged(op); // перед повторным commit
+            if (m != null) {
+                return m;
+            }
+            if (!put(op.plan)) {
+                return new Resolution(Status.INCOMPLETE, Reason.NONE,
+                        Pending.DESTINATION_WRITE, "", 0, 0);
+            }
+            op.destinationConfirmed = true;
         }
-        if (!put(op.plan)) {
-            return new Resolution(Status.INCOMPLETE, Reason.NONE,
-                    Pending.DESTINATION_WRITE, "", 0, 0);
-        }
-        op.destinationConfirmed = true;
         return finish(Reason.NONE, op.plan);
     }
 
@@ -296,35 +305,36 @@ public final class CredentialStore implements AutoCloseable {
         if (m != null) {
             return m;
         }
-        for (Role role : Role.values()) {
-            Source cur = sourceOf(snap, role);
-            Resolution bad = unreadable(cur, Pending.UNREADABLE);
-            if (bad != null) {
-                return bad;
+        if (!op.deleteConfirmed) {
+            for (Role role : Role.values()) {
+                Source cur = sourceOf(snap, role);
+                Resolution bad = unreadable(cur, Pending.UNREADABLE);
+                if (bad != null) {
+                    return bad;
+                }
+                Source stored = sourceOf(op.snapshot, role);
+                // enc может быть исходником либо уже пустым кешем после
+                // неподтверждённого delete; новые реквизиты — не трогать.
+                if (!sameCredentials(stored, cur) && hasCredentials(cur)) {
+                    return changed();
+                }
             }
-            Source stored = sourceOf(op.snapshot, role);
-            // enc может быть исходником либо уже пустым кешем после
-            // неподтверждённого delete; новые реквизиты — не трогать.
-            if (!sameCredentials(stored, cur) && hasCredentials(cur)) {
-                return changed();
+            m = markerChanged(op); // перед повторным commit
+            if (m != null) {
+                return m;
             }
+            if (!backendDelete()) {
+                return new Resolution(Status.INCOMPLETE, Reason.NONE,
+                        Pending.DELETE, "", 0, 0);
+            }
+            op.deleteConfirmed = true;
         }
-        m = markerChanged(op); // перед повторным commit
-        if (m != null) {
-            return m;
-        }
-        if (!backendDelete()) {
-            return new Resolution(Status.INCOMPLETE, Reason.NONE,
-                    Pending.DELETE, "", 0, 0);
-        }
+        // После подтверждения — только проверка результата: появившиеся
+        // реквизиты повторным удалением не трогаем.
         return confirmDeleted();
     }
 
     private Resolution resumeMigration(PendingOp op, Source[] snap) {
-        Resolution m = markerChanged(op);
-        if (m != null) {
-            return m;
-        }
         for (Role role : Role.values()) {
             Source cur = sourceOf(snap, role);
             Resolution bad = unreadable(cur, Pending.UNREADABLE);
@@ -361,11 +371,13 @@ public final class CredentialStore implements AutoCloseable {
             }
         }
 
+        // Маркер — после поверки источников (расхождение реквизитов
+        // важнее), но до любой зависимой записи.
+        Resolution m = markerChanged(op);
+        if (m != null) {
+            return m;
+        }
         if (op.destinationUnconfirmed) {
-            Resolution m2 = markerChanged(op); // перед повторным commit
-            if (m2 != null) {
-                return m2;
-            }
             if (!put(op.plan)) {
                 return new Resolution(Status.INCOMPLETE, Reason.NONE,
                         Pending.DESTINATION_WRITE, "", 0, 0);
@@ -463,6 +475,7 @@ public final class CredentialStore implements AutoCloseable {
             return new Resolution(Status.INCOMPLETE, Reason.NONE,
                     Pending.DELETE, "", 0, 0);
         }
+        del.deleteConfirmed = true;
         return confirmDeleted();
     }
 
@@ -514,7 +527,19 @@ public final class CredentialStore implements AutoCloseable {
                     Reason.SERVICE_STATE_INVALID, Pending.UNREADABLE,
                     "", 0, 0);
         }
-        if (cur == op.initialState || cur == op.writtenState) {
+        // Фазы: до подтверждения записи допустимы исходный маркер и
+        // значение нашего commit (грязный кеш — не подтверждение, commit
+        // повторяется реально). После commit()==true допустимо только
+        // ожидаемое состояние после записи: возврата к исходной фазе и
+        // повторной записи ради исправления расхождения нет.
+        boolean confirmed = op.kind == OpKind.DELETE
+                ? op.deleteConfirmed : op.destinationConfirmed;
+        ServiceState expected = op.writtenState != null
+                ? op.writtenState : op.initialState;
+        boolean ok = confirmed
+                ? cur == expected
+                : (cur == op.initialState || cur == op.writtenState);
+        if (ok) {
             return null;
         }
         // Новый маркер (в т.ч. подтверждённое удаление) — постороннее
@@ -571,6 +596,19 @@ public final class CredentialStore implements AutoCloseable {
         if (cur != ServiceState.DELETED) {
             return new Resolution(Status.INCOMPLETE,
                     Reason.SERVICE_STATE_CHANGED, Pending.SOURCE_CHANGED,
+                    "", 0, 0);
+        }
+        // Результат обязан соответствовать удалению: реквизитов в
+        // encrypted нет. Появившиеся значения — несогласованность,
+        // повторным удалением не исправляем.
+        Source enc = backendSnapshotSafe(Role.ENCRYPTED);
+        Resolution bad = unreadable(enc, Pending.UNREADABLE);
+        if (bad != null) {
+            return bad;
+        }
+        if (hasCredentials(enc)) {
+            return new Resolution(Status.INCOMPLETE,
+                    Reason.SERVICE_STATE_MISMATCH, Pending.SOURCE_CHANGED,
                     "", 0, 0);
         }
         coord.pending = null;

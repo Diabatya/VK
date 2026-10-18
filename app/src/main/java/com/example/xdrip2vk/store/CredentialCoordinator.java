@@ -72,6 +72,12 @@ final class CredentialCoordinator {
          * DELETED); null — операция маркер не меняет.
          */
         final CredentialBackend.ServiceState writtenState;
+        /**
+         * DELETE: commit удаления подтверждён. Повторное удаление
+         * запрещено: после подтверждения выполняется только проверка
+         * результата — появившиеся реквизиты не трогаем.
+         */
+        boolean deleteConfirmed;
 
         PendingOp(OpKind kind, Source[] snapshot, Plan plan,
                   CredentialBackend.ServiceState initialState,

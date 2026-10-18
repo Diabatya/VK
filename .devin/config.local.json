@@ -1,18 +1,7 @@
 {
   "permissions": {
     "allow": [
-      "Exec(find)",
-      "Exec(cp)",
-      "Exec(gh release)",
-      "Exec(python3)",
-      "Exec(./gradlew)",
-      "Exec(ls)",
-      "Exec(shasum)",
-      "Exec(wc)",
-      "Exec(grep)",
-      "Exec(unzip)",
-      "Exec(basename)",
-      "Exec(sha256sum)"
+      "Exec(find)"
     ]
   }
 }
