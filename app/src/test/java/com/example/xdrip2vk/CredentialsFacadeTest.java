@@ -65,6 +65,9 @@ public class CredentialsFacadeTest {
             return putOverride != null ? putOverride.call(t, c, a, st)
                     : d.putCredentials(t, c, a, st);
         }
+        @Override public String credentialMeta(Role role) {
+            return d.credentialMeta(role);
+        }
         @Override public boolean deleteCredentials() { return d.deleteCredentials(); }
         @Override public boolean removeCredentials(Role role) {
             return d.removeCredentials(role);

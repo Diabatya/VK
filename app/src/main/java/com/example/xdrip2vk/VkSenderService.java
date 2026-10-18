@@ -119,6 +119,8 @@ public class VkSenderService extends Service {
     private HandlerThread handlerThread;
     private Handler handler;
     private SharedPreferences prefs;
+    /** Тестовая подмена SharedPreferences сервиса (модель commit=false). */
+    static volatile SharedPreferences prefsOverride;
     private AlarmManager alarmManager;
     private PowerManager.WakeLock wakeLock;
 
@@ -792,7 +794,8 @@ public class VkSenderService extends Service {
     public void onCreate() {
         super.onCreate();
         Logger.d(TAG, "Сервис создан");
-        prefs = PreferenceManager.getDefaultSharedPreferences(this);
+        prefs = prefsOverride != null ? prefsOverride
+                : PreferenceManager.getDefaultSharedPreferences(this);
         alarmManager = (AlarmManager) getSystemService(Context.ALARM_SERVICE);
 
         PowerManager pm = (PowerManager) getSystemService(Context.POWER_SERVICE);
@@ -1390,16 +1393,30 @@ public class VkSenderService extends Service {
         final String owner;
         final long oldChat;
         final long oldAlert;
+        /**
+         * Уникальное поле записи: каждая запись маркера отличается от
+         * предыдущей, поэтому commit()==true — реальное подтверждение
+         * записи на диск, а не no-op над уже кешированным значением
+         * (2Г.4Б.1.1).
+         */
+        final String nonce;
 
-        OwnerTransition(String fp, String owner, long oldChat, long oldAlert) {
+        OwnerTransition(String fp, String owner, long oldChat,
+                        long oldAlert, String nonce) {
             this.fp = fp;
             this.owner = owner;
             this.oldChat = oldChat;
             this.oldAlert = oldAlert;
+            this.nonce = nonce;
+        }
+
+        OwnerTransition withNonce(String n) {
+            return new OwnerTransition(fp, owner, oldChat, oldAlert, n);
         }
 
         String encode() {
-            return fp + "|" + owner + "|" + oldChat + "|" + oldAlert;
+            return fp + "|" + owner + "|" + oldChat + "|" + oldAlert
+                    + "|" + nonce;
         }
 
         static OwnerTransition decode(String s) {
@@ -1407,16 +1424,28 @@ public class VkSenderService extends Service {
                 return null;
             }
             String[] p = s.split("\\|", -1);
-            if (p.length != 4 || p[0].isEmpty() || p[1].isEmpty()) {
+            // 4 поля — формат 2Г.4Б.1 (nonce отсутствует); 5 — текущий.
+            if ((p.length != 4 && p.length != 5)
+                    || p[0].isEmpty() || p[1].isEmpty()) {
                 return null;
             }
             try {
                 return new OwnerTransition(p[0], p[1],
-                        Long.parseLong(p[2]), Long.parseLong(p[3]));
+                        Long.parseLong(p[2]), Long.parseLong(p[3]),
+                        p.length > 4 ? p[4] : "");
             } catch (NumberFormatException e) {
                 return null;
             }
         }
+    }
+
+    /** Уникальность nonce в пределах процесса. */
+    private static final java.util.concurrent.atomic.AtomicLong
+            MARKER_NONCE = new java.util.concurrent.atomic.AtomicLong();
+
+    private static String nextMarkerNonce() {
+        return Long.toHexString(System.nanoTime())
+                + Long.toHexString(MARKER_NONCE.getAndIncrement());
     }
 
     /**
@@ -1478,12 +1507,18 @@ public class VkSenderService extends Service {
             // унаследованные ДО первой команды сброса — иначе после
             // прерывания новый выбор не отличить от наследия.
             t = new OwnerTransition(auth.tokenFp, auth.senderId,
-                    snap.chatId, snap.alertChatId);
-            if (!prefs.edit()
-                    .putString(PREF_OWNER_TRANSITION, t.encode())
-                    .commit()) {
-                return; // маркер не записан — переход не начинаем
-            }
+                    snap.chatId, snap.alertChatId, "");
+        }
+        // Маркер подтверждается на диске перед КАЖДЫМ сбросом: nonce
+        // делает запись реальным изменением, поэтому commit()==true —
+        // доказательство записи, а значение из кеша после прежнего
+        // commit=false — нет (2Г.4Б.1.1). Кеш того же процесса и новый
+        // экземпляр сервиса обхода не создают.
+        t = t.withNonce(nextMarkerNonce());
+        if (!prefs.edit()
+                .putString(PREF_OWNER_TRANSITION, t.encode())
+                .commit()) {
+            return; // маркер не подтверждён — сброс не начинаем
         }
         try {
             CredentialStore.Resolution r = creds

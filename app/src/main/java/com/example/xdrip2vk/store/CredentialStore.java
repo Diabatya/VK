@@ -307,7 +307,7 @@ public final class CredentialStore implements AutoCloseable {
         coord.pending = op;
 
         if (!plan.token.isEmpty() && !plan.alreadyEncrypted) {
-            if (!put(plan)) {
+            if (!put(op)) {
                 op.destinationUnconfirmed = true;
                 return new Resolution(Status.INCOMPLETE, o.reason,
                         Pending.DESTINATION_WRITE, "", 0, 0);
@@ -375,7 +375,7 @@ public final class CredentialStore implements AutoCloseable {
             if (m != null) {
                 return m;
             }
-            if (!put(op.plan)) {
+            if (!put(op)) {
                 return new Resolution(Status.INCOMPLETE, Reason.NONE,
                         Pending.DESTINATION_WRITE, "", 0, 0);
             }
@@ -463,7 +463,7 @@ public final class CredentialStore implements AutoCloseable {
             return m;
         }
         if (op.destinationUnconfirmed) {
-            if (!put(op.plan)) {
+            if (!put(op)) {
                 return new Resolution(Status.INCOMPLETE, Reason.NONE,
                         Pending.DESTINATION_WRITE, "", 0, 0);
             }
@@ -521,7 +521,9 @@ public final class CredentialStore implements AutoCloseable {
                         Pending.NONE, "", 0, 0);
             }
         }
-        return startSave(snap, meta, plan(t, chatId, alertChatId));
+        // Явное сохранение полного набора — оба поля выбраны явно.
+        return startSave(snap, meta, plan(t, chatId, alertChatId),
+                true, true);
     }
 
     /**
@@ -529,11 +531,12 @@ public final class CredentialStore implements AutoCloseable {
      * реальный commit, после commit()==true — проверка результата.
      */
     private Resolution startSave(Source[] snap, ServiceState meta,
-                                 Plan plan) {
+                                 Plan plan,
+                                 boolean chatSelected, boolean alertSelected) {
         PendingOp save = new PendingOp(OpKind.SAVE, snap, plan, meta,
-                ServiceState.ACTIVE);
+                ServiceState.ACTIVE, chatSelected, alertSelected);
         coord.pending = save;
-        if (!put(save.plan)) {
+        if (!put(save)) {
             save.destinationUnconfirmed = true;
             return new Resolution(Status.INCOMPLETE, Reason.NONE,
                     Pending.DESTINATION_WRITE, "", 0, 0);
@@ -611,7 +614,10 @@ public final class CredentialStore implements AutoCloseable {
                         Pending.NONE, "", 0, 0);
             }
         }
-        return startSave(snap, meta, plan(t, chatId, alertChatId));
+        // Новая запись токена — перенесённые адресаты принадлежат
+        // новой идентичности: явным выбором не считаются.
+        return startSave(snap, meta, plan(t, chatId, alertChatId),
+                false, false);
     }
 
     /**
@@ -649,8 +655,11 @@ public final class CredentialStore implements AutoCloseable {
         long chat = chatId != null ? chatId : enc.effectiveChatId();
         long alert = alertChatId != null
                 ? alertChatId : enc.effectiveAlertChatId();
+        // Записываемое поле — явный выбор; переносимое сохраняет метку.
+        boolean[] sel = fieldFlags();
         return startSave(snap, meta,
-                plan(enc.token.string, chat, alert));
+                plan(enc.token.string, chat, alert),
+                chatId != null || sel[0], alertChatId != null || sel[1]);
     }
 
     /**
@@ -690,15 +699,22 @@ public final class CredentialStore implements AutoCloseable {
         }
         long curChat = enc.effectiveChatId();
         long curAlert = enc.effectiveAlertChatId();
-        long chat = curChat == oldChatId ? 0 : curChat;
-        long alert = curAlert == oldAlertChatId ? 0 : curAlert;
+        // Равенство старому значению само по себе наследование не
+        // доказывает: тот же адресат мог быть выбран явно. Доказательство
+        // явного выбора — флаг, подтверждённый тем же commit, что и
+        // значение; отсутствующая/нечитаемая мета флагом не считается.
+        boolean[] sel = fieldFlags();
+        long chat = curChat == oldChatId && !sel[0] ? 0 : curChat;
+        long alert = curAlert == oldAlertChatId && !sel[1] ? 0 : curAlert;
         if (chat == curChat && alert == curAlert) {
             // Унаследованных значений на диске уже нет — подтверждённое
             // состояние, повторная запись не нужна.
             return new Resolution(Status.READY, Reason.NONE, Pending.NONE,
                     enc.token.string, curChat, curAlert);
         }
-        return startSave(snap, meta, plan(enc.token.string, chat, alert));
+        return startSave(snap, meta, plan(enc.token.string, chat, alert),
+                chat == curChat ? sel[0] : false,
+                alert == curAlert ? sel[1] : false);
     }
 
     private Resolution incompleteFor(PendingOp op) {
@@ -988,10 +1004,37 @@ public final class CredentialStore implements AutoCloseable {
                 Pending.SOURCE_CLEAR, "", 0, 0);
     }
 
-    private boolean put(Plan plan) {
+    /**
+     * Флаги «поле записано явным выбором адресата» из метаданных
+     * последнего подтверждённого commit (формат "f:CA", C/A — 0/1).
+     * Отсутствие и нечитаемая мета — неявный выбор (флага нет).
+     */
+    private boolean[] fieldFlags() {
+        try {
+            String m = backend.credentialMeta(Role.ENCRYPTED);
+            if (m != null && m.length() == 4 && m.startsWith("f:")
+                    && (m.charAt(2) == '0' || m.charAt(2) == '1')
+                    && (m.charAt(3) == '0' || m.charAt(3) == '1')) {
+                return new boolean[]{m.charAt(2) == '1',
+                        m.charAt(3) == '1'};
+            }
+        } catch (RuntimeException e) {
+            // как нечитаемое: доказательств явного выбора нет
+        }
+        return new boolean[]{false, false};
+    }
+
+    private boolean put(PendingOp op) {
+        Plan plan = op.plan;
+        // Флаги явного выбора — в том же commit, что и значения:
+        // только так повторный выбор старого адресата доказуемо
+        // отличается от унаследованного после прерывания.
+        String state = CredentialBackend.STATE_ACTIVE + "|f:"
+                + (op.chatSelected ? "1" : "0")
+                + (op.alertSelected ? "1" : "0");
         try {
             return backend.putCredentials(plan.token, plan.chatId,
-                    plan.alertChatId, CredentialBackend.STATE_ACTIVE);
+                    plan.alertChatId, state);
         } catch (RuntimeException e) {
             return false; // как commit=false: кеш грязный, диск не подтверждён
         }

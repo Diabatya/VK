@@ -78,15 +78,32 @@ final class CredentialCoordinator {
          * результата — появившиеся реквизиты не трогаем.
          */
         boolean deleteConfirmed;
+        /**
+         * Флаги «поле записано явным выбором» (2Г.4Б.1.1) — передаются
+         * метаданными в том же commit записи и различают унаследованный
+         * адресат и повторный выбор того же значения.
+         */
+        final boolean chatSelected;
+        final boolean alertSelected;
 
         PendingOp(OpKind kind, Source[] snapshot, Plan plan,
                   CredentialBackend.ServiceState initialState,
                   CredentialBackend.ServiceState writtenState) {
+            this(kind, snapshot, plan, initialState, writtenState,
+                    false, false);
+        }
+
+        PendingOp(OpKind kind, Source[] snapshot, Plan plan,
+                  CredentialBackend.ServiceState initialState,
+                  CredentialBackend.ServiceState writtenState,
+                  boolean chatSelected, boolean alertSelected) {
             this.kind = kind;
             this.snapshot = snapshot;
             this.plan = plan;
             this.initialState = initialState;
             this.writtenState = writtenState;
+            this.chatSelected = chatSelected;
+            this.alertSelected = alertSelected;
         }
     }
 

@@ -207,7 +207,14 @@ public class CredentialStoreTest {
             cache.get(Role.ENCRYPTED).put("token", V.str(token));
             cache.get(Role.ENCRYPTED).put("chat", V.num(chatId));
             cache.get(Role.ENCRYPTED).put("alert", V.num(alertChatId));
-            cache.get(Role.ENCRYPTED).put("meta", V.str(serviceState));
+            cache.get(Role.ENCRYPTED).put("meta",
+                    V.str(CredentialBackend.serviceStatePart(serviceState)));
+            String fm = CredentialBackend.fieldMetaPart(serviceState);
+            if (fm.isEmpty()) {
+                cache.get(Role.ENCRYPTED).remove("fmeta");
+            } else {
+                cache.get(Role.ENCRYPTED).put("fmeta", V.str(fm));
+            }
             if (putStarted != null) {
                 putStarted.countDown();
             }
@@ -230,6 +237,12 @@ public class CredentialStoreTest {
                 onNthPut.run(); // мутация между commit и finish
             }
             return true;
+        }
+
+        @Override
+        public String credentialMeta(Role role) {
+            V v = cache.get(role).get("fmeta");
+            return v == null || v.s == null ? "" : v.s;
         }
 
         @Override

@@ -46,6 +46,12 @@ public final class AndroidCredentialBackend implements CredentialBackend {
      * являются одной транзакцией.
      */
     static final String KEY_STATE = "cred_service_state";
+    /**
+     * Метаданные полей (флаги явного выбора, 2Г.4Б.1.1) — тот же файл и
+     * тот же commit, что реквизиты: передаются внутри serviceState
+     * после '|', состояние и мета записываются в разные ключи.
+     */
+    static final String KEY_META = "cred_field_meta";
     static final String STATE_ACTIVE = "v1:active";
     static final String STATE_DELETED = "v1:deleted";
 
@@ -175,16 +181,40 @@ public final class AndroidCredentialBackend implements CredentialBackend {
     public boolean putCredentials(String token, long chatId,
                                   long alertChatId, String serviceState) {
         try {
-            return prefs(Role.ENCRYPTED).edit()
+            SharedPreferences.Editor e = prefs(Role.ENCRYPTED).edit()
                     .putString(KEY_TOKEN, token)
                     .putLong(KEY_CHAT, chatId)
                     .putLong(KEY_ALERT, alertChatId)
-                    .putString(KEY_STATE, serviceState)
-                    .commit();
+                    .putString(KEY_STATE,
+                            CredentialBackend.serviceStatePart(serviceState));
+            String meta = CredentialBackend.fieldMetaPart(serviceState);
+            if (meta.isEmpty()) {
+                e.remove(KEY_META);
+            } else {
+                e.putString(KEY_META, meta);
+            }
+            return e.commit();
         } catch (Exception e) {
             Logger.w("CredBackend", "Запись реквизитов не выполнена: "
                     + e.getClass().getSimpleName());
             return false;
+        }
+    }
+
+    @Override
+    public String credentialMeta(Role role) {
+        if (role != Role.ENCRYPTED) {
+            return "";
+        }
+        try {
+            SharedPreferences p = prefs(Role.ENCRYPTED);
+            if (!p.contains(KEY_META)) {
+                return "";
+            }
+            String v = p.getString(KEY_META, "");
+            return v == null ? "" : v;
+        } catch (Exception e) {
+            return ""; // неподтверждённая/нечитаемая мета — нет доказательств
         }
     }
 
@@ -197,6 +227,7 @@ public final class AndroidCredentialBackend implements CredentialBackend {
                     .remove(KEY_TOKEN)
                     .remove(KEY_CHAT)
                     .remove(KEY_ALERT)
+                    .remove(KEY_META)
                     .putString(KEY_STATE, STATE_DELETED)
                     .commit();
         } catch (Exception e) {
@@ -215,6 +246,7 @@ public final class AndroidCredentialBackend implements CredentialBackend {
                     .remove(KEY_TOKEN)
                     .remove(KEY_CHAT)
                     .remove(KEY_ALERT)
+                    .remove(KEY_META)
                     .commit();
         } catch (Exception e) {
             Logger.w("CredBackend", "Очистка реквизитов не выполнена: "
