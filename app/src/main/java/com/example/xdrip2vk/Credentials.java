@@ -244,6 +244,36 @@ public final class Credentials {
         permitMainBlockingForTest = false;
     }
 
+    /**
+     * Дождаться применения уже поставленных публикаций. Задачи
+     * publishExec ставятся синхронно в issue() и идут строго в порядке
+     * поколений: маркер, поставленный после завершения Future команды,
+     * исполняется позже её публикации — после возврата снятие
+     * mutationPending и результат уже видны через snapshot()/
+     * resolveBlocking(). Блокирующий вызов — только с фоновых потоков
+     * (service worker); на потоке публикаций — самоблокировка.
+     */
+    void awaitPublishIdle() {
+        if (Looper.myLooper() == Looper.getMainLooper()
+                && !permitMainBlockingForTest) {
+            throw new IllegalStateException(
+                    "awaitPublishIdle on main thread is forbidden");
+        }
+        Thread t = Thread.currentThread();
+        if (t.getName() != null && t.getName().startsWith("credentials-publish")) {
+            throw new IllegalStateException(
+                    "awaitPublishIdle on the publish thread would deadlock");
+        }
+        java.util.concurrent.CountDownLatch l =
+                new java.util.concurrent.CountDownLatch(1);
+        publishExec.execute(l::countDown);
+        try {
+            l.await(30, TimeUnit.SECONDS);
+        } catch (InterruptedException e) {
+            Thread.currentThread().interrupt();
+        }
+    }
+
     /** Для тестов: дождаться обработки очереди публикаций фасада. */
     void awaitPublishIdleForTest() {
         java.util.concurrent.CountDownLatch l =

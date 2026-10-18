@@ -1490,6 +1490,12 @@ public class VkSenderService extends Service {
                     .clearInheritedChatIdsAsync(
                             auth.tokenFp, t.oldChat, t.oldAlert)
                     .get(30, java.util.concurrent.TimeUnit.SECONDS);
+            // Публикация снятия mutationPending асинхронна: без ожидания
+            // currentTokenFp() мог бы увидеть маскированный снимок уже
+            // подтверждённой команды и отложить завершение на следующий
+            // обход (на медленных системах — потеря свежего показания:
+            // перечитанный в loadConfig снимок не READY → без постановки).
+            creds.awaitPublishIdle();
             if (r != null && r.status == CredentialStore.Status.READY
                     && auth.tokenFp.equals(currentTokenFp())) {
                 // Сброс этой версии подтверждён и токен не сменился.
