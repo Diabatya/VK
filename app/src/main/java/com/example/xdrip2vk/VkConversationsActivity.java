@@ -90,6 +90,9 @@ public class VkConversationsActivity extends AppCompatActivity {
     static volatile java.util.concurrent.CountDownLatch loadDoneForTest;
 
     private void loadConversations() {
+        // Захват сигнала именно этой загрузки при её запуске: завершившийся
+        // поздно поток не отсчитает latch, который выставил следующий тест.
+        final java.util.concurrent.CountDownLatch l = loadDoneForTest;
         new Thread(() -> {
             try {
                 Map<String, String> params = new HashMap<>();
@@ -106,7 +109,6 @@ public class VkConversationsActivity extends AppCompatActivity {
 
                 parseResponse(response);
             } finally {
-                java.util.concurrent.CountDownLatch l = loadDoneForTest;
                 if (l != null) {
                     l.countDown(); // результат уже поставлен в главный поток
                 }

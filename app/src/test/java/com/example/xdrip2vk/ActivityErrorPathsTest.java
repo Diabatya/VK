@@ -64,28 +64,34 @@ public class ActivityErrorPathsTest {
 
     @After
     public void tearDown() {
-        // Завершаем фоновую работу перед снятием подмен: задача текущего
-        // теста не использует транспорт следующего.
-        awaitQuietly();
-        for (Activity a : opened) {
-            if (!a.isFinishing() && !a.isDestroyed()) {
-                a.finish();
+        // Незавершённая фоновая задача — явная ошибка cleanup; подмены
+        // сбрасываются в finally в любом случае.
+        try {
+            awaitQuietly();
+        } finally {
+            for (Activity a : opened) {
+                if (!a.isFinishing() && !a.isDestroyed()) {
+                    a.finish();
+                }
             }
+            VkApi.transportOverride = null;
+            VkConversationsActivity.loadDoneForTest = null;
+            ShadowLog.clear();
+            ShadowToast.reset();
         }
-        VkApi.transportOverride = null;
-        VkConversationsActivity.loadDoneForTest = null;
-        ShadowLog.clear();
-        ShadowToast.reset();
     }
 
     private void awaitQuietly() {
         CountDownLatch l = VkConversationsActivity.loadDoneForTest;
-        if (l != null) {
-            try {
-                l.await(5, TimeUnit.SECONDS);
-            } catch (InterruptedException e) {
-                Thread.currentThread().interrupt();
-            }
+        if (l == null) {
+            return;
+        }
+        try {
+            assertTrue("cleanup: фоновая задача не завершилась",
+                    l.await(5, TimeUnit.SECONDS));
+        } catch (InterruptedException e) {
+            Thread.currentThread().interrupt();
+            fail("cleanup: ожидание завершения прервано");
         }
     }
 
