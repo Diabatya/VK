@@ -1345,8 +1345,9 @@ public class VkSenderService extends Service {
                 .putString(PREF_CONFIRMED_SENDER, owner)
                 .putString(PREF_CONFIRMED_SENDER_FP, fp)
                 .apply();
-        onConfirmedSender(owner, fp);
-        return AuthContext.verified(fp, owner);
+        AuthContext auth = AuthContext.verified(fp, owner);
+        ensureOwnerTransition(auth);
+        return auth;
     }
 
     /** Fingerprint актуального подтверждённого токена; "" — READY нет. */
@@ -1357,34 +1358,65 @@ public class VkSenderService extends Service {
     }
 
     /**
-     * Подтверждённая смена аккаунта: чаты прежнего отправителя сбрасываются
-     * ОДНОЙ командой хранилища с проверкой версии токена — устаревший вызов
-     * чаты новой версии не трогает. Пока сброс не подтверждён на диске,
-     * опубликованный снимок не даёт READY — отправки в унаследованные
-     * адресаты не начинаются. Единицы, пороги и имя устройства сохраняются.
-     * Старая очередь хранится в coordinator со своим владельцем до истечения.
+     * Переход адресатов при смене аккаунта — три различимых состояния:
+     * «личность подтверждена» (CONFIRMED_SENDER/_FP соответствуют fp),
+     * «сброс не подтверждён» (LAST_SENDER != владелец) и «переход
+     * завершён» (LAST_SENDER == владелец).
+     *
+     * Вызывается при каждом обходе с verified auth, а не один раз при
+     * подтверждении: commit=false оставляет переход незавершённым, а
+     * более поздние resolve завершают ожидающий сброс — здесь фиксируется
+     * завершение БЕЗ повторного стирания чатов.
+     *
+     * Правила: LAST_SENDER меняется только когда сброс этой версии
+     * токена подтверждён или видимо применён на диске (оба адресата 0 —
+     * унаследованных адресатов не осталось). Ненулевые адресаты при
+     * незавершённом переходе могли унаследоваться — выполняется
+     * подтверждённый clearChatIdsAsync именно для этого fp: устаревший
+     * вызов новую версию не трогает. Пока переход не завершён, старые
+     * адресаты не становятся чатами нового владельца. Единицы, пороги и
+     * имя устройства сохраняются. Старая очередь хранится в coordinator
+     * со своим владельцем до истечения.
      */
-    private void onConfirmedSender(String owner, String fp) {
-        String prev = prefs.getString(PREF_LAST_SENDER, "");
-        if (!prev.isEmpty() && !prev.equals(owner)) {
-            try {
-                CredentialStore.Resolution r = Credentials.get(this)
-                        .clearChatIdsAsync(fp)
-                        .get(30, java.util.concurrent.TimeUnit.SECONDS);
-                if (r != null && r.status == CredentialStore.Status.READY) {
-                    prefs.edit().putString(PREF_LAST_SENDER, owner).apply();
-                    Logger.w(TAG, "Подтверждён другой владелец токена — чаты нужно выбрать заново");
-                }
-                // Сброс не подтверждён (отказ записи / устаревший токен) —
-                // LAST_SENDER не меняем: прежние адресаты не становятся
-                // чатами нового владельца.
-            } catch (Exception e) {
-                Logger.e(TAG, "Сброс чатов при смене владельца не подтверждён");
-            }
+    private void ensureOwnerTransition(AuthContext auth) {
+        if (!auth.verified) {
             return;
         }
-        if (!owner.equals(prev)) {
-            prefs.edit().putString(PREF_LAST_SENDER, owner).apply();
+        String prev = prefs.getString(PREF_LAST_SENDER, "");
+        if (auth.senderId.equals(prev)) {
+            return; // переход завершён или не требуется
+        }
+        if (prev.isEmpty()) {
+            prefs.edit().putString(PREF_LAST_SENDER, auth.senderId).apply();
+            return;
+        }
+        Credentials creds = Credentials.get(this);
+        Credentials.Snapshot snap = creds.resolveBlocking();
+        // Переход применяется только к версии, для которой подтверждён
+        // владелец: замена токена во время восстановления или
+        // незавершённая запись не дают менять состояние.
+        if (!snap.sendPermitted()
+                || !auth.tokenFp.equals(Fingerprint.of(snap.token))) {
+            return;
+        }
+        if (snap.chatId == 0 && snap.alertChatId == 0) {
+            // Сброс уже применён на диске (повтором незавершённой операции
+            // или до потери фиксации) — завершаем, ничего не стирая.
+            prefs.edit().putString(PREF_LAST_SENDER, auth.senderId).apply();
+            return;
+        }
+        try {
+            CredentialStore.Resolution r = creds
+                    .clearChatIdsAsync(auth.tokenFp)
+                    .get(30, java.util.concurrent.TimeUnit.SECONDS);
+            if (r != null && r.status == CredentialStore.Status.READY) {
+                prefs.edit().putString(PREF_LAST_SENDER, auth.senderId).apply();
+                Logger.w(TAG, "Подтверждён другой владелец токена — чаты нужно выбрать заново");
+            }
+            // Сброс не подтверждён — LAST_SENDER не меняем: прежние
+            // адресаты не становятся чатами нового владельца.
+        } catch (Exception e) {
+            Logger.e(TAG, "Сброс чатов при смене владельца не подтверждён");
         }
     }
 
@@ -1418,6 +1450,12 @@ public class VkSenderService extends Service {
                 drainAndSchedule();
                 return;
             }
+        } else {
+            // Cached verified НЕ доказывает завершение перехода адресатов:
+            // commit=false мог оставить LAST_SENDER прежним, а поздний
+            // resolve завершил ожидающий сброс — фиксируем здесь. Уже
+            // завершённый переход повторно чаты не стирает.
+            ensureOwnerTransition(auth);
         }
         final String tokenF = token;
         DeliveryCoordinator.Sender sender = senderOverride != null
