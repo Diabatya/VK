@@ -81,21 +81,36 @@ public class VkConversationsActivity extends AppCompatActivity {
         loadConversations();
     }
 
+    /**
+     * Тестовый сигнал завершения фоновой загрузки: выставляется тестом,
+     * отсчитывается фоновым потоком ПОСЛЕ постановки результата в главный
+     * поток (все пути parseResponse/failure завершаются runOnUiThread-задачей
+     * или возвратом). Заменяет ожидание по таймеру; логику не меняет.
+     */
+    static volatile java.util.concurrent.CountDownLatch loadDoneForTest;
+
     private void loadConversations() {
         new Thread(() -> {
-            Map<String, String> params = new HashMap<>();
-            params.put("count", "20");
-            String response = VkApi.request("messages.getConversations", token, params);
+            try {
+                Map<String, String> params = new HashMap<>();
+                params.put("count", "20");
+                String response = VkApi.request("messages.getConversations", token, params);
 
-            if (response == null) {
-                runOnUiThread(() -> {
-                    Toast.makeText(this, "Ошибка сети при загрузке бесед", Toast.LENGTH_LONG).show();
-                    finishLoad();
-                });
-                return;
+                if (response == null) {
+                    runOnUiThread(() -> {
+                        Toast.makeText(this, "Ошибка сети при загрузке бесед", Toast.LENGTH_LONG).show();
+                        finishLoad();
+                    });
+                    return;
+                }
+
+                parseResponse(response);
+            } finally {
+                java.util.concurrent.CountDownLatch l = loadDoneForTest;
+                if (l != null) {
+                    l.countDown(); // результат уже поставлен в главный поток
+                }
             }
-
-            parseResponse(response);
         }).start();
     }
 

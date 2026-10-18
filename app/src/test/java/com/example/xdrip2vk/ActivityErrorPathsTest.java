@@ -3,10 +3,12 @@ package com.example.xdrip2vk;
 import static org.junit.Assert.*;
 import static org.robolectric.Shadows.shadowOf;
 
+import android.app.Activity;
 import android.content.Context;
 import android.content.Intent;
 import android.net.Uri;
 import android.os.Looper;
+import android.widget.ListView;
 
 import androidx.test.core.app.ApplicationProvider;
 
@@ -24,12 +26,19 @@ import java.io.IOException;
 import java.io.InputStream;
 import java.util.ArrayList;
 import java.util.List;
+import java.util.concurrent.CountDownLatch;
+import java.util.concurrent.TimeUnit;
 
 /**
  * Проверка настоящих путей Activity: список бесед (VkConversationsActivity)
  * и импорт токена (SettingsActivity.SettingsFragment). Маркеры в ответах VK
  * и сообщениях исключений не должны попадать в Logcat и Toast. Сети нет —
- * транспорт VK подменён transportOverride (сбрасывается после теста).
+ * транспорт VK подменён transportOverride.
+ *
+ * Синхронизация без таймерных опросов: loadDoneForTest отсчитывается
+ * фоновым потоком после постановки результата в главный поток; тест ждёт
+ * latch с ограниченным timeout (явное падение при превышении), затем
+ * прокачивает главный looper.
  */
 @RunWith(RobolectricTestRunner.class)
 @Config(sdk = 34)
@@ -38,48 +47,94 @@ public class ActivityErrorPathsTest {
     private static final String TOKEN_MARK = "SYNTH_TKN_act9z";
     private static final String MSG_MARK = "SYNTH_ERRMSG_p4m";
     private static final String TITLE_MARK = "SYNTH_CHATTITLE_k8w";
+    private static final long AWAIT_MS = 10_000;
 
     private Context context;
+    private final List<Activity> opened = new ArrayList<>();
 
     @Before
     public void setUp() {
         context = ApplicationProvider.getApplicationContext();
+        VkApi.transportOverride = null; // подмена прошлого теста не протекает
         ShadowLog.clear();
-        TokenStorage.setToken(context, TOKEN_MARK);
+        ShadowToast.reset();
+        VkConversationsActivity.loadDoneForTest = null;
+        TokenStorage.setToken(context, TOKEN_MARK); // изолированный синтетический токен
     }
 
     @After
     public void tearDown() {
+        // Завершаем фоновую работу перед снятием подмен: задача текущего
+        // теста не использует транспорт следующего.
+        awaitQuietly();
+        for (Activity a : opened) {
+            if (!a.isFinishing() && !a.isDestroyed()) {
+                a.finish();
+            }
+        }
         VkApi.transportOverride = null;
+        VkConversationsActivity.loadDoneForTest = null;
         ShadowLog.clear();
+        ShadowToast.reset();
     }
 
-    private List<String> allLogs() {
+    private void awaitQuietly() {
+        CountDownLatch l = VkConversationsActivity.loadDoneForTest;
+        if (l != null) {
+            try {
+                l.await(5, TimeUnit.SECONDS);
+            } catch (InterruptedException e) {
+                Thread.currentThread().interrupt();
+            }
+        }
+    }
+
+    /** Ждать завершения фоновой загрузки и выполнить результат на главном. */
+    private void awaitLoadAndIdle() throws InterruptedException {
+        CountDownLatch l = VkConversationsActivity.loadDoneForTest;
+        assertNotNull("latch загрузки не установлен тестом", l);
+        assertTrue("фоновая загрузка не завершилась за " + AWAIT_MS + " мс",
+                l.await(AWAIT_MS, TimeUnit.MILLISECONDS));
+        shadowOf(Looper.getMainLooper()).idle();
+    }
+
+    private String latestToast() {
+        CharSequence t = ShadowToast.getTextOfLatestToast();
+        return t == null ? null : t.toString();
+    }
+
+    private List<String> allLogTexts() {
         List<String> out = new ArrayList<>();
         for (ShadowLog.LogItem i : ShadowLog.getLogs()) {
             out.add(i.msg);
+            // Утечка возможна и через Throwable/цепочку причин.
+            Throwable th = i.throwable;
+            while (th != null) {
+                out.add(th.getClass().getName() + ":" + th.getMessage());
+                th = th.getCause();
+            }
         }
         return out;
     }
 
-    /** Дождаться Toast из фонового потока Activity и вернуть его текст. */
-    private String awaitToast() throws InterruptedException {
-        for (int i = 0; i < 300; i++) {
-            shadowOf(Looper.getMainLooper()).idle();
-            CharSequence t = ShadowToast.getTextOfLatestToast();
-            if (t != null) {
-                return t.toString();
+    private void assertNoMarkersInLogs(String... marks) {
+        for (String m : allLogTexts()) {
+            for (String mark : marks) {
+                assertFalse("маркер в логе/throwable: " + m,
+                        m != null && m.contains(mark));
             }
-            Thread.sleep(10);
         }
-        return null;
     }
 
     private VkConversationsActivity startConversations() {
+        VkConversationsActivity.loadDoneForTest = new CountDownLatch(1);
         Intent i = new Intent(context, VkConversationsActivity.class);
         i.putExtra("chat_type", "normal");
-        return Robolectric.buildActivity(VkConversationsActivity.class, i)
+        VkConversationsActivity a = Robolectric
+                .buildActivity(VkConversationsActivity.class, i)
                 .create().get();
+        opened.add(a);
+        return a;
     }
 
     @Test
@@ -89,16 +144,14 @@ public class ActivityErrorPathsTest {
         VkApi.transportOverride = (m, t, p) -> new VkApi.RawResponse(200, body);
 
         startConversations();
-        String toast = awaitToast();
+        awaitLoadAndIdle();
 
+        String toast = latestToast();
         assertNotNull("ожидался Toast об ошибке", toast);
         assertTrue(toast.contains("бесед") || toast.contains("авторизац"));
         assertFalse(toast.contains(TOKEN_MARK));
         assertFalse(toast.contains(MSG_MARK));
-        for (String m : allLogs()) {
-            assertFalse(m.contains(TOKEN_MARK));
-            assertFalse(m.contains(MSG_MARK));
-        }
+        assertNoMarkersInLogs(TOKEN_MARK, MSG_MARK);
     }
 
     @Test
@@ -108,12 +161,14 @@ public class ActivityErrorPathsTest {
         VkApi.transportOverride = (m, t, p) -> new VkApi.RawResponse(200, body);
 
         startConversations();
-        String toast = awaitToast();
+        awaitLoadAndIdle();
 
+        String toast = latestToast();
         assertNotNull(toast);
         assertTrue("код 5 → понятное сообщение об авторизации: " + toast,
                 toast.contains("авторизац"));
         assertFalse(toast.contains(MSG_MARK));
+        assertNoMarkersInLogs(MSG_MARK);
     }
 
     @Test
@@ -124,13 +179,10 @@ public class ActivityErrorPathsTest {
                 (m, t, p) -> new VkApi.RawResponse(200, "[[[ " + frag);
 
         startConversations();
-        String toast = awaitToast();
+        awaitLoadAndIdle();
 
-        assertNotNull(toast);
-        assertEquals("Некорректный ответ VK", toast);
-        for (String m : allLogs()) {
-            assertFalse("фрагмент ответа не в логе: " + m, m.contains(frag));
-        }
+        assertEquals("Некорректный ответ VK", latestToast());
+        assertNoMarkersInLogs(frag);
     }
 
     @Test
@@ -142,21 +194,13 @@ public class ActivityErrorPathsTest {
         VkApi.transportOverride = (m, t, p) -> new VkApi.RawResponse(200, body);
 
         VkConversationsActivity a = startConversations();
-        // Ждём заполнения списка, затем проверяем адаптер — реальный путь.
-        for (int i = 0; i < 300; i++) {
-            shadowOf(Looper.getMainLooper()).idle();
-            if (a.findViewById(android.R.id.list) != null
-                    && ((android.widget.ListView)
-                            a.findViewById(R.id.list_conversations))
-                            .getAdapter() != null) {
-                break;
-            }
-            Thread.sleep(10);
-        }
-        android.widget.ListView lv = a.findViewById(R.id.list_conversations);
+        awaitLoadAndIdle();
+
+        ListView lv = a.findViewById(R.id.list_conversations);
         assertNotNull(lv.getAdapter());
-        assertTrue(lv.getAdapter().getCount() > 0);
-        assertTrue(lv.getAdapter().getItem(0).toString().contains(TITLE_MARK));
+        assertEquals(1, lv.getAdapter().getCount());
+        assertTrue(lv.getAdapter().getItem(0).toString()
+                .contains(TITLE_MARK));
     }
 
     @Test
@@ -167,15 +211,16 @@ public class ActivityErrorPathsTest {
         Uri uri = Uri.parse("content://fake.test/import.txt");
         shadowOf(context.getContentResolver())
                 .registerInputStream(uri, new InputStream() {
-            @Override
-            public int read() throws IOException {
-                throw new IOException("fs error " + mark);
-            }
-        });
+                    @Override
+                    public int read() throws IOException {
+                        throw new IOException("fs error " + mark);
+                    }
+                });
 
         SettingsActivity activity = Robolectric
                 .buildActivity(SettingsActivity.class).create().start()
                 .resume().get();
+        opened.add(activity);
         SettingsActivity.SettingsFragment fragment =
                 (SettingsActivity.SettingsFragment) activity
                         .getSupportFragmentManager()
@@ -185,12 +230,7 @@ public class ActivityErrorPathsTest {
         fragment.onTokenFileSelected(uri);
         shadowOf(Looper.getMainLooper()).idle();
 
-        CharSequence toast = ShadowToast.getTextOfLatestToast();
-        assertNotNull("ожидался Toast об ошибке чтения", toast);
-        assertEquals("Ошибка чтения файла", toast.toString());
-        assertFalse(toast.toString().contains(mark));
-        for (String m : allLogs()) {
-            assertFalse(m.contains(mark));
-        }
+        assertEquals("Ошибка чтения файла", latestToast());
+        assertNoMarkersInLogs(mark);
     }
 }

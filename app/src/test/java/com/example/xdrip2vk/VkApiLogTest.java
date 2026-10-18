@@ -139,4 +139,65 @@ public class VkApiLogTest {
                     msg.contains(mark));
         }
     }
+
+    // --- extractErrorCode: только корректные целые коды попадают в диагностику ---
+
+    @Test
+    public void extractErrorCodeAcceptsPlainInt() {
+        assertEquals(113, VkApi.extractErrorCode(
+                "{\"error\":{\"error_code\":113,\"error_msg\":\"x\"}}"));
+        assertEquals(5, VkApi.extractErrorCode(
+                "{\"error\":{\"error_code\":5}}"));
+        assertEquals(0, VkApi.extractErrorCode(
+                "{\"error\":{\"error_code\":0}}"));
+    }
+
+    @Test
+    public void extractErrorCodeRejectsNonNumeric() {
+        assertEquals(-1, VkApi.extractErrorCode(
+                "{\"error\":{\"error_code\":\"5\"}}"));      // строка
+        assertEquals(-1, VkApi.extractErrorCode(
+                "{\"error\":{\"error_code\":5.5}}"));        // дробь
+        assertEquals(-1, VkApi.extractErrorCode(
+                "{\"error\":{\"error_code\":-3}}"));         // отрицательное
+        assertEquals(-1, VkApi.extractErrorCode(
+                "{\"error\":{\"error_code\":99999999999}}")); // переполнение
+    }
+
+    @Test
+    public void extractErrorCodeRejectsAbsentAndBroken() {
+        assertEquals(-1, VkApi.extractErrorCode(null));
+        assertEquals(-1, VkApi.extractErrorCode(""));
+        assertEquals(-1, VkApi.extractErrorCode("{\"error\":{}}")); // нет кода
+        assertEquals(-1, VkApi.extractErrorCode(
+                "{\"response\":[]}"));                             // нет error
+        assertEquals(-1, VkApi.extractErrorCode("[[[broken"));
+    }
+
+    @Test
+    public void invalidErrorCodeNotInDiagnosticText() {
+        String mark = "SYNTH_BADCODE_e8n";
+        String body = "{\"error\":{\"error_code\":\"" + mark + "\","
+                + "\"error_msg\":\"x\"}}";
+        VkApi.transportOverride = (m, t, p) -> new VkApi.RawResponse(200, body);
+
+        SendResult r = VkApi.sendMessage(TOKEN_MARK, PEER_MARK, TEXT_MARK, 1);
+
+        assertEquals(SendResult.PERMANENT, r);
+        List<String> msgs = allMessages();
+        for (String m : msgs) {
+            assertFalse("невалидный код не попадает в диагностику: " + m,
+                    m.contains(mark));
+            assertFalse("error_code не выводится при нецелом значении: " + m,
+                    m.contains("error_code="));
+        }
+        // Безопасные поля на месте.
+        boolean hasBase = false;
+        for (String m : msgs) {
+            if (m.contains("http=200") && m.contains("PERMANENT")) {
+                hasBase = true;
+            }
+        }
+        assertTrue(hasBase);
+    }
 }
