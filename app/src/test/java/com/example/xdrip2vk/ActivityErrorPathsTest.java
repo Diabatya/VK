@@ -55,11 +55,12 @@ public class ActivityErrorPathsTest {
     @Before
     public void setUp() {
         context = ApplicationProvider.getApplicationContext();
+        CredHelper.install(context);
         VkApi.transportOverride = null; // подмена прошлого теста не протекает
         ShadowLog.clear();
         ShadowToast.reset();
         VkConversationsActivity.loadDoneForTest = null;
-        TokenStorage.setToken(context, TOKEN_MARK); // изолированный синтетический токен
+        CredHelper.setToken(context, TOKEN_MARK); // изолированный синтетический токен
     }
 
     @After
@@ -210,7 +211,7 @@ public class ActivityErrorPathsTest {
     }
 
     @Test
-    public void importFileErrorShowsFixedMessage() {
+    public void importFileErrorShowsFixedMessage() throws Exception {
         // Настоящий путь: фрагмент настроек из SettingsActivity, контент
         // ContentResolver бросает IOException с маркером в сообщении.
         String mark = "SYNTH_FILEFRAG_m6r";
@@ -233,7 +234,16 @@ public class ActivityErrorPathsTest {
                         .findFragmentById(R.id.settings_container);
         assertNotNull(fragment);
 
+        SettingsActivity.SettingsFragment.importDoneForTest =
+                new CountDownLatch(1);
         fragment.onTokenFileSelected(uri);
+        try {
+            assertTrue("фоновое чтение файла не завершилось",
+                    SettingsActivity.SettingsFragment.importDoneForTest
+                            .await(AWAIT_MS, TimeUnit.MILLISECONDS));
+        } finally {
+            SettingsActivity.SettingsFragment.importDoneForTest = null;
+        }
         shadowOf(Looper.getMainLooper()).idle();
 
         assertEquals("Ошибка чтения файла", latestToast());

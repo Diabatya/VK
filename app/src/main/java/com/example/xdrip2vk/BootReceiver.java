@@ -34,13 +34,27 @@ public class BootReceiver extends BroadcastReceiver {
                 }
                 return;
             }
-            String token = TokenStorage.getToken(context);
-            long chatId = TokenStorage.getChatId(context);
 
-            if (!token.isEmpty() && chatId > 0) {
-                Intent serviceIntent = new Intent(context, VkSenderService.class);
-                context.startForegroundService(serviceIntent);
+            // Реквизиты читаются только через фасад: на главном потоке
+            // receiver доступен уже опубликованный снимок (без Keystore),
+            // иначе — подтверждение состояния асинхронно, запуск только
+            // после READY-снимка с токеном и чатом.
+            Credentials creds = Credentials.get(context);
+            if (creds.snapshot().configured()) {
+                startService(context);
+            } else {
+                final Context app = context.getApplicationContext();
+                creds.resolveOnBackground(s -> {
+                    if (s.configured()) {
+                        startService(app);
+                    }
+                });
             }
         }
+    }
+
+    private static void startService(Context context) {
+        Intent serviceIntent = new Intent(context, VkSenderService.class);
+        context.startForegroundService(serviceIntent);
     }
 }

@@ -82,6 +82,7 @@ public class VkSenderServicePersistenceTest {
     @Before
     public void setUp() {
         context = ApplicationProvider.getApplicationContext();
+        CredHelper.install(context);
         prefs = PreferenceManager.getDefaultSharedPreferences(context);
         prefs.edit().clear().commit();
         // Тесты не про разрешение: ключ подтверждён заранее — иначе
@@ -90,8 +91,8 @@ public class VkSenderServicePersistenceTest {
         prefs.edit().putBoolean(
                 VkSenderService.PREF_TRANSMISSION_ENABLED, true).commit();
         VkSenderService.resetTransmissionFlagsForTest();
-        TokenStorage.setToken(context, "SYNTHETIC_TOKEN_1");
-        TokenStorage.setChatId(context, 777);
+        CredHelper.setToken(context, "SYNTHETIC_TOKEN_1");
+        CredHelper.setChatId(context, 777);
         store = new RecordingStore();
         VkSenderService.stateStoreOverride = store;
         peers = new ArrayList<>();
@@ -187,7 +188,7 @@ public class VkSenderServicePersistenceTest {
     @Test
     public void restoreFromLastCheckpointKeepsMessageAndBindings() {
         prefs.edit().putBoolean("alert_enabled", true).apply();
-        TokenStorage.setAlertChatId(context, 888);
+        CredHelper.setAlertChatId(context, 888);
         VkSenderService s = startService();
         rule = (peer) -> SendResult.RETRYABLE; // оба остаются в очереди
         s.onStartCommand(autoUpdate(54, System.currentTimeMillis() - 60_000), 0, 1);
@@ -210,7 +211,7 @@ public class VkSenderServicePersistenceTest {
     @Test
     public void sentThenRetryableRestoreSkipsSentKeepsRidAndBackoff() {
         prefs.edit().putBoolean("alert_enabled", true).apply();
-        TokenStorage.setAlertChatId(context, 888);
+        CredHelper.setAlertChatId(context, 888);
         VkSenderService s = startService();
         // обычное SENT, тревога RETRYABLE
         rule = (peer) -> peer.equals("888") ? SendResult.RETRYABLE : SendResult.SENT;
@@ -294,7 +295,7 @@ public class VkSenderServicePersistenceTest {
     @Test
     public void resultWriteFailureStopsNextSendThenRecovers() {
         prefs.edit().putBoolean("alert_enabled", true).apply();
-        TokenStorage.setAlertChatId(context, 888);
+        CredHelper.setAlertChatId(context, 888);
         VkSenderService s = startService();
         final boolean[] firstSend = {true};
         VkSenderService.senderOverride = (peer, text, rid) -> {
@@ -367,7 +368,7 @@ public class VkSenderServicePersistenceTest {
     @Test
     public void destroyDuringSendAppliesResultStopsRestAndSaves() {
         prefs.edit().putBoolean("alert_enabled", true).apply();
-        TokenStorage.setAlertChatId(context, 888);
+        CredHelper.setAlertChatId(context, 888);
         VkSenderService s = startService();
         VkSenderService.senderOverride = (peer, text, rid) -> {
             peers.add(peer);
@@ -442,7 +443,7 @@ public class VkSenderServicePersistenceTest {
         // Новый токен ещё не подтверждён: очередь создаётся без владельца,
         // привязка выполняется в drain после verify — именно в той записи
         // и начинается завершение (воспроизведение из замечания).
-        TokenStorage.setToken(context, "SYNTHETIC_TOKEN_B");
+        CredHelper.setToken(context, "SYNTHETIC_TOKEN_B");
         onBindingWrite(s::onDestroy);
         s.onStartCommand(autoUpdate(121, System.currentTimeMillis() - 30_000), 0, 2);
         idle(s);
@@ -463,14 +464,14 @@ public class VkSenderServicePersistenceTest {
         assertEquals(1, peers.size());
         int rid = rids.get(0);
 
-        TokenStorage.setToken(context, "SYNTHETIC_TOKEN_B"); // пока неподтверждён
+        CredHelper.setToken(context, "SYNTHETIC_TOKEN_B"); // пока неподтверждён
         // токен меняется ещё раз ВНУТРИ checkpoint поздней привязки
         final List<String> verified = new ArrayList<>();
         verifier = (token) -> {
             verified.add(token);
             return "user:1"; // B и C — тот же владелец
         };
-        onBindingWrite(() -> TokenStorage.setToken(context, "SYNTHETIC_TOKEN_C"));
+        onBindingWrite(() -> CredHelper.setToken(context, "SYNTHETIC_TOKEN_C"));
         s.onStartCommand(autoUpdate(121, System.currentTimeMillis() - 30_000), 0, 2);
         idle(s);
 
@@ -489,15 +490,15 @@ public class VkSenderServicePersistenceTest {
         idle(s);
         assertEquals(1, peers.size());
 
-        TokenStorage.setToken(context, "SYNTHETIC_TOKEN_B");
+        CredHelper.setToken(context, "SYNTHETIC_TOKEN_B");
         verifier = (token) -> token.equals("SYNTHETIC_TOKEN_C") ? "user:2" : "user:1";
-        onBindingWrite(() -> TokenStorage.setToken(context, "SYNTHETIC_TOKEN_C"));
+        onBindingWrite(() -> CredHelper.setToken(context, "SYNTHETIC_TOKEN_C"));
         s.onStartCommand(autoUpdate(121, System.currentTimeMillis() - 30_000), 0, 2);
         idle(s);
 
         assertEquals("send после смены токена на чужой аккаунт: " + peers,
                 1, peers.size());
-        assertEquals(0, TokenStorage.getChatId(context));
+        assertEquals(0, CredHelper.getChatId(context));
         s.onDestroy();
     }
 
@@ -508,9 +509,9 @@ public class VkSenderServicePersistenceTest {
         idle(s);
         assertEquals(1, peers.size());
 
-        TokenStorage.setToken(context, "SYNTHETIC_TOKEN_B");
+        CredHelper.setToken(context, "SYNTHETIC_TOKEN_B");
         verifier = (token) -> token.equals("SYNTHETIC_TOKEN_C") ? null : "user:1";
-        onBindingWrite(() -> TokenStorage.setToken(context, "SYNTHETIC_TOKEN_C"));
+        onBindingWrite(() -> CredHelper.setToken(context, "SYNTHETIC_TOKEN_C"));
         s.onStartCommand(autoUpdate(121, System.currentTimeMillis() - 30_000), 0, 2);
         idle(s);
 

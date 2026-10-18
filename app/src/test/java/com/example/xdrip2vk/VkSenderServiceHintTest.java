@@ -56,6 +56,7 @@ public class VkSenderServiceHintTest {
     @Before
     public void setUp() {
         context = ApplicationProvider.getApplicationContext();
+        CredHelper.install(context);
         prefs = PreferenceManager.getDefaultSharedPreferences(context);
         prefs.edit().clear().commit();
         prefs.edit()
@@ -77,8 +78,8 @@ public class VkSenderServiceHintTest {
             return SendResult.SENT;
         };
         VkSenderService.identityVerifierOverride = t -> "user:1";
-        TokenStorage.setToken(context, "SYNTHETIC_TOKEN");
-        TokenStorage.setChatId(context, 777);
+        CredHelper.setToken(context, "SYNTHETIC_TOKEN");
+        CredHelper.setChatId(context, 777);
     }
 
     @After

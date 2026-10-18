@@ -56,11 +56,12 @@ public class VkSenderServiceStoppedTest {
     @Before
     public void setUp() {
         context = ApplicationProvider.getApplicationContext();
+        CredHelper.install(context);
         prefs = PreferenceManager.getDefaultSharedPreferences(context);
         prefs.edit().clear().commit();
         VkSenderService.resetTransmissionFlagsForTest();
-        TokenStorage.setToken(context, "SYNTHETIC_TOKEN_1");
-        TokenStorage.setChatId(context, 777);
+        CredHelper.setToken(context, "SYNTHETIC_TOKEN_1");
+        CredHelper.setChatId(context, 777);
         writes.clear();
         onWrite = null;
         VkSenderService.stateStoreOverride = new VkSenderService.StateStore() {
@@ -205,8 +206,8 @@ public class VkSenderServiceStoppedTest {
 
     @Test
     public void migrationNewInstallDefaultsDisabled() {
-        TokenStorage.setToken(context, "");
-        TokenStorage.setChatId(context, 0);
+        CredHelper.setToken(context, "");
+        CredHelper.setChatId(context, 0);
         assertFalse(VkSenderService.isTransmissionAllowed(context));
     }
 
@@ -214,8 +215,8 @@ public class VkSenderServiceStoppedTest {
     public void settingsDoNotChangeSavedChoice() {
         prefs.edit().putBoolean(VkSenderService.PREF_TRANSMISSION_ENABLED, false).commit();
         // смена токена/чата не включает передачу обратно
-        TokenStorage.setToken(context, "SYNTHETIC_TOKEN_2");
-        TokenStorage.setChatId(context, 999);
+        CredHelper.setToken(context, "SYNTHETIC_TOKEN_2");
+        CredHelper.setChatId(context, 999);
         assertFalse(VkSenderService.isTransmissionAllowed(context));
     }
 
@@ -255,7 +256,7 @@ public class VkSenderServiceStoppedTest {
     @Test
     public void stoppedTokenChangeDoesNotStartService() {
         stopTransmission(null);
-        TokenStorage.setToken(context, "SYNTHETIC_TOKEN_2");
+        CredHelper.setToken(context, "SYNTHETIC_TOKEN_2");
         VkSenderService.notifyTokenChanged(context); // ручной ввод и импорт — тот же путь
         assertNull("смена токена при запрете не включает передачу",
                 shadowApp().getNextStartedService());
@@ -309,7 +310,7 @@ public class VkSenderServiceStoppedTest {
     @Test
     public void stopDuringFirstSendAppliesResultSkipsRest() {
         prefs.edit().putBoolean("alert_enabled", true).apply();
-        TokenStorage.setAlertChatId(context, 888);
+        CredHelper.setAlertChatId(context, 888);
         VkSenderService s = startService();
         final boolean[] first = {true};
         VkSenderService.senderOverride = (peer, text, rid) -> {

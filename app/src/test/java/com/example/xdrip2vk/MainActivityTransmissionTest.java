@@ -35,11 +35,12 @@ public class MainActivityTransmissionTest {
     @Before
     public void setUp() {
         context = ApplicationProvider.getApplicationContext();
+        CredHelper.install(context);
         prefs = PreferenceManager.getDefaultSharedPreferences(context);
         prefs.edit().clear().commit();
         VkSenderService.resetTransmissionFlagsForTest();
-        TokenStorage.setToken(context, "SYNTHETIC_TOKEN_1");
-        TokenStorage.setChatId(context, 777);
+        CredHelper.setToken(context, "SYNTHETIC_TOKEN_1");
+        CredHelper.setChatId(context, 777);
     }
 
     @After

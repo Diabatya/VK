@@ -22,6 +22,7 @@ import com.example.xdrip2vk.core.AlertThresholds;
 import com.example.xdrip2vk.core.AuthContext;
 import com.example.xdrip2vk.core.DeliveryCoordinator;
 import com.example.xdrip2vk.core.Fingerprint;
+import com.example.xdrip2vk.store.CredentialStore;
 import com.example.xdrip2vk.core.SgvReading;
 import com.example.xdrip2vk.core.TreatmentEvent;
 import com.example.xdrip2vk.core.Units;
@@ -258,9 +259,10 @@ public class VkSenderService extends Service {
         }
         SharedPreferences p = PreferenceManager.getDefaultSharedPreferences(context);
         if (!p.contains(PREF_TRANSMISSION_ENABLED) || migrationUnconfirmed) {
-            boolean legacy = !TokenStorage.getToken(context).isEmpty()
-                    && TokenStorage.getChatId(context) > 0;
-            maybeInitTransmissionKey(context.getApplicationContext(), legacy);
+            // Миграция ключа: решение о прежнем выборе принимается по
+            // достоверному снимку реквизитов на фоновом исполнителе —
+            // здесь Keystore открывать нельзя.
+            maybeInitTransmissionKey(context.getApplicationContext());
             // Неподтверждённая инициализация не разрешает новые отправки:
             // ни в очереди, ни во время записи кеш prefs не является
             // источником — разрешение публикует только успешная запись.
@@ -519,7 +521,7 @@ public class VkSenderService extends Service {
     /** Значение последней попытки инициализации (0/1); -1 — не было. */
     private static volatile int migrationAttemptedValue = -1;
 
-    private static void maybeInitTransmissionKey(final Context app, final boolean legacy) {
+    private static void maybeInitTransmissionKey(final Context app) {
         if (migrationInitQueued) {
             return; // попытка уже в очереди — повторные чтения её не накапливают
         }
@@ -534,10 +536,29 @@ public class VkSenderService extends Service {
                 if (!p.contains(PREF_TRANSMISSION_ENABLED)
                         || migrationUnconfirmed) {
                     if (migrationAttemptedValue < 0) {
-                        // Исходное решение миграции фиксируется при первой
-                        // попытке — все повторы сохраняют тот же выбор
-                        // независимо от дальнейших настроек токена/чатов.
-                        migrationAttemptedValue = legacy ? 1 : 0;
+                        // Исходное решение миграции принимается только по
+                        // достоверному результату хранилища: недоступность,
+                        // конфликт или незавершённая операция — это не
+                        // «новая ненастроенная установка», false не пишем.
+                        // Снимок читается здесь (не main, не worker
+                        // координатора) — Keystore вне главного потока.
+                        Credentials.Snapshot s =
+                                Credentials.get(app).resolveBlocking();
+                        switch (s.state) {
+                            case READY:
+                                migrationAttemptedValue =
+                                        !s.token.isEmpty() && s.chatId > 0 ? 1 : 0;
+                                break;
+                            case EMPTY:
+                            case DELETED:
+                                migrationAttemptedValue = 0;
+                                break;
+                            default:
+                                break; // недостоверно — решения нет
+                        }
+                    }
+                    if (migrationAttemptedValue < 0) {
+                        return; // записи выбора не было — повтор по цепочке
                     }
                     // contains() после отказа не завершает инициализацию —
                     // значение в памяти могло остаться от отказавшего commit.
@@ -960,15 +981,23 @@ public class VkSenderService extends Service {
         drainAndSchedule();
     }
 
+    /**
+     * Токен и оба адресата — из ОДНОГО подтверждённого снимка слоя
+     * реквизитов: независимые getter могли бы наблюдать разные версии.
+     * Вызывается с рабочего потока сервиса — не с main и не с worker
+     * координатора.
+     */
     private DeliveryCoordinator.Config loadConfig() {
-        String token = TokenStorage.getToken(this);
-        long chatId = TokenStorage.getChatId(this);
-        long alertChatId = TokenStorage.getAlertChatId(this);
+        Credentials.Snapshot snap = Credentials.get(this).resolveBlocking();
+        boolean ready = snap.sendPermitted();
+        long chatId = ready ? snap.chatId : 0;
+        long alertChatId = ready ? snap.alertChatId : 0;
+        String token = ready ? snap.token : "";
         boolean alertEnabled = prefs.getBoolean(PREF_ALERT_ENABLED, false);
         AlertThresholds thresholds = AlertThresholds.orDefault(
                 prefs.getString(PREF_ALERT_MIN_BG, AlertThresholds.DEFAULT_MIN_STR),
                 prefs.getString(PREF_ALERT_MAX_BG, AlertThresholds.DEFAULT_MAX_STR));
-        boolean configured = !token.isEmpty() && chatId > 0;
+        boolean configured = snap.configured();
         // Невыбранный чат — только id==0. Отрицательный peer_id — допустимый
         // адресат VK (сообщество по схеме messages.send), отбрасывать его по
         // знаку нельзя; пустая строка для id<=0 создавала бы ложный статус
@@ -1304,8 +1333,9 @@ public class VkSenderService extends Service {
         String owner = identityVerifierOverride != null
                 ? identityVerifierOverride.apply(token)
                 : VkApi.fetchTokenOwner(token);
-        String tokenNow = TokenStorage.getToken(this);
-        if (!Fingerprint.of(tokenNow).equals(fp)) {
+        // За время сети версия токена могла смениться — результат применяем
+        // только к актуальному подтверждённому снимку.
+        if (!currentTokenFp().equals(fp)) {
             return null; // токен сменился во время проверки
         }
         if (owner == null || owner.isEmpty()) {
@@ -1315,21 +1345,43 @@ public class VkSenderService extends Service {
                 .putString(PREF_CONFIRMED_SENDER, owner)
                 .putString(PREF_CONFIRMED_SENDER_FP, fp)
                 .apply();
-        onConfirmedSender(owner);
+        onConfirmedSender(owner, fp);
         return AuthContext.verified(fp, owner);
     }
 
+    /** Fingerprint актуального подтверждённого токена; "" — READY нет. */
+    private String currentTokenFp() {
+        Credentials.Snapshot s = Credentials.get(this).resolveBlocking();
+        return s.sendPermitted() && !s.token.isEmpty()
+                ? Fingerprint.of(s.token) : "";
+    }
+
     /**
-     * Подтверждённая смена аккаунта: чаты прежнего отправителя сбрасываются —
-     * их нужно выбрать заново. Единицы, пороги и имя устройства сохраняются.
+     * Подтверждённая смена аккаунта: чаты прежнего отправителя сбрасываются
+     * ОДНОЙ командой хранилища с проверкой версии токена — устаревший вызов
+     * чаты новой версии не трогает. Пока сброс не подтверждён на диске,
+     * опубликованный снимок не даёт READY — отправки в унаследованные
+     * адресаты не начинаются. Единицы, пороги и имя устройства сохраняются.
      * Старая очередь хранится в coordinator со своим владельцем до истечения.
      */
-    private void onConfirmedSender(String owner) {
+    private void onConfirmedSender(String owner, String fp) {
         String prev = prefs.getString(PREF_LAST_SENDER, "");
         if (!prev.isEmpty() && !prev.equals(owner)) {
-            TokenStorage.setChatId(this, 0);
-            TokenStorage.setAlertChatId(this, 0);
-            Logger.w(TAG, "Подтверждён другой владелец токена — чаты нужно выбрать заново");
+            try {
+                CredentialStore.Resolution r = Credentials.get(this)
+                        .clearChatIdsAsync(fp)
+                        .get(30, java.util.concurrent.TimeUnit.SECONDS);
+                if (r != null && r.status == CredentialStore.Status.READY) {
+                    prefs.edit().putString(PREF_LAST_SENDER, owner).apply();
+                    Logger.w(TAG, "Подтверждён другой владелец токена — чаты нужно выбрать заново");
+                }
+                // Сброс не подтверждён (отказ записи / устаревший токен) —
+                // LAST_SENDER не меняем: прежние адресаты не становятся
+                // чатами нового владельца.
+            } catch (Exception e) {
+                Logger.e(TAG, "Сброс чатов при смене владельца не подтверждён");
+            }
+            return;
         }
         if (!owner.equals(prev)) {
             prefs.edit().putString(PREF_LAST_SENDER, owner).apply();
@@ -1344,13 +1396,19 @@ public class VkSenderService extends Service {
             updateNotification("Передача остановлена пользователем");
             return; // запрет: ни отправок, ни перепланирования
         }
-        String token = TokenStorage.getToken(this);
-        if (token.isEmpty()) {
+        // Токен, оба адресата и статус хранилища — один согласованный
+        // снимок. LOADING/BLOCKED/INCOMPLETE/EMPTY/DELETED — не источник
+        // отправки, и отсутствие отправки по этой причине не считается
+        // неудачной сетевой попыткой.
+        Credentials creds = Credentials.get(this);
+        Credentials.Snapshot snap = creds.resolveBlocking();
+        if (!snap.sendPermitted() || snap.token.isEmpty()) {
             if (coordinator.pendingCount() > 0) {
-                updateNotification("Ошибка: не задан токен ВК или не выбран чат для отправки");
+                updateNotification(storageStatusText(snap));
             }
             return;
         }
+        String token = snap.token;
         String fp = Fingerprint.of(token);
         AuthContext auth = currentAuthContext(token);
         if (!auth.verified) {
@@ -1370,7 +1428,7 @@ public class VkSenderService extends Service {
         // блокирующего checkpoint) проверяется: представленный токен актуален,
         // завершение не началось, пользовательское разрешение не отозвано.
         DeliveryCoordinator.Summary s = coordinator.drain(sender, auth,
-                () -> fp.equals(Fingerprint.of(TokenStorage.getToken(this)))
+                () -> fp.equals(currentTokenFp())
                         && !shuttingDown
                         && isTransmissionAllowed(this));
         // Финальный commit результатов обхода (внутри drain уже писались
@@ -1416,6 +1474,22 @@ public class VkSenderService extends Service {
             handler.postDelayed(drainRunnable, delay);
         } else if (!shuttingDown) {
             lastDrainDelayMs = -1;
+        }
+    }
+
+    /**
+     * Фиксированный текст состояния хранилища для статуса — без значений
+     * реквизитов и текста исключений. Ошибка хранилища не выглядит как
+     * «токен не задан» или «успешно».
+     */
+    private static String storageStatusText(Credentials.Snapshot s) {
+        switch (s.state) {
+            case BLOCKED:
+            case INCOMPLETE:
+            case LOADING:
+                return Credentials.describe(s) + " — отправка заблокирована";
+            default:
+                return "Ошибка: не задан токен ВК или не выбран чат для отправки";
         }
     }
 

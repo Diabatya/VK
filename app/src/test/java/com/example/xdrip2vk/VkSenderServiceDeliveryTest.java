@@ -39,6 +39,7 @@ public class VkSenderServiceDeliveryTest {
     @Before
     public void setUp() {
         context = ApplicationProvider.getApplicationContext();
+        CredHelper.install(context);
         prefs = PreferenceManager.getDefaultSharedPreferences(context);
         prefs.edit().clear().commit();
         // Тесты не про разрешение: ключ подтверждён заранее — иначе
@@ -47,8 +48,8 @@ public class VkSenderServiceDeliveryTest {
         prefs.edit().putBoolean(
                 VkSenderService.PREF_TRANSMISSION_ENABLED, true).commit();
         VkSenderService.resetTransmissionFlagsForTest();
-        TokenStorage.setToken(context, "SYNTHETIC_TOKEN");
-        TokenStorage.setChatId(context, 777);
+        CredHelper.setToken(context, "SYNTHETIC_TOKEN");
+        CredHelper.setChatId(context, 777);
         peers = new java.util.ArrayList<>();
         result = new AtomicReference<>(SendResult.SENT);
         rule = null;
@@ -94,7 +95,7 @@ public class VkSenderServiceDeliveryTest {
     @Test
     public void authBlockDoesNotRescheduleEverySecond() {
         prefs.edit().putBoolean("alert_enabled", true).apply();
-        TokenStorage.setAlertChatId(context, 888);
+        CredHelper.setAlertChatId(context, 888);
         VkSenderService s = startService();
 
         // обычное сообщение получает AUTH_FAILED, тревога остаётся в очереди
@@ -121,7 +122,7 @@ public class VkSenderServiceDeliveryTest {
     @Test
     public void permanentErrorShowsPartialFailureNotRetryPromise() {
         prefs.edit().putBoolean("alert_enabled", true).apply();
-        TokenStorage.setAlertChatId(context, 888);
+        CredHelper.setAlertChatId(context, 888);
         VkSenderService s = startService();
 
         // обычное доставлено, тревога — окончательная ошибка
@@ -181,7 +182,7 @@ public class VkSenderServiceDeliveryTest {
     @Test
     public void negativeAlertPeerIdDeliveredVerbatim() {
         prefs.edit().putBoolean("alert_enabled", true).apply();
-        TokenStorage.setAlertChatId(context, -77); // адресат-сообщество по схеме VK
+        CredHelper.setAlertChatId(context, -77); // адресат-сообщество по схеме VK
         VkSenderService s = startService();
         s.onStartCommand(autoUpdate(54, System.currentTimeMillis() - 60_000), 0, 1);
         idle(s);
@@ -252,7 +253,7 @@ public class VkSenderServiceDeliveryTest {
     public void staleAlertRetryDoesNotHideNewerMissedAlert() {
         // A: чат тревог выбран; обычное ушло, тревога A — RETRYABLE
         prefs.edit().putBoolean("alert_enabled", true).apply();
-        TokenStorage.setAlertChatId(context, 888);
+        CredHelper.setAlertChatId(context, 888);
         VkSenderService s = startService();
         rule = (peer) -> peer.equals("888") ? SendResult.RETRYABLE : SendResult.SENT;
         s.onStartCommand(autoUpdate(54, System.currentTimeMillis() - 120_000), 0, 1);
@@ -260,7 +261,7 @@ public class VkSenderServiceDeliveryTest {
         assertEquals(2, peers.size());
 
         // чат убрали; более новое низкое B → тревога B пропущена
-        TokenStorage.setAlertChatId(context, 0);
+        CredHelper.setAlertChatId(context, 0);
         rule = (peer) -> SendResult.SENT;
         s.onStartCommand(autoUpdate(50, System.currentTimeMillis() - 30_000), 0, 2);
         idle(s);
@@ -277,7 +278,7 @@ public class VkSenderServiceDeliveryTest {
     @Test
     public void validAlertChatBothDeliveredShowsSuccess() {
         prefs.edit().putBoolean("alert_enabled", true).apply();
-        TokenStorage.setAlertChatId(context, 888);
+        CredHelper.setAlertChatId(context, 888);
         VkSenderService s = startService();
         s.onStartCommand(autoUpdate(54, System.currentTimeMillis() - 60_000), 0, 1);
         idle(s);

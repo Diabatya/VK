@@ -44,6 +44,7 @@ public class VkSenderServiceAuthTest {
     @Before
     public void setUp() {
         context = ApplicationProvider.getApplicationContext();
+        CredHelper.install(context);
         prefs = PreferenceManager.getDefaultSharedPreferences(context);
         prefs.edit().clear().commit();
         // Тесты не про разрешение: ключ подтверждён заранее — иначе
@@ -52,8 +53,8 @@ public class VkSenderServiceAuthTest {
         prefs.edit().putBoolean(
                 VkSenderService.PREF_TRANSMISSION_ENABLED, true).commit();
         VkSenderService.resetTransmissionFlagsForTest();
-        TokenStorage.setToken(context, "SYNTHETIC_TOKEN_1");
-        TokenStorage.setChatId(context, 777);
+        CredHelper.setToken(context, "SYNTHETIC_TOKEN_1");
+        CredHelper.setChatId(context, 777);
         rids = new ArrayList<>();
         peers = new ArrayList<>();
         result = new AtomicReference<>(SendResult.SENT);
@@ -129,7 +130,7 @@ public class VkSenderServiceAuthTest {
         // новый токен того же отправителя — очередь возобновляется сразу,
         // не дожидаясь показания; random_id прежний
         rule = null; // SENT
-        TokenStorage.setToken(context, "SYNTHETIC_TOKEN_2");
+        CredHelper.setToken(context, "SYNTHETIC_TOKEN_2");
         s.onStartCommand(tokenChanged(), 0, 3);
         idle(s);
         assertEquals(3, peers.size()); // auth-failed + сообщение 2-го показания
@@ -147,14 +148,14 @@ public class VkSenderServiceAuthTest {
 
         // новый токен подтверждён для ДРУГОГО аккаунта
         verifier = (token) -> "user:2";
-        TokenStorage.setToken(context, "SYNTHETIC_TOKEN_FOREIGN");
+        CredHelper.setToken(context, "SYNTHETIC_TOKEN_FOREIGN");
         s.onStartCommand(tokenChanged(), 0, 2);
         idle(s);
 
         assertEquals("старое сообщение ушло чужому аккаунту: " + peers,
                 1, peers.size());
         // чаты сброшены — новый отправитель должен выбрать их заново
-        assertEquals(0, TokenStorage.getChatId(context));
+        assertEquals(0, CredHelper.getChatId(context));
         // причина блокировки показана
         String text = lastNotificationText(s);
         assertTrue("ожидалась причина блокировки: " + text,
@@ -172,7 +173,7 @@ public class VkSenderServiceAuthTest {
 
         // проверка личности не удалась: timeout/битый ответ/отказ — не успех
         verifier = (token) -> null;
-        TokenStorage.setToken(context, "SYNTHETIC_TOKEN_BAD");
+        CredHelper.setToken(context, "SYNTHETIC_TOKEN_BAD");
         s.onStartCommand(tokenChanged(), 0, 2);
         idle(s);
         assertEquals(1, peers.size()); // отправок нет
@@ -193,12 +194,12 @@ public class VkSenderServiceAuthTest {
         // проверка T1 возвращает user:9, но во время неё токен уже заменён на T2
         verifier = (token) -> {
             if (token.equals("SYNTHETIC_TOKEN_STALE")) {
-                TokenStorage.setToken(context, "SYNTHETIC_TOKEN_2");
+                CredHelper.setToken(context, "SYNTHETIC_TOKEN_2");
                 return "user:9"; // результат старой версии — игнорируется
             }
             return "user:1"; // T2 подтверждает того же отправителя
         };
-        TokenStorage.setToken(context, "SYNTHETIC_TOKEN_STALE");
+        CredHelper.setToken(context, "SYNTHETIC_TOKEN_STALE");
         s.onStartCommand(tokenChanged(), 0, 2);
         idle(s);
         // очередь возобновилась под T2 (user:1), не под "user:9" старого ответа
@@ -230,7 +231,7 @@ public class VkSenderServiceAuthTest {
     public void sameHashCodeTokensAreDistinct() {
         // "Aa" и "BB" дают одинаковый String.hashCode — fingerprint различает
         assertEquals("Aa".hashCode(), "BB".hashCode());
-        TokenStorage.setToken(context, "Aa");
+        CredHelper.setToken(context, "Aa");
         VkSenderService s = startService();
         rule = (peer) -> SendResult.AUTH_FAILED;
         s.onStartCommand(autoUpdate(120, System.currentTimeMillis() - 60_000), 0, 1);
@@ -239,7 +240,7 @@ public class VkSenderServiceAuthTest {
 
         // токен "BB" того же отправителя — блокировка "Aa" ему не мешает
         rule = null;
-        TokenStorage.setToken(context, "BB");
+        CredHelper.setToken(context, "BB");
         s.onStartCommand(tokenChanged(), 0, 2);
         idle(s);
         assertEquals(2, peers.size());
@@ -252,7 +253,7 @@ public class VkSenderServiceAuthTest {
     public void unverifiedThenForeignTokenDoesNotInheritChats() {
         // T1 подтверждён как user:1, чаты 777/888 выбраны под user:1
         prefs.edit().putBoolean("alert_enabled", true).apply();
-        TokenStorage.setAlertChatId(context, 888);
+        CredHelper.setAlertChatId(context, 888);
         VkSenderService s = startService();
         s.onStartCommand(autoUpdate(120, System.currentTimeMillis() - 60_000), 0, 1);
         idle(s);
@@ -261,11 +262,11 @@ public class VkSenderServiceAuthTest {
 
         // Фаза 1: токен B сохранён, проверка владельца ещё не удалась
         verifier = (token) -> token.equals("SYNTHETIC_TOKEN_B") ? null : "user:1";
-        TokenStorage.setToken(context, "SYNTHETIC_TOKEN_B");
+        CredHelper.setToken(context, "SYNTHETIC_TOKEN_B");
         s.onStartCommand(tokenChanged(), 0, 2);
         idle(s);
         assertEquals(1, peers.size()); // отправок нет
-        assertEquals(777, TokenStorage.getChatId(context)); // чаты пока прежние
+        assertEquals(777, CredHelper.getChatId(context)); // чаты пока прежние
 
         // Фаза 2: свежее низкое показание поступает до подтверждения владельца;
         // проверка в том же обходе подтверждает ДРУГОГО владельца user:2
@@ -275,15 +276,15 @@ public class VkSenderServiceAuthTest {
 
         // ни одной отправки в унаследованные чаты от B
         assertEquals("отправки в унаследованные чаты: " + peers, 1, peers.size());
-        assertEquals(0, TokenStorage.getChatId(context));
-        assertEquals(0, TokenStorage.getAlertChatId(context));
+        assertEquals(0, CredHelper.getChatId(context));
+        assertEquals(0, CredHelper.getAlertChatId(context));
         String text = lastNotificationText(s);
         assertTrue("ожидалась причина блокировки: " + text,
                 text.contains("заблокирован"));
 
         // после явного выбора чатов под user:2 новое показание доставляется
-        TokenStorage.setChatId(context, 999);
-        TokenStorage.setAlertChatId(context, 555);
+        CredHelper.setChatId(context, 999);
+        CredHelper.setAlertChatId(context, 555);
         s.onStartCommand(autoUpdate(60, System.currentTimeMillis()), 0, 4);
         idle(s);
         assertEquals(3, peers.size());
@@ -295,7 +296,7 @@ public class VkSenderServiceAuthTest {
     @Test
     public void unverifiedThenSameSenderTokenKeepsDelivery() {
         prefs.edit().putBoolean("alert_enabled", true).apply();
-        TokenStorage.setAlertChatId(context, 888);
+        CredHelper.setAlertChatId(context, 888);
         VkSenderService s = startService();
         s.onStartCommand(autoUpdate(120, System.currentTimeMillis() - 60_000), 0, 1);
         idle(s);
@@ -303,7 +304,7 @@ public class VkSenderServiceAuthTest {
 
         // B сначала неподтверждён
         verifier = (token) -> token.equals("SYNTHETIC_TOKEN_B") ? null : "user:1";
-        TokenStorage.setToken(context, "SYNTHETIC_TOKEN_B");
+        CredHelper.setToken(context, "SYNTHETIC_TOKEN_B");
         s.onStartCommand(tokenChanged(), 0, 2);
         idle(s);
         assertEquals(1, peers.size());
@@ -316,7 +317,7 @@ public class VkSenderServiceAuthTest {
         assertEquals(3, peers.size());
         assertEquals("777", peers.get(1));
         assertEquals("888", peers.get(2));
-        assertEquals(777, TokenStorage.getChatId(context)); // чаты не сброшены
+        assertEquals(777, CredHelper.getChatId(context)); // чаты не сброшены
         s.onDestroy();
     }
 
@@ -329,7 +330,7 @@ public class VkSenderServiceAuthTest {
         s1.onDestroy();
 
         // Между запусками токен заменён на чужого владельца; остался candidate
-        TokenStorage.setToken(context, "SYNTHETIC_TOKEN_B");
+        CredHelper.setToken(context, "SYNTHETIC_TOKEN_B");
         verifier = (token) -> token.equals("SYNTHETIC_TOKEN_B") ? "user:2" : "user:1";
         prefs.edit()
                 .putFloat("candidate_bg_value", 54f)
@@ -342,7 +343,7 @@ public class VkSenderServiceAuthTest {
 
         assertEquals("candidate ушёл в унаследованные чаты: " + peers,
                 1, peers.size());
-        assertEquals(0, TokenStorage.getChatId(context));
+        assertEquals(0, CredHelper.getChatId(context));
         s2.onDestroy();
     }
 
@@ -364,7 +365,7 @@ public class VkSenderServiceAuthTest {
 
         // Токен B пока неподтверждён
         verifier = (token) -> token.equals("SYNTHETIC_TOKEN_B") ? null : "user:1";
-        TokenStorage.setToken(context, "SYNTHETIC_TOKEN_B");
+        CredHelper.setToken(context, "SYNTHETIC_TOKEN_B");
         s.onStartCommand(tokenChanged(), 0, 3);
         idle(s);
 
@@ -377,7 +378,7 @@ public class VkSenderServiceAuthTest {
         idle(s);
 
         assertEquals("терапия ушла в чужие чаты: " + peers, 1, peers.size());
-        assertEquals(0, TokenStorage.getChatId(context));
+        assertEquals(0, CredHelper.getChatId(context));
         s.onDestroy();
     }
 
@@ -386,7 +387,7 @@ public class VkSenderServiceAuthTest {
     @Test
     public void tokenSwapMidDrainStopsNextSendSameOwnerResumes() {
         prefs.edit().putBoolean("alert_enabled", true).apply();
-        TokenStorage.setAlertChatId(context, 888);
+        CredHelper.setAlertChatId(context, 888);
         VkSenderService s = startService();
         final boolean[] swapped = {false};
         VkSenderService.senderOverride = (peer, text, rid) -> {
@@ -395,7 +396,7 @@ public class VkSenderServiceAuthTest {
             if (!swapped[0]) {
                 // имитация: токен заменён пока шла первая сетевая попытка
                 swapped[0] = true;
-                TokenStorage.setToken(context, "SYNTHETIC_TOKEN_2");
+                CredHelper.setToken(context, "SYNTHETIC_TOKEN_2");
             }
             return SendResult.SENT;
         };
@@ -413,7 +414,7 @@ public class VkSenderServiceAuthTest {
     @Test
     public void tokenSwapMidDrainForeignOwnerBlocksRest() {
         prefs.edit().putBoolean("alert_enabled", true).apply();
-        TokenStorage.setAlertChatId(context, 888);
+        CredHelper.setAlertChatId(context, 888);
         VkSenderService s = startService();
         verifier = (token) -> token.equals("SYNTHETIC_TOKEN_B") ? "user:2" : "user:1";
         final boolean[] swapped = {false};
@@ -422,7 +423,7 @@ public class VkSenderServiceAuthTest {
             rids.add(new int[]{rid});
             if (!swapped[0]) {
                 swapped[0] = true;
-                TokenStorage.setToken(context, "SYNTHETIC_TOKEN_B");
+                CredHelper.setToken(context, "SYNTHETIC_TOKEN_B");
             }
             return SendResult.SENT;
         };
@@ -432,7 +433,7 @@ public class VkSenderServiceAuthTest {
         // вторая отправка под другой учётной записью не выполнена
         assertEquals("отправка продолжилась после смены токена: " + peers,
                 1, peers.size());
-        assertEquals(0, TokenStorage.getChatId(context));
+        assertEquals(0, CredHelper.getChatId(context));
         String text = lastNotificationText(s);
         assertTrue("ожидалась причина блокировки: " + text,
                 text.contains("заблокирован"));
@@ -442,7 +443,7 @@ public class VkSenderServiceAuthTest {
     @Test
     public void tokenSwapMidDrainUnverifiedOwnerBlocksRest() {
         prefs.edit().putBoolean("alert_enabled", true).apply();
-        TokenStorage.setAlertChatId(context, 888);
+        CredHelper.setAlertChatId(context, 888);
         VkSenderService s = startService();
         verifier = (token) -> token.equals("SYNTHETIC_TOKEN_B") ? null : "user:1";
         final boolean[] swapped = {false};
@@ -451,7 +452,7 @@ public class VkSenderServiceAuthTest {
             rids.add(new int[]{rid});
             if (!swapped[0]) {
                 swapped[0] = true;
-                TokenStorage.setToken(context, "SYNTHETIC_TOKEN_B");
+                CredHelper.setToken(context, "SYNTHETIC_TOKEN_B");
             }
             return SendResult.SENT;
         };

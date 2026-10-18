@@ -54,6 +54,7 @@ public class VkSenderServiceMigrationTest {
     @Before
     public void setUp() {
         context = ApplicationProvider.getApplicationContext();
+        CredHelper.install(context);
         prefs = PreferenceManager.getDefaultSharedPreferences(context);
         prefs.edit().clear().commit();
         // Тесты не про разрешение: ключ подтверждён заранее — иначе
@@ -62,8 +63,8 @@ public class VkSenderServiceMigrationTest {
         prefs.edit().putBoolean(
                 VkSenderService.PREF_TRANSMISSION_ENABLED, true).commit();
         VkSenderService.resetTransmissionFlagsForTest();
-        TokenStorage.setToken(context, "SYNTHETIC_TOKEN");
-        TokenStorage.setChatId(context, 777);
+        CredHelper.setToken(context, "SYNTHETIC_TOKEN");
+        CredHelper.setChatId(context, 777);
         sends = new ArrayList<>();
         result = new AtomicReference<>(SendResult.SENT);
         VkSenderService.senderOverride = (peer, text, rid) -> {

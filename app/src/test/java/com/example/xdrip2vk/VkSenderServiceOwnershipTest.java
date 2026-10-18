@@ -62,11 +62,12 @@ public class VkSenderServiceOwnershipTest {
     @Before
     public void setUp() {
         context = ApplicationProvider.getApplicationContext();
+        CredHelper.install(context);
         prefs = PreferenceManager.getDefaultSharedPreferences(context);
         prefs.edit().clear().commit();
         VkSenderService.resetTransmissionFlagsForTest();
-        TokenStorage.setToken(context, "SYNTHETIC_TOKEN_1");
-        TokenStorage.setChatId(context, 777);
+        CredHelper.setToken(context, "SYNTHETIC_TOKEN_1");
+        CredHelper.setChatId(context, 777);
         writes.clear();
         failWrites = false;
         VkSenderService.stateStoreOverride = new VkSenderService.StateStore() {
@@ -540,7 +541,7 @@ public class VkSenderServiceOwnershipTest {
         shadowApp().grantPermissions(android.Manifest.permission.POST_NOTIFICATIONS);
         new BootReceiver().onReceive(context,
                 new Intent(Intent.ACTION_BOOT_COMPLETED));
-        TokenStorage.setToken(context, "SYNTHETIC_TOKEN_2");
+        CredHelper.setToken(context, "SYNTHETIC_TOKEN_2");
         VkSenderService.notifyTokenChanged(context); // ручной ввод/импорт — тот же путь
         VkSenderService.awaitSwitchIdleForTest();
 
@@ -682,7 +683,7 @@ public class VkSenderServiceOwnershipTest {
         assertTrue(prefs.getBoolean(
                 VkSenderService.PREF_TRANSMISSION_ENABLED, false));
         // дальнейшие настройки выбор не меняют
-        TokenStorage.setChatId(context, 0);
+        CredHelper.setChatId(context, 0);
         assertTrue(VkSenderService.isTransmissionAllowed(context));
     }
 
@@ -1397,8 +1398,8 @@ public class VkSenderServiceOwnershipTest {
     @Test
     public void newInstallMigrationRetryKeepsOriginalChoice() {
         // Новая установка: токен пустой, чат 0 → исходное решение false.
-        TokenStorage.setToken(context, "");
-        TokenStorage.setChatId(context, 0);
+        CredHelper.setToken(context, "");
+        CredHelper.setChatId(context, 0);
         List<Boolean> written = Collections.synchronizedList(new ArrayList<>());
         AtomicInteger calls = new AtomicInteger();
         CountDownLatch retryEntered = new CountDownLatch(1);
@@ -1427,8 +1428,8 @@ public class VkSenderServiceOwnershipTest {
         VkSenderService.awaitSwitchIdleForTest(); // попытка 1 отказала
 
         // Пользователь заполняет настройки, НЕ нажимая «Запустить».
-        TokenStorage.setToken(context, "SYNTHETIC_TOKEN_2");
-        TokenStorage.setChatId(context, 999);
+        CredHelper.setToken(context, "SYNTHETIC_TOKEN_2");
+        CredHelper.setChatId(context, 999);
         assertFalse(VkSenderService.isTransmissionAllowed(context)); // повтор
         awaitLatch(retryEntered); // повторная запись выполняется
         assertFalse("во время повторной записи разрешения нет",
@@ -1473,8 +1474,8 @@ public class VkSenderServiceOwnershipTest {
         VkSenderService.awaitSwitchIdleForTest(); // попытка 1 отказала
 
         // Смена аккаунта между попытками — чат сброшен.
-        TokenStorage.setChatId(context, 0);
-        TokenStorage.setAlertChatId(context, 0);
+        CredHelper.setChatId(context, 0);
+        CredHelper.setAlertChatId(context, 0);
         assertFalse(VkSenderService.isTransmissionAllowed(context)); // повтор
         awaitLatch(retryEntered); // повторная запись выполняется
         assertFalse("во время повторной записи разрешения нет",
@@ -1627,14 +1628,14 @@ public class VkSenderServiceOwnershipTest {
     @Test
     public void newInstallConfiguringWithoutStartStaysOff() {
         // новая ненастроенная установка: ключа нет → выключено
-        TokenStorage.setToken(context, "");
-        TokenStorage.setChatId(context, 0);
+        CredHelper.setToken(context, "");
+        CredHelper.setChatId(context, 0);
         assertFalse(VkSenderService.isTransmissionAllowed(context));
         VkSenderService.awaitSwitchIdleForTest(); // инициализация записана
 
         // заполнение настроек без «Запустить» выбор не меняет
-        TokenStorage.setToken(context, "SYNTHETIC_TOKEN_2");
-        TokenStorage.setChatId(context, 999);
+        CredHelper.setToken(context, "SYNTHETIC_TOKEN_2");
+        CredHelper.setChatId(context, 999);
         assertFalse(VkSenderService.isTransmissionAllowed(context));
     }
 
@@ -1649,8 +1650,8 @@ public class VkSenderServiceOwnershipTest {
                 VkSenderService.isTransmissionAllowed(context));
 
         // сброс/смена чатов (смена аккаунта) — не остановка пользователем
-        TokenStorage.setChatId(context, 0);
-        TokenStorage.setAlertChatId(context, 0);
+        CredHelper.setChatId(context, 0);
+        CredHelper.setAlertChatId(context, 0);
         assertTrue(VkSenderService.isTransmissionAllowed(context));
     }
 
@@ -1661,8 +1662,8 @@ public class VkSenderServiceOwnershipTest {
         assertFalse(VkSenderService.isTransmissionAllowed(context));
         // сохранённый true при убранной конфигурации
         prefs.edit().putBoolean(VkSenderService.PREF_TRANSMISSION_ENABLED, true).commit();
-        TokenStorage.setToken(context, "");
-        TokenStorage.setChatId(context, 0);
+        CredHelper.setToken(context, "");
+        CredHelper.setChatId(context, 0);
         assertTrue(VkSenderService.isTransmissionAllowed(context));
     }
 

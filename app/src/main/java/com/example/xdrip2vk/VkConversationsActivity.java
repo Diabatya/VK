@@ -1,6 +1,5 @@
 package com.example.xdrip2vk;
 
-import android.content.Intent;
 import android.os.Bundle;
 import android.view.View;
 import android.widget.AdapterView;
@@ -11,6 +10,8 @@ import android.widget.TextView;
 import android.widget.Toast;
 import androidx.appcompat.app.AppCompatActivity;
 import androidx.appcompat.widget.Toolbar;
+import com.example.xdrip2vk.core.CredentialAudit;
+import com.example.xdrip2vk.core.Fingerprint;
 import org.json.JSONArray;
 import org.json.JSONObject;
 import java.util.ArrayList;
@@ -23,6 +24,9 @@ public class VkConversationsActivity extends AppCompatActivity {
     private ProgressBar progressBar;
     private List<Conversation> conversations;
     private String token;
+    /** Fingerprint токена, с которым загружен список — выбор привязан к версии. */
+    private String tokenFp;
+    private String chatType;
 
     public static class Conversation {
         public String title;
@@ -54,7 +58,7 @@ public class VkConversationsActivity extends AppCompatActivity {
         }
 
         TextView tvChatType = findViewById(R.id.tv_chat_type);
-        String chatType = getIntent().getStringExtra("chat_type");
+        chatType = getIntent().getStringExtra("chat_type");
         if (chatType == null) chatType = "normal";
 
         if ("alert".equals(chatType)) {
@@ -67,18 +71,28 @@ public class VkConversationsActivity extends AppCompatActivity {
         progressBar = findViewById(R.id.progress_bar);
         conversations = new ArrayList<>();
 
-        token = TokenStorage.getToken(this);
-
-        if (token.isEmpty()) {
-            Toast.makeText(this, "Сначала укажите токен VK", Toast.LENGTH_LONG).show();
-            finish();
-            return;
-        }
-
         progressBar.setVisibility(View.VISIBLE);
         listView.setVisibility(View.GONE);
 
-        loadConversations();
+        // Токен читается только из подтверждённого снимка фасада,
+        // асинхронно — Keystore не открывается на главном потоке.
+        Credentials.get(this).resolveOnBackground(s -> {
+            if (!s.configured() && (!s.sendPermitted() || s.token.isEmpty())) {
+                // Нет подтверждённого токена или хранилище заблокировано —
+                // ошибка не выглядит как «токен не задан».
+                runOnUiThread(() -> {
+                    if (!isFinishing() && !isDestroyed()) {
+                        Toast.makeText(this, Credentials.describe(s),
+                                Toast.LENGTH_LONG).show();
+                        finish();
+                    }
+                });
+                return;
+            }
+            token = s.token;
+            tokenFp = Fingerprint.of(token);
+            loadConversations();
+        });
     }
 
     /**
@@ -171,17 +185,7 @@ public class VkConversationsActivity extends AppCompatActivity {
 
                 listView.setOnItemClickListener((AdapterView<?> parent, View view, int position, long id) -> {
                     Conversation selected = conversations.get(position);
-                    String chatType = getIntent().getStringExtra("chat_type");
-                    if (chatType == null) chatType = "normal";
-
-                    if ("alert".equals(chatType)) {
-                        TokenStorage.setAlertChatId(this, selected.peerId);
-                    } else {
-                        TokenStorage.setChatId(this, selected.peerId);
-                    }
-
-                    Toast.makeText(this, "Выбрано: " + selected.title, Toast.LENGTH_SHORT).show();
-                    finish();
+                    onConversationSelected(selected);
                 });
             });
 
@@ -194,6 +198,47 @@ public class VkConversationsActivity extends AppCompatActivity {
                 Toast.makeText(this, "Некорректный ответ VK", Toast.LENGTH_LONG).show();
                 finishLoad();
             });
+        }
+    }
+
+    /**
+     * Выбор адресата — через команду хранилища с fingerprint версии токена,
+     * с которой загружен список: выбор по списку старой версии не пишется.
+     * Успех показывается только после подтверждённой записи.
+     */
+    private void onConversationSelected(Conversation selected) {
+        progressBar.setVisibility(View.VISIBLE);
+        if ("alert".equals(chatType)) {
+            Credentials.get(this).setAlertChatIdOnMain(selected.peerId, tokenFp,
+                    s -> onSelectionResult(selected, s));
+        } else {
+            Credentials.get(this).setChatIdOnMain(selected.peerId, tokenFp,
+                    s -> onSelectionResult(selected, s));
+        }
+    }
+
+    private void onSelectionResult(Conversation selected, Credentials.Snapshot s) {
+        if (isFinishing() || isDestroyed()) {
+            return;
+        }
+        progressBar.setVisibility(View.GONE);
+        switch (s.state) {
+            case READY:
+                Toast.makeText(this, "Выбрано: " + selected.title, Toast.LENGTH_SHORT).show();
+                finish();
+                break;
+            case BLOCKED:
+                if (s.reason == CredentialAudit.Reason.STALE_TOKEN) {
+                    Toast.makeText(this,
+                            "Токен изменился, загрузите список бесед заново",
+                            Toast.LENGTH_LONG).show();
+                } else {
+                    Toast.makeText(this, Credentials.describe(s), Toast.LENGTH_LONG).show();
+                }
+                break;
+            default:
+                Toast.makeText(this, Credentials.describe(s), Toast.LENGTH_LONG).show();
+                break;
         }
     }
 

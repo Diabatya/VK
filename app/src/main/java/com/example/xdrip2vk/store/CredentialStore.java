@@ -208,6 +208,14 @@ public final class CredentialStore implements AutoCloseable {
         close();
     }
 
+    /**
+     * Для тестов: забыть процессный координатор хранилища backend —
+     * моделирует новый процесс (незавершённые операции теряются).
+     */
+    public static void resetCoordinatorForTest(CredentialBackend backend) {
+        CredentialCoordinator.resetForTest(backend.storageId());
+    }
+
     @Override
     public void close() {
         synchronized (this) {
