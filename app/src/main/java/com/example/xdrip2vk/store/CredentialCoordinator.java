@@ -61,11 +61,26 @@ final class CredentialCoordinator {
         final Set<Role> pendingClears = EnumSet.noneOf(Role.class);
         /** Очистка подтверждена — источник обязан оставаться пустым. */
         final Set<Role> confirmedClears = EnumSet.noneOf(Role.class);
+        /**
+         * Служебное состояние (cred_service_state) на момент начала
+         * операции — часть ожидаемого состояния наравне с реквизитами.
+         */
+        final CredentialBackend.ServiceState initialState;
+        /**
+         * Маркер, который записывает commit этой операции одним Editor
+         * с реквизитами (SAVE/MIGRATION-с-записью → ACTIVE, DELETE →
+         * DELETED); null — операция маркер не меняет.
+         */
+        final CredentialBackend.ServiceState writtenState;
 
-        PendingOp(OpKind kind, Source[] snapshot, Plan plan) {
+        PendingOp(OpKind kind, Source[] snapshot, Plan plan,
+                  CredentialBackend.ServiceState initialState,
+                  CredentialBackend.ServiceState writtenState) {
             this.kind = kind;
             this.snapshot = snapshot;
             this.plan = plan;
+            this.initialState = initialState;
+            this.writtenState = writtenState;
         }
     }
 

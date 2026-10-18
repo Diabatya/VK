@@ -195,7 +195,7 @@ public final class CredentialStore implements AutoCloseable {
                 return new Resolution(Status.EMPTY, o.reason, Pending.NONE,
                         "", 0, 0);
             case MIGRATION_REQUIRED:
-                return startPlan(o, snap);
+                return startPlan(o, snap, meta);
             default: // CONFLICT / UNAVAILABLE / CORRUPT — ничего не писать
                 return new Resolution(Status.BLOCKED, o.reason,
                         Pending.NONE, "", 0, 0);
@@ -203,13 +203,18 @@ public final class CredentialStore implements AutoCloseable {
     }
 
     /** Новая однозначная операция: запись назначения → точечные очистки. */
-    private Resolution startPlan(Outcome o, Source[] snap) {
+    private Resolution startPlan(Outcome o, Source[] snap,
+                                 ServiceState meta) {
         Plan plan = o.plan;
         if (plan == null) {
             return new Resolution(Status.BLOCKED, o.reason, Pending.NONE,
                     "", 0, 0);
         }
-        PendingOp op = new PendingOp(OpKind.MIGRATION, snap, plan);
+        // Запись назначения ставит маркер ACTIVE тем же commit; план без
+        // записи (alreadyEncrypted/осиротевшие ключи) маркер не меняет.
+        boolean writesMarker = !plan.token.isEmpty() && !plan.alreadyEncrypted;
+        PendingOp op = new PendingOp(OpKind.MIGRATION, snap, plan, meta,
+                writesMarker ? ServiceState.ACTIVE : null);
         op.pendingClears.addAll(plan.clearSources); // всё плановое — долг
         // Однозначная существующая encrypted-копия = подтверждённое назначение.
         op.destinationConfirmed =
@@ -252,6 +257,10 @@ public final class CredentialStore implements AutoCloseable {
 
     /** Продолжение неподтверждённого сохранения: реальный повтор записи. */
     private Resolution resumeSave(PendingOp op, Source[] snap) {
+        Resolution m = markerChanged(op);
+        if (m != null) {
+            return m;
+        }
         for (Role role : Role.values()) {
             Source cur = sourceOf(snap, role);
             Resolution bad = unreadable(cur, Pending.UNREADABLE);
@@ -269,6 +278,10 @@ public final class CredentialStore implements AutoCloseable {
                 return changed();
             }
         }
+        m = markerChanged(op); // перед повторным commit
+        if (m != null) {
+            return m;
+        }
         if (!put(op.plan)) {
             return new Resolution(Status.INCOMPLETE, Reason.NONE,
                     Pending.DESTINATION_WRITE, "", 0, 0);
@@ -279,6 +292,10 @@ public final class CredentialStore implements AutoCloseable {
 
     /** Продолжение неподтверждённого удаления: реальный повтор commit. */
     private Resolution resumeDelete(PendingOp op, Source[] snap) {
+        Resolution m = markerChanged(op);
+        if (m != null) {
+            return m;
+        }
         for (Role role : Role.values()) {
             Source cur = sourceOf(snap, role);
             Resolution bad = unreadable(cur, Pending.UNREADABLE);
@@ -292,15 +309,22 @@ public final class CredentialStore implements AutoCloseable {
                 return changed();
             }
         }
+        m = markerChanged(op); // перед повторным commit
+        if (m != null) {
+            return m;
+        }
         if (!backendDelete()) {
             return new Resolution(Status.INCOMPLETE, Reason.NONE,
                     Pending.DELETE, "", 0, 0);
         }
-        coord.pending = null;
-        return deleted(Pending.NONE);
+        return confirmDeleted();
     }
 
     private Resolution resumeMigration(PendingOp op, Source[] snap) {
+        Resolution m = markerChanged(op);
+        if (m != null) {
+            return m;
+        }
         for (Role role : Role.values()) {
             Source cur = sourceOf(snap, role);
             Resolution bad = unreadable(cur, Pending.UNREADABLE);
@@ -338,6 +362,10 @@ public final class CredentialStore implements AutoCloseable {
         }
 
         if (op.destinationUnconfirmed) {
+            Resolution m2 = markerChanged(op); // перед повторным commit
+            if (m2 != null) {
+                return m2;
+            }
             if (!put(op.plan)) {
                 return new Resolution(Status.INCOMPLETE, Reason.NONE,
                         Pending.DESTINATION_WRITE, "", 0, 0);
@@ -380,7 +408,15 @@ public final class CredentialStore implements AutoCloseable {
             return new Resolution(Status.BLOCKED,
                     Reason.SERVICE_STATE_INVALID, Pending.NONE, "", 0, 0);
         }
-        if (meta != ServiceState.DELETED) {
+        if (meta == ServiceState.DELETED) {
+            // Подтверждённое удаление разрешает явное сохранение, но не
+            // освобождает от проверки снимков: encrypted обязан читаться
+            // и быть пустым, legacy — доступны и без реквизитов.
+            Resolution bad = deletedStateCheck(snap);
+            if (bad != null) {
+                return bad;
+            }
+        } else {
             Outcome o = check(snap);
             if (o.verdict != Verdict.READY_SECURED
                     && o.verdict != Verdict.EMPTY) {
@@ -389,7 +425,7 @@ public final class CredentialStore implements AutoCloseable {
             }
         }
         PendingOp save = new PendingOp(OpKind.SAVE, snap,
-                plan(t, chatId, alertChatId));
+                plan(t, chatId, alertChatId), meta, ServiceState.ACTIVE);
         coord.pending = save;
         if (!put(save.plan)) {
             save.destinationUnconfirmed = true;
@@ -420,14 +456,14 @@ public final class CredentialStore implements AutoCloseable {
             return new Resolution(Status.BLOCKED, o.reason, Pending.NONE,
                     "", 0, 0);
         }
-        PendingOp del = new PendingOp(OpKind.DELETE, snap, null);
+        PendingOp del = new PendingOp(OpKind.DELETE, snap, null, meta,
+                ServiceState.DELETED);
         coord.pending = del;
         if (!backendDelete()) {
             return new Resolution(Status.INCOMPLETE, Reason.NONE,
                     Pending.DELETE, "", 0, 0);
         }
-        coord.pending = null;
-        return deleted(Pending.NONE);
+        return confirmDeleted();
     }
 
     private Resolution incompleteFor(PendingOp op) {
@@ -463,6 +499,82 @@ public final class CredentialStore implements AutoCloseable {
     private Plan plan(String token, long chatId, long alertChatId) {
         return Plan.of(token, chatId, alertChatId,
                 java.util.Collections.<Role>emptyList(), false);
+    }
+
+    /**
+     * Маркер — часть состояния операции. Допустимы исходное значение и
+     * значение, которое пишет commit этой операции (грязный кеш после
+     * commit=false сам по себе подтверждением не является). INVALID,
+     * ошибка чтения и постороннее изменение блокируют зависимые шаги.
+     */
+    private Resolution markerChanged(PendingOp op) {
+        ServiceState cur = serviceState(Role.ENCRYPTED);
+        if (cur == ServiceState.INVALID) {
+            return new Resolution(Status.INCOMPLETE,
+                    Reason.SERVICE_STATE_INVALID, Pending.UNREADABLE,
+                    "", 0, 0);
+        }
+        if (cur == op.initialState || cur == op.writtenState) {
+            return null;
+        }
+        // Новый маркер (в т.ч. подтверждённое удаление) — постороннее
+        // изменение: не снимать и не перезаписывать старым планом.
+        return new Resolution(Status.INCOMPLETE,
+                Reason.SERVICE_STATE_CHANGED, Pending.SOURCE_CHANGED,
+                "", 0, 0);
+    }
+
+    /**
+     * DELETED — допустимый источник явного сохранения, но не основание
+     * пропустить снимки: все источники читаемы и корректны по типам,
+     * реквизитов ни в encrypted, ни в legacy быть не должно. Иначе —
+     * несогласованное состояние, автоматически не исправляется.
+     */
+    private Resolution deletedStateCheck(Source[] snap) {
+        for (Role role : Role.values()) {
+            Source cur = sourceOf(snap, role);
+            if (cur == null || cur.role != role) {
+                return new Resolution(Status.BLOCKED, Reason.SOURCE_CORRUPT,
+                        Pending.NONE, "", 0, 0);
+            }
+            if (cur.read == Read.UNAVAILABLE) {
+                return new Resolution(Status.BLOCKED,
+                        Reason.SOURCE_UNAVAILABLE, Pending.NONE, "", 0, 0);
+            }
+            if (cur.read == Read.CORRUPT || cur.hasFieldTypeMismatch()) {
+                return new Resolution(Status.BLOCKED, Reason.SOURCE_CORRUPT,
+                        Pending.NONE, "", 0, 0);
+            }
+        }
+        for (Role role : Role.values()) {
+            if (hasCredentials(sourceOf(snap, role))) {
+                return new Resolution(Status.BLOCKED,
+                        Reason.SERVICE_STATE_MISMATCH, Pending.NONE,
+                        "", 0, 0);
+            }
+        }
+        return null;
+    }
+
+    /**
+     * Подтверждение delete commit'ом: итог допустим только при читаемом
+     * маркере DELETED. commit()==true — единственное подтверждение, но
+     * посторонняя замена маркера после него результатом не признаётся.
+     */
+    private Resolution confirmDeleted() {
+        ServiceState cur = serviceState(Role.ENCRYPTED);
+        if (cur == ServiceState.INVALID) {
+            return new Resolution(Status.INCOMPLETE,
+                    Reason.SERVICE_STATE_INVALID, Pending.UNREADABLE,
+                    "", 0, 0);
+        }
+        if (cur != ServiceState.DELETED) {
+            return new Resolution(Status.INCOMPLETE,
+                    Reason.SERVICE_STATE_CHANGED, Pending.SOURCE_CHANGED,
+                    "", 0, 0);
+        }
+        coord.pending = null;
+        return deleted(Pending.NONE);
     }
 
     private Resolution changed() {
@@ -543,6 +655,12 @@ public final class CredentialStore implements AutoCloseable {
         if (!sameCredentials(stored, cur) && hasCredentials(cur)) {
             return changed();
         }
+        // Маркер проверяется перед каждой очисткой: новое подтверждённое
+        // удаление или INVALID старым планом не снимаются.
+        Resolution m = markerChanged(op);
+        if (m != null) {
+            return m;
+        }
         // Назначение проверяется перед каждой очисткой: если оно исчезло,
         // удаление legacy уничтожило бы последнюю копию токена.
         Resolution dest = checkDestination(op);
@@ -557,6 +675,25 @@ public final class CredentialStore implements AutoCloseable {
     }
 
     private Resolution finish(Reason reason, Plan plan) {
+        // Перед публикацией результата маркер обязан быть ожидаемым:
+        // записанным этой операцией либо неизменным исходным. Неизвестная
+        // версия и постороннее изменение блокируют завершение.
+        PendingOp op = coord.pending;
+        if (op != null) {
+            ServiceState cur = serviceState(Role.ENCRYPTED);
+            if (cur == ServiceState.INVALID) {
+                return new Resolution(Status.INCOMPLETE,
+                        Reason.SERVICE_STATE_INVALID, Pending.UNREADABLE,
+                        "", 0, 0);
+            }
+            ServiceState expected = op.writtenState != null
+                    ? op.writtenState : op.initialState;
+            if (cur != expected) {
+                return new Resolution(Status.INCOMPLETE,
+                        Reason.SERVICE_STATE_CHANGED, Pending.SOURCE_CHANGED,
+                        "", 0, 0);
+            }
+        }
         Source enc = snapshot(Role.ENCRYPTED);
         Outcome after = CredentialAudit.check(enc,
                 snapshot(Role.PLAIN), snapshot(Role.DEFAULT));

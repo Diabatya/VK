@@ -66,6 +66,9 @@ public class CredentialStoreTest {
         Object storageId = new Object(); // id процессного хранилища
         int failWrites;      // сколько putCredentials вернут false
         boolean throwOnWrite, throwOnClear, throwOnSnapshot, throwOnDelete;
+        boolean throwOnServiceState; // ошибка чтения маркера
+        int removeTrigger = -1;      // номер вызова remove для onNthRemove
+        Runnable onNthRemove;        // мутация после commit очистки
         final java.util.Set<Integer> throwWriteOn = new java.util.HashSet<>();
         final java.util.Set<Integer> failClearOn = new java.util.HashSet<>();
         final java.util.Set<Integer> failDeleteOn = new java.util.HashSet<>();
@@ -172,6 +175,9 @@ public class CredentialStoreTest {
 
         @Override
         public ServiceState serviceState(Role role) {
+            if (throwOnServiceState) {
+                throw new RuntimeException("service state read failed");
+            }
             V v = cache.get(role).get("meta");
             if (v == null) {
                 return ServiceState.ABSENT;
@@ -257,6 +263,9 @@ public class CredentialStoreTest {
             d.remove("token");
             d.remove("chat");
             d.remove("alert");
+            if (onNthRemove != null && clearCalls == removeTrigger) {
+                onNthRemove.run(); // мутация между очисткой и finish
+            }
             return true;
         }
     }
@@ -1421,6 +1430,374 @@ public class CredentialStoreTest {
             s.deleteAsync();
             fail("deleteAsync после close должен отклоняться");
         } catch (IllegalStateException expected) {
+        }
+    }
+
+    // --- 2Г.3В.1.1: маркер — часть состояния операции ---
+
+    /** A: INVALID-маркер во время pending SAVE блокирует повторный put. */
+    @Test
+    public void invalidMarkerDuringPendingSaveBlocksRetry()
+            throws Exception {
+        FakeBackend b = new FakeBackend();
+        b.failWrites = 1;
+        CredentialStore s = new CredentialStore(b);
+        try {
+            assertEquals(Status.INCOMPLETE,
+                    s.saveAsync(T_A, 5L, 0L).get(10, TimeUnit.SECONDS)
+                            .status);
+            // Маркер стал неизвестным/битым после отказа commit.
+            b.putRaw(Role.ENCRYPTED, "meta", V.str("v9:weird"));
+            int writes = b.writeCalls;
+            Resolution r = await(s);
+            assertEquals(Status.INCOMPLETE, r.status);
+            assertEquals(Reason.SERVICE_STATE_INVALID, r.reason);
+            assertFalse(r.sendPermitted());
+            assertEquals(writes, b.writeCalls); // второго put нет
+            // Операция не исчезла: после восстановления — реальный повтор.
+            b.cache.get(Role.ENCRYPTED)
+                    .put("meta", V.str(CredentialBackend.STATE_ACTIVE));
+            assertEquals(Status.READY, await(s).status);
+            assertEquals(writes + 1, b.writeCalls);
+        } finally {
+            s.close();
+        }
+    }
+
+    /** INVALID-маркер во время pending MIGRATION: повторной записи нет. */
+    @Test
+    public void invalidMarkerDuringPendingMigrationBlocks()
+            throws Exception {
+        FakeBackend b = new FakeBackend();
+        b.seed(Role.PLAIN, T_A, 5L, null);
+        b.failWrites = 1;
+        CredentialStore s = new CredentialStore(b);
+        try {
+            assertEquals(Status.INCOMPLETE, await(s).status);
+            b.putRaw(Role.ENCRYPTED, "meta", V.str("v2:x"));
+            int writes = b.writeCalls;
+            Resolution r = await(s);
+            assertEquals(Status.INCOMPLETE, r.status);
+            assertEquals(Reason.SERVICE_STATE_INVALID, r.reason);
+            assertFalse(r.sendPermitted());
+            assertEquals(writes, b.writeCalls);
+            assertEquals(T_A, b.disk.get(Role.PLAIN).get("token").s);
+        } finally {
+            s.close();
+        }
+    }
+
+    /** INVALID-маркер во время pending DELETE: повторного delete нет. */
+    @Test
+    public void invalidMarkerDuringPendingDeleteBlocks() throws Exception {
+        FakeBackend b = new FakeBackend();
+        b.seed(Role.ENCRYPTED, T_A, 5L, null);
+        b.failDeleteOn.add(1);
+        CredentialStore s = new CredentialStore(b);
+        try {
+            assertEquals(Status.INCOMPLETE,
+                    s.deleteAsync().get(10, TimeUnit.SECONDS).status);
+            b.putRaw(Role.ENCRYPTED, "meta", V.str("oops"));
+            int deletes = b.deleteCalls;
+            Resolution r = await(s);
+            assertEquals(Status.INCOMPLETE, r.status);
+            assertEquals(Reason.SERVICE_STATE_INVALID, r.reason);
+            assertEquals(deletes, b.deleteCalls);
+            assertEquals(T_A, b.disk.get(Role.ENCRYPTED).get("token").s);
+        } finally {
+            s.close();
+        }
+    }
+
+    /** Ошибка чтения маркера при resume — блок, без записи. */
+    @Test
+    public void serviceStateReadErrorBlocksResume() throws Exception {
+        FakeBackend b = new FakeBackend();
+        b.failWrites = 1;
+        CredentialStore s = new CredentialStore(b);
+        try {
+            assertEquals(Status.INCOMPLETE,
+                    s.saveAsync(T_A, 5L, 0L).get(10, TimeUnit.SECONDS)
+                            .status);
+            b.throwOnServiceState = true;
+            int writes = b.writeCalls;
+            Resolution r = await(s);
+            assertEquals(Status.INCOMPLETE, r.status);
+            assertEquals(Reason.SERVICE_STATE_INVALID, r.reason);
+            assertEquals(writes, b.writeCalls);
+            b.throwOnServiceState = false;
+            assertEquals(Status.READY, await(s).status); // реальный повтор
+            assertEquals(writes + 1, b.writeCalls);
+        } finally {
+            s.close();
+        }
+    }
+
+    /** Неизвестная версия маркера перед finish не даёт опубликовать итог. */
+    @Test
+    public void unknownMarkerVersionBeforeFinishBlocks() throws Exception {
+        FakeBackend b = new FakeBackend();
+        b.putRaw(Role.PLAIN, "chat", V.num(5L)); // осиротевший адресат
+        b.removeTrigger = 1;
+        b.onNthRemove = () -> b.putRaw(Role.ENCRYPTED, "meta",
+                V.str("v2:x")); // маркер испортился между очисткой и finish
+        CredentialStore s = new CredentialStore(b);
+        try {
+            Resolution r = await(s);
+            assertEquals(Status.INCOMPLETE, r.status);
+            assertEquals(Reason.SERVICE_STATE_INVALID, r.reason);
+            assertFalse(r.sendPermitted());
+            // После восстановления маркера миграция-очистка достраивается.
+            b.cache.get(Role.ENCRYPTED).remove("meta");
+            b.disk.get(Role.ENCRYPTED).remove("meta");
+            assertEquals(Status.EMPTY, await(s).status);
+        } finally {
+            s.close();
+        }
+    }
+
+    /** B: DELETED + повреждённый encrypted — сохранение заблокировано. */
+    @Test
+    public void corruptEncryptedBlocksSaveInDeletedState()
+            throws Exception {
+        FakeBackend b = new FakeBackend();
+        CredentialStore s = new CredentialStore(b);
+        try {
+            assertEquals(Status.DELETED,
+                    s.deleteAsync().get(10, TimeUnit.SECONDS).status);
+            b.readState.put(Role.ENCRYPTED, Read.CORRUPT);
+            int writes = b.writeCalls;
+            Resolution r = s.saveAsync(T_B, 9L, 0L).get(10,
+                    TimeUnit.SECONDS);
+            assertEquals(Status.BLOCKED, r.status);
+            assertEquals(Reason.SOURCE_CORRUPT, r.reason);
+            assertFalse(r.sendPermitted());
+            assertEquals(writes, b.writeCalls);
+        } finally {
+            s.close();
+        }
+    }
+
+    /** B: DELETED + недоступный encrypted — сохранение заблокировано. */
+    @Test
+    public void unavailableEncryptedBlocksSaveInDeletedState()
+            throws Exception {
+        FakeBackend b = new FakeBackend();
+        CredentialStore s = new CredentialStore(b);
+        try {
+            assertEquals(Status.DELETED,
+                    s.deleteAsync().get(10, TimeUnit.SECONDS).status);
+            b.readState.put(Role.ENCRYPTED, Read.UNAVAILABLE);
+            Resolution r = s.saveAsync(T_B, 9L, 0L).get(10,
+                    TimeUnit.SECONDS);
+            assertEquals(Status.BLOCKED, r.status);
+            assertEquals(Reason.SOURCE_UNAVAILABLE, r.reason);
+            assertEquals(0, b.writeCalls);
+        } finally {
+            s.close();
+        }
+    }
+
+    /** B: DELETED + неверный тип поля encrypted — сохранение заблокировано. */
+    @Test
+    public void wrongTypeEncryptedBlocksSaveInDeletedState()
+            throws Exception {
+        FakeBackend b = new FakeBackend();
+        CredentialStore s = new CredentialStore(b);
+        try {
+            assertEquals(Status.DELETED,
+                    s.deleteAsync().get(10, TimeUnit.SECONDS).status);
+            b.putRaw(Role.ENCRYPTED, "chat", V.str("not-a-number"));
+            Resolution r = s.saveAsync(T_B, 9L, 0L).get(10,
+                    TimeUnit.SECONDS);
+            assertEquals(Status.BLOCKED, r.status);
+            assertEquals(Reason.SOURCE_CORRUPT, r.reason);
+            assertEquals(0, b.writeCalls);
+        } finally {
+            s.close();
+        }
+    }
+
+    /** DELETED + непустой encrypted — несогласованность, не перезаписывать. */
+    @Test
+    public void deletedWithEncryptedCredsBlocksSave() throws Exception {
+        FakeBackend b = new FakeBackend();
+        CredentialStore s = new CredentialStore(b);
+        try {
+            assertEquals(Status.DELETED,
+                    s.deleteAsync().get(10, TimeUnit.SECONDS).status);
+            // Посторонняя запись реквизитов после удаления.
+            b.putRaw(Role.ENCRYPTED, "token", V.str(T_A));
+            Resolution r = s.saveAsync(T_B, 9L, 0L).get(10,
+                    TimeUnit.SECONDS);
+            assertEquals(Status.BLOCKED, r.status);
+            assertEquals(Reason.SERVICE_STATE_MISMATCH, r.reason);
+            assertEquals(0, b.writeCalls);
+            assertEquals(T_A, b.disk.get(Role.ENCRYPTED).get("token").s);
+        } finally {
+            s.close();
+        }
+    }
+
+    /** DELETED + legacy: resolve без миграции, save без записи. */
+    @Test
+    public void deletedWithLegacyBlocksSaveAndMigration()
+            throws Exception {
+        FakeBackend b = new FakeBackend();
+        CredentialStore s = new CredentialStore(b);
+        try {
+            assertEquals(Status.DELETED,
+                    s.deleteAsync().get(10, TimeUnit.SECONDS).status);
+            b.seed(Role.PLAIN, T_A, 5L, null); // «воскресший» legacy-токен
+            Resolution r = await(s);
+            assertEquals(Status.DELETED, r.status);
+            assertFalse(r.sendPermitted());
+            assertEquals(0, b.writeCalls);   // миграции нет
+            assertEquals(0, b.clearCalls);   // legacy не тронут
+            Resolution r2 = s.saveAsync(T_B, 9L, 0L).get(10,
+                    TimeUnit.SECONDS);
+            assertEquals(Status.BLOCKED, r2.status);
+            assertEquals(Reason.SERVICE_STATE_MISMATCH, r2.reason);
+            assertEquals(0, b.writeCalls);
+            assertEquals(T_A, b.disk.get(Role.PLAIN).get("token").s);
+        } finally {
+            s.close();
+        }
+    }
+
+    /** C: новое DELETED во время pending миграции не снимается старым планом. */
+    @Test
+    public void foreignDeleteBlocksPendingMigration() throws Exception {
+        FakeBackend b = new FakeBackend();
+        b.seed(Role.PLAIN, T_A, 5L, null);
+        b.failWrites = 1;
+        CredentialStore s = new CredentialStore(b);
+        try {
+            assertEquals(Status.INCOMPLETE, await(s).status);
+            // Подтверждённое удаление: enc пуст, маркер на диске.
+            b.cache.get(Role.ENCRYPTED).clear();
+            b.disk.get(Role.ENCRYPTED).clear();
+            b.putRaw(Role.ENCRYPTED, "meta",
+                    V.str(CredentialBackend.STATE_DELETED));
+            int writes = b.writeCalls;
+            Resolution r = await(s);
+            assertEquals(Status.INCOMPLETE, r.status);
+            assertEquals(Reason.SERVICE_STATE_CHANGED, r.reason);
+            assertFalse(r.sendPermitted());
+            assertEquals(writes, b.writeCalls); // старый put не повторён
+            assertEquals(0, b.clearCalls);    // legacy не очищен
+            assertEquals(T_A, b.disk.get(Role.PLAIN).get("token").s);
+            assertEquals(CredentialBackend.STATE_DELETED,
+                    b.disk.get(Role.ENCRYPTED).get("meta").s);
+        } finally {
+            s.close();
+        }
+    }
+
+    /** Новое DELETED во время pending SAVE не снимается старым сохранением. */
+    @Test
+    public void foreignDeleteBlocksPendingSave() throws Exception {
+        FakeBackend b = new FakeBackend();
+        b.failWrites = 1;
+        CredentialStore s = new CredentialStore(b);
+        try {
+            assertEquals(Status.INCOMPLETE,
+                    s.saveAsync(T_A, 5L, 0L).get(10, TimeUnit.SECONDS)
+                            .status);
+            // Постороннее подтверждённое удаление: диск без реквизитов,
+            // маркер DELETED; кеш имитирует то же состояние.
+            b.cache.get(Role.ENCRYPTED).clear();
+            b.disk.get(Role.ENCRYPTED).clear();
+            b.putRaw(Role.ENCRYPTED, "meta",
+                    V.str(CredentialBackend.STATE_DELETED));
+            int writes = b.writeCalls;
+            Resolution r = await(s);
+            assertEquals(Status.INCOMPLETE, r.status);
+            assertEquals(Reason.SERVICE_STATE_CHANGED, r.reason);
+            assertEquals(writes, b.writeCalls);
+        } finally {
+            s.close();
+        }
+    }
+
+    /** Отказ delete с грязным маркером: DELETED не публикуется до commit. */
+    @Test
+    public void deleteDirtyMarkerNotPublishedUntilCommit()
+            throws Exception {
+        FakeBackend b = new FakeBackend();
+        b.seed(Role.ENCRYPTED, T_A, 5L, null);
+        b.failDeleteOn.add(1);
+        CredentialStore s = new CredentialStore(b);
+        // Другой backend того же storageId — общие диск/кеш, свой счётчик.
+        FakeBackend b2 = b.sameProcessStorage();
+        b2.failDeleteOn.add(1); // первый commit нового backend тоже false
+        CredentialStore s2 = new CredentialStore(b2);
+        try {
+            assertEquals(Status.INCOMPLETE,
+                    s.deleteAsync().get(10, TimeUnit.SECONDS).status);
+            // Грязный маркер DELETED в общем кеше — не результат.
+            Resolution r = await(s2);
+            assertEquals(Status.INCOMPLETE, r.status);
+            assertEquals(1, b2.deleteCalls); // реальный повторный commit
+            assertEquals(T_A, b.disk.get(Role.ENCRYPTED).get("token").s);
+            Resolution r2 = await(s2);
+            assertEquals(Status.DELETED, r2.status);
+            assertEquals(2, b2.deleteCalls);
+        } finally {
+            s.close();
+            s2.close();
+        }
+    }
+
+    /** Новый handle того же storageId не обходит проверку маркера. */
+    @Test
+    public void newHandleDoesNotBypassMarkerCheck() throws Exception {
+        FakeBackend b = new FakeBackend();
+        b.failWrites = 1;
+        CredentialStore s1 = new CredentialStore(b);
+        try {
+            assertEquals(Status.INCOMPLETE,
+                    s1.saveAsync(T_A, 5L, 0L).get(10, TimeUnit.SECONDS)
+                            .status);
+            b.putRaw(Role.ENCRYPTED, "meta", V.str("v9:x"));
+            int writes = b.writeCalls;
+            // Другой backend того же storageId видит общий долг и маркер.
+            CredentialStore s2 =
+                    new CredentialStore(b.sameProcessStorage());
+            try {
+                Resolution r = await(s2);
+                assertEquals(Status.INCOMPLETE, r.status);
+                assertEquals(Reason.SERVICE_STATE_INVALID, r.reason);
+                assertEquals(writes, b.writeCalls);
+            } finally {
+                s2.close();
+            }
+        } finally {
+            s1.close();
+        }
+    }
+
+    /** Отказ save после DELETED: повтор — реальная запись, затем READY. */
+    @Test
+    public void saveAfterDeleteRetryIsReal() throws Exception {
+        FakeBackend b = new FakeBackend();
+        CredentialStore s = new CredentialStore(b);
+        try {
+            assertEquals(Status.DELETED,
+                    s.deleteAsync().get(10, TimeUnit.SECONDS).status);
+            b.failWrites = 1;
+            assertEquals(Status.INCOMPLETE,
+                    s.saveAsync(T_B, 9L, 0L).get(10, TimeUnit.SECONDS)
+                            .status);
+            int writes = b.writeCalls;
+            Resolution r = await(s);
+            assertEquals(Status.READY, r.status);
+            assertEquals(T_B, r.token);
+            assertEquals(writes + 1, b.writeCalls);
+            assertEquals(CredentialBackend.STATE_ACTIVE,
+                    b.disk.get(Role.ENCRYPTED).get("meta").s);
+        } finally {
+            s.close();
         }
     }
 
