@@ -19,6 +19,14 @@ import com.example.xdrip2vk.core.CredentialAudit.Source;
  */
 public interface CredentialBackend {
 
+    /**
+     * Идентичность процессного хранилища (набор файлов): backend'ы с
+     * одинаковым id разделяют координатор и незавершённые операции.
+     * Новый объект backend с тем же id — НЕ новый процесс и не обходит
+     * защиту. Только настоящий новый процесс восстанавливается из диска.
+     */
+    Object storageId();
+
     /** Снимок одного источника для CredentialAudit. */
     Source snapshot(Role role);
 

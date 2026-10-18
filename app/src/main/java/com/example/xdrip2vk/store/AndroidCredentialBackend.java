@@ -44,6 +44,9 @@ public final class AndroidCredentialBackend implements CredentialBackend {
         SharedPreferences open(Context context) throws Exception;
     }
 
+    /** Фиксированный набор файлов реквизитов — общий id процессного хранилища. */
+    private static final Object STORAGE_ID = "xdrip2vk-credentials";
+
     private final Context appContext;
     private final EncryptedOpener opener;
     private volatile SharedPreferences encrypted;
@@ -60,6 +63,11 @@ public final class AndroidCredentialBackend implements CredentialBackend {
     public AndroidCredentialBackend(Context context, EncryptedOpener opener) {
         this.appContext = context.getApplicationContext();
         this.opener = opener;
+    }
+
+    @Override
+    public Object storageId() {
+        return STORAGE_ID;
     }
 
     private SharedPreferences prefs(Role role) throws Exception {

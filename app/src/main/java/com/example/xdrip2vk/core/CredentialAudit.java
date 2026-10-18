@@ -182,7 +182,7 @@ public final class CredentialAudit {
                     Entry.absent(), Entry.absent(), Entry.absent());
         }
 
-        boolean hasKey() {
+        public boolean hasKey() {
             return token.kind != Entry.Kind.ABSENT
                     || chatId.kind != Entry.Kind.ABSENT
                     || alertChatId.kind != Entry.Kind.ABSENT;

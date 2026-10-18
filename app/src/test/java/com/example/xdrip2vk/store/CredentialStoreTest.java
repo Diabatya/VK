@@ -63,7 +63,9 @@ public class CredentialStoreTest {
         final Map<Role, Map<String, V>> disk = new EnumMap<>(Role.class);
         final Map<Role, Map<String, V>> cache = new EnumMap<>(Role.class);
         final Map<Role, Read> readState = new EnumMap<>(Role.class);
+        Object storageId = new Object(); // id процессного хранилища
         int failWrites;      // сколько putCredentials вернут false
+        boolean throwOnWrite, throwOnClear;
         final java.util.Set<Integer> failClearOn = new java.util.HashSet<>();
         int writeCalls, clearCalls;
         final AtomicInteger snapshots = new AtomicInteger();
@@ -76,6 +78,22 @@ public class CredentialStoreTest {
                 cache.put(r, new HashMap<String, V>());
                 readState.put(r, Read.READABLE);
             }
+        }
+
+        /** Второй backend НАД ТЕМ ЖЕ процессным хранилищем (не новый процесс). */
+        FakeBackend sameProcessStorage() {
+            return new FakeBackend(disk, cache, storageId);
+        }
+
+        private FakeBackend(Map<Role, Map<String, V>> sharedDisk,
+                            Map<Role, Map<String, V>> sharedCache,
+                            Object id) {
+            disk.putAll(sharedDisk);
+            cache.putAll(sharedCache);
+            for (Role r : Role.values()) {
+                readState.put(r, Read.READABLE);
+            }
+            this.storageId = id;
         }
 
         void seed(Role r, String token, Long chat, Long alert) {
@@ -104,6 +122,11 @@ public class CredentialStoreTest {
                 fresh.cache.get(r).putAll(disk.get(r));
             }
             return fresh;
+        }
+
+        @Override
+        public Object storageId() {
+            return storageId;
         }
 
         private Entry entry(Map<String, V> m, String key, boolean numeric) {
@@ -142,6 +165,9 @@ public class CredentialStoreTest {
             cache.get(Role.ENCRYPTED).put("token", V.str(token));
             cache.get(Role.ENCRYPTED).put("chat", V.num(chatId));
             cache.get(Role.ENCRYPTED).put("alert", V.num(alertChatId));
+            if (throwOnWrite) {
+                throw new RuntimeException("write failed after cache");
+            }
             if (failWrites > 0) {
                 failWrites--; // commit=false: диск не изменён, кеш грязный
                 return false;
@@ -157,6 +183,9 @@ public class CredentialStoreTest {
             c.remove("token");
             c.remove("chat");
             c.remove("alert");
+            if (throwOnClear) {
+                throw new RuntimeException("clear failed after cache");
+            }
             if (failClearOn.contains(clearCalls)) {
                 return false; // commit=false: на диске ключи остались
             }
@@ -416,6 +445,200 @@ public class CredentialStoreTest {
         assertEquals("credential-store", b.threadName);
         assertNotEquals(Thread.currentThread().getName(), b.threadName);
         store.shutdown();
+    }
+
+    // --- регрессии 2Г.3Б.1 ---
+
+    @Test
+    public void failedClearRetriedBySameStore() throws Exception {
+        // Воспроизведение №1: чистый кеш давал ложный READY без повтора
+        // очистки. Теперь долг очистки — конкретная операция координатора.
+        FakeBackend b = new FakeBackend();
+        b.seed(Role.PLAIN, T_A, 5L, null);
+        b.failClearOn.add(1);
+        CredentialStore store = new CredentialStore(b);
+        try {
+            Resolution r1 = await(store);
+            assertEquals(Status.INCOMPLETE, r1.status);
+
+            Resolution r2 = await(store);
+            assertEquals(2, b.clearCalls); // реальный второй remove
+            assertEquals(Status.READY, r2.status);
+            assertTrue(b.disk.get(Role.PLAIN).isEmpty());
+        } finally {
+            store.close();
+        }
+    }
+
+    @Test
+    public void repeatedClearFailureStaysIncomplete() throws Exception {
+        FakeBackend b = new FakeBackend();
+        b.seed(Role.PLAIN, T_A, 5L, null);
+        b.failClearOn.add(1);
+        b.failClearOn.add(2);
+        CredentialStore store = new CredentialStore(b);
+        try {
+            assertEquals(Status.INCOMPLETE, await(store).status);
+            Resolution r = await(store);
+            assertEquals(Status.INCOMPLETE, r.status);
+            assertEquals(Pending.SOURCE_CLEAR, r.pending);
+            assertFalse(r.sendPermitted());
+        } finally {
+            store.close();
+        }
+    }
+
+    @Test
+    public void orphanClearFailureNotFalseEmpty() throws Exception {
+        FakeBackend b = new FakeBackend();
+        b.putRaw(Role.DEFAULT, "chat", V.num(5L));
+        b.failClearOn.add(1);
+        CredentialStore store = new CredentialStore(b);
+        try {
+            assertEquals(Status.INCOMPLETE, await(store).status);
+            // Повтор реально очистит, только затем EMPTY.
+            assertEquals(Status.EMPTY, await(store).status);
+            assertNull(b.disk.get(Role.DEFAULT).get("chat"));
+        } finally {
+            store.close();
+        }
+    }
+
+    @Test
+    public void newStoreDoesNotTrustDirtyEncryptedCache() throws Exception {
+        // Воспроизведение №2: второй Store удалял plain по неподтверждённому
+        // encrypted-кешу. Координатор общий — запись сначала повторяется.
+        FakeBackend b = new FakeBackend();
+        b.seed(Role.PLAIN, T_A, 5L, null);
+        b.failWrites = 1;
+        CredentialStore first = new CredentialStore(b);
+        assertEquals(Status.INCOMPLETE, await(first).status);
+        first.close(); // кеш backend НЕ сброшен — тот же процесс
+
+        CredentialStore second = new CredentialStore(b);
+        try {
+            Resolution r = await(second);
+            assertEquals(Status.READY, r.status);
+            assertEquals(2, b.writeCalls); // повтор commit назначения
+            assertTrue(b.disk.get(Role.PLAIN).isEmpty());
+            assertEquals(T_A, b.disk.get(Role.ENCRYPTED).get("token").s);
+        } finally {
+            second.close();
+        }
+    }
+
+    @Test
+    public void newBackendSameStorageDoesNotBypass() throws Exception {
+        FakeBackend b = new FakeBackend();
+        b.seed(Role.PLAIN, T_A, 5L, null);
+        b.failWrites = 1;
+        CredentialStore first = new CredentialStore(b);
+        assertEquals(Status.INCOMPLETE, await(first).status);
+        first.close();
+
+        FakeBackend b2 = b.sameProcessStorage(); // тот же диск/кеш/id
+        CredentialStore second = new CredentialStore(b2);
+        try {
+            Resolution r = await(second);
+            assertEquals(Status.READY, r.status);
+            assertTrue(b.disk.get(Role.PLAIN).isEmpty());
+            assertEquals(T_A, b.disk.get(Role.ENCRYPTED).get("token").s);
+        } finally {
+            second.close();
+        }
+    }
+
+    @Test
+    public void twoHandlesAreSerialized() throws Exception {
+        FakeBackend b = new FakeBackend();
+        b.seed(Role.PLAIN, T_A, 5L, null);
+        CredentialStore s1 = new CredentialStore(b);
+        CredentialStore s2 = new CredentialStore(b);
+        try {
+            Resolution r1 = s1.resolveAsync().get(10, TimeUnit.SECONDS);
+            Resolution r2 = s2.resolveAsync().get(10, TimeUnit.SECONDS);
+            assertEquals(Status.READY, r1.status);
+            assertEquals(Status.READY, r2.status);
+            assertEquals(1, b.writeCalls);   // операция одна — не дубль
+            assertEquals(1, b.clearCalls);
+        } finally {
+            s1.close();
+            s2.close();
+        }
+    }
+
+    @Test
+    public void newCredsAfterFailedClearAreNotDeleted() throws Exception {
+        FakeBackend b = new FakeBackend();
+        b.seed(Role.PLAIN, T_A, 5L, null);
+        b.failClearOn.add(1);
+        CredentialStore store = new CredentialStore(b);
+        try {
+            assertEquals(Status.INCOMPLETE, await(store).status);
+            // Между отказом и повтором источник получил новые реквизиты.
+            b.cache.get(Role.PLAIN).put("token", V.str(T_B));
+            b.disk.get(Role.PLAIN).put("token", V.str(T_B));
+            Resolution r = await(store);
+            assertEquals(Status.INCOMPLETE, r.status);
+            assertEquals(Pending.SOURCE_CHANGED, r.pending);
+            assertEquals(T_B, b.disk.get(Role.PLAIN).get("token").s);
+        } finally {
+            store.close();
+        }
+    }
+
+    @Test
+    public void newCredsAfterFailedWriteNotOverwrittenByOldPlan() throws Exception {
+        FakeBackend b = new FakeBackend();
+        b.seed(Role.PLAIN, T_A, 5L, null);
+        b.failWrites = 1;
+        CredentialStore store = new CredentialStore(b);
+        try {
+            assertEquals(Status.INCOMPLETE, await(store).status);
+            // В encrypted попали новые реквизиты — старый план их не трогает.
+            b.cache.get(Role.ENCRYPTED).put("token", V.str(T_B));
+            b.disk.get(Role.ENCRYPTED).put("token", V.str(T_B));
+            Resolution r = await(store);
+            assertEquals(Status.INCOMPLETE, r.status);
+            assertEquals(Pending.SOURCE_CHANGED, r.pending);
+            assertEquals(T_B, b.disk.get(Role.ENCRYPTED).get("token").s);
+            assertEquals(T_A, b.disk.get(Role.PLAIN).get("token").s);
+        } finally {
+            store.close();
+        }
+    }
+
+    @Test
+    public void writeExceptionAfterCacheKeepsProtection() throws Exception {
+        FakeBackend b = new FakeBackend();
+        b.seed(Role.PLAIN, T_A, 5L, null);
+        b.throwOnWrite = true; // исключение после изменения кеша
+        CredentialStore store = new CredentialStore(b);
+        try {
+            assertEquals(Status.INCOMPLETE, await(store).status);
+            b.throwOnWrite = false;
+            Resolution r = await(store);
+            assertEquals(Status.READY, r.status);
+            assertTrue(b.disk.get(Role.PLAIN).isEmpty());
+        } finally {
+            store.close();
+        }
+    }
+
+    @Test
+    public void clearExceptionAfterCacheKeepsProtection() throws Exception {
+        FakeBackend b = new FakeBackend();
+        b.seed(Role.PLAIN, T_A, 5L, null);
+        b.throwOnClear = true;
+        CredentialStore store = new CredentialStore(b);
+        try {
+            assertEquals(Status.INCOMPLETE, await(store).status);
+            b.throwOnClear = false;
+            assertEquals(Status.READY, await(store).status);
+            assertTrue(b.disk.get(Role.PLAIN).isEmpty());
+        } finally {
+            store.close();
+        }
     }
 
     @Test

@@ -8,34 +8,31 @@ import com.example.xdrip2vk.core.CredentialAudit.Reason;
 import com.example.xdrip2vk.core.CredentialAudit.Role;
 import com.example.xdrip2vk.core.CredentialAudit.Source;
 import com.example.xdrip2vk.core.CredentialAudit.Verdict;
+import com.example.xdrip2vk.store.CredentialCoordinator.PendingOp;
 
-import java.util.concurrent.ExecutorService;
-import java.util.concurrent.Executors;
+import java.util.ArrayList;
+import java.util.List;
 import java.util.concurrent.Future;
 
 /**
- * Исполнитель слоя реквизитов (задание 2Г.3Б): читает снимки через
- * подменяемый {@link CredentialBackend}, принимает решение настоящим
+ * Исполнитель слоя реквизитов (задания 2Г.3Б/2Г.3Б.1): читает снимки
+ * через {@link CredentialBackend}, решает настоящим
  * {@link CredentialAudit} и выполняет только однозначный план.
  *
- * Не подключён к действующим TokenStorage/Activity/receivers/сервису —
- * вызывается тестами. Автоматической миграции при старте нет.
+ * Не подключён к действующим TokenStorage/Activity/receivers/сервису.
  *
- * Порядок переноса непустого токена:
- *   снимки → commit записи назначения → перепроверка источника →
- *   commit очистки каждого источника → повторная проверка итога.
+ * Владение состоянием: сериализация и незавершённые операции живут в
+ * {@link CredentialCoordinator} по storageId хранилища — общие для всех
+ * handle/backend в процессе. Замена Store или backend не является
+ * новым процессом и не делает кеш достоверным: неподтверждённые записи
+ * и очистки учитываются всеми экземплярами. Только настоящий новый
+ * процесс восстанавливается из реально сохранённых данных на диске.
  *
- * commit()==true — единственное подтверждение записи: read-back из
- * того же SharedPreferences не доверяется (commit=false пачкает кеш).
- * Незавершённая операция хранится как in-process pendingState; в новом
- * процессе восстановление выполняется из реально сохранённых данных —
- * повторный check видит подтверждённые шаги и продолжает план.
- * Отдельный marker в default prefs протоколом не заменяется.
- *
- * Все операции сериализуются одним рабочим потоком — диск и Keystore
- * вне главного потока. Секреты не выводятся в диагностику.
+ * commit()==true — единственное подтверждение записи/очистки:
+ * read-back из того же SharedPreferences не доверяется. READY/EMPTY из
+ * аудита грязного кеша не снимают незавершённую операцию.
  */
-public final class CredentialStore {
+public final class CredentialStore implements AutoCloseable {
 
     /** Фаза незавершённой операции в процессе. */
     public enum Pending {
@@ -44,7 +41,7 @@ public final class CredentialStore {
         DESTINATION_WRITE,
         /** Очистка одного или нескольких источников не подтверждена. */
         SOURCE_CLEAR,
-        /** Источник изменился до очистки — требуется новая проверка. */
+        /** Реквизиты изменились во время операции — нужна новая проверка. */
         SOURCE_CHANGED
     }
 
@@ -92,128 +89,245 @@ public final class CredentialStore {
     }
 
     private final CredentialBackend backend;
-    private final ExecutorService worker =
-            Executors.newSingleThreadExecutor(r ->
-                    new Thread(r, "credential-store"));
-
-    /** In-process состояние незавершённой операции (под lock worker'а). */
-    private Pending pendingState = Pending.NONE;
-    /** Запись назначения не подтверждена — alreadyEncrypted не доверять. */
-    private boolean destinationWriteUnconfirmed;
+    private final CredentialCoordinator coord;
+    private volatile boolean closed;
 
     public CredentialStore(CredentialBackend backend) {
         this.backend = backend;
+        this.coord = CredentialCoordinator.acquire(backend.storageId());
     }
 
-    /** Сериализованная проверка/миграция — на рабочем потоке. */
+    /** Сериализованная проверка/миграция — на общем рабочем потоке хранилища. */
     public Future<Resolution> resolveAsync() {
-        return worker.submit(this::resolve);
+        return coord.submit(this::resolve);
     }
 
-    /** Для будущего подключения: все записи реквизитов — через этот worker. */
-    public ExecutorService executor() {
-        return worker;
-    }
-
+    /**
+     * Закрытие handle: состояние координатора сохраняется, общий worker
+     * завершается мягко, когда закрыт последний handle (без прерывания
+     * выполняющегося commit).
+     */
     public void shutdown() {
-        worker.shutdownNow();
+        close();
+    }
+
+    @Override
+    public void close() {
+        if (!closed) {
+            closed = true;
+            coord.release();
+        }
     }
 
     private Resolution resolve() {
-        Source enc = backend.snapshot(Role.ENCRYPTED);
-        Source plain = backend.snapshot(Role.PLAIN);
-        Source def = backend.snapshot(Role.DEFAULT);
-        Outcome o = CredentialAudit.check(enc, plain, def);
-        Source[] snapshot = {enc, plain, def};
+        Source enc = snapshot(Role.ENCRYPTED);
+        Source plain = snapshot(Role.PLAIN);
+        Source def = snapshot(Role.DEFAULT);
+        Source[] snap = {enc, plain, def};
 
+        // Незавершённая операция приоритетнее нового аудита кеша:
+        // очищенный в кеше источник не отменяет долг подтвердить очистку,
+        // грязный encrypted-кеш не делает запись назначения подтверждённой.
+        PendingOp op = coord.pending;
+        if (op != null) {
+            return resume(op, snap);
+        }
+
+        Outcome o = CredentialAudit.check(enc, plain, def);
         switch (o.verdict) {
             case READY_SECURED:
-                pendingState = Pending.NONE;
                 return new Resolution(Status.READY, o.reason, Pending.NONE,
                         enc.token.string, enc.effectiveChatId(),
                         enc.effectiveAlertChatId());
             case EMPTY:
-                pendingState = Pending.NONE;
                 return new Resolution(Status.EMPTY, o.reason, Pending.NONE,
                         "", 0, 0);
             case MIGRATION_REQUIRED:
-                return executePlan(o, snapshot);
+                return startPlan(o, snap);
             default: // CONFLICT / UNAVAILABLE / CORRUPT — ничего не писать
-                return new Resolution(Status.BLOCKED, o.reason, pendingState,
-                        "", 0, 0);
+                return new Resolution(Status.BLOCKED, o.reason,
+                        pendingOf(coord.pending), "", 0, 0);
         }
     }
 
-    private Resolution executePlan(Outcome o, Source[] snapshot) {
+    /** Новая однозначная операция: запись назначения → точечные очистки. */
+    private Resolution startPlan(Outcome o, Source[] snap) {
         Plan plan = o.plan;
         if (plan == null) {
-            return new Resolution(Status.BLOCKED, o.reason, pendingState,
+            return new Resolution(Status.BLOCKED, o.reason, Pending.NONE,
                     "", 0, 0);
         }
+        PendingOp op = new PendingOp(snap, plan);
+        op.pendingClears.addAll(plan.clearSources); // всё плановое — долг
+        coord.pending = op;
 
-        // 1. Запись назначения одним commit — только для непустого токена.
-        //    alreadyEncrypted доверяется лишь при отсутствии в процессе
-        //    неподтверждённой записи: грязный кеш успехом не считается.
-        if (!plan.token.isEmpty()
-                && (!plan.alreadyEncrypted || destinationWriteUnconfirmed)) {
-            if (!backend.putCredentials(plan.token, plan.chatId,
-                    plan.alertChatId)) {
-                destinationWriteUnconfirmed = true;
-                pendingState = Pending.DESTINATION_WRITE;
+        if (!plan.token.isEmpty() && !plan.alreadyEncrypted) {
+            if (!put(plan)) {
+                op.destinationUnconfirmed = true;
                 return new Resolution(Status.INCOMPLETE, o.reason,
-                        pendingState, "", 0, 0);
-            }
-            destinationWriteUnconfirmed = false;
-        }
-
-        // 2. Очистка источников — каждая своим commit, после перепроверки,
-        //    что реквизиты источника не изменились со времени снимка.
-        for (Role role : plan.clearSources) {
-            if (!sameCredentials(sourceOf(snapshot, role),
-                    backend.snapshot(role))) {
-                pendingState = Pending.SOURCE_CHANGED;
-                return new Resolution(Status.INCOMPLETE, o.reason,
-                        pendingState, "", 0, 0);
-            }
-            if (!backend.removeCredentials(role)) {
-                pendingState = Pending.SOURCE_CLEAR;
-                return new Resolution(Status.INCOMPLETE, o.reason,
-                        pendingState, "", 0, 0);
+                        Pending.DESTINATION_WRITE, "", 0, 0);
             }
         }
+        for (Role role : new ArrayList<>(op.pendingClears)) {
+            Resolution r = clearOnce(op, role, o.reason);
+            if (r != null) {
+                return r;
+            }
+            op.pendingClears.remove(role);
+        }
+        return finish(o.reason, plan);
+    }
 
-        // 3. Повторная проверка итогового состояния.
-        Source enc = backend.snapshot(Role.ENCRYPTED);
+    /**
+     * Продолжение незавершённой операции любым handle этого хранилища:
+     * сначала поверка источников относительно исходного снимка, затем
+     * повтор неподтверждённых шагов.
+     */
+    private Resolution resume(PendingOp op, Source[] snap) {
+        for (Role role : Role.values()) {
+            Source stored = sourceOf(op.snapshot, role);
+            Source cur = sourceOf(snap, role);
+            if (op.pendingClears.contains(role)) {
+                // Цель очистки: старые реквизиты либо пропавшие из кеша —
+                // ок; иные непустые значения — чужие данные, не удалять.
+                if (!sameCredentials(stored, cur) && hasCredentials(cur)) {
+                    return changed();
+                }
+            } else if (role == Role.ENCRYPTED) {
+                // Назначение: исходное состояние или значения нашего плана
+                // (неподтверждённая запись могла остаться в кеше).
+                if (!sameCredentials(stored, cur)
+                        && !matchesPlan(cur, op.plan)) {
+                    return changed();
+                }
+            } else if (!sameCredentials(stored, cur)) {
+                return changed();
+            }
+        }
+
+        if (op.destinationUnconfirmed) {
+            if (!put(op.plan)) {
+                return new Resolution(Status.INCOMPLETE, Reason.NONE,
+                        Pending.DESTINATION_WRITE, "", 0, 0);
+            }
+            op.destinationUnconfirmed = false;
+        }
+        for (Role role : new ArrayList<>(op.pendingClears)) {
+            Resolution r = clearOnce(op, role, Reason.NONE);
+            if (r != null) {
+                return r;
+            }
+            op.pendingClears.remove(role);
+        }
+        return finish(Reason.NONE, op.plan);
+    }
+
+    private Resolution changed() {
+        // Новые реквизиты не затираются старым планом: операция
+        // останавливается, требуется новая проверка. Состояние сохраняется.
+        return new Resolution(Status.INCOMPLETE, Reason.NONE,
+                Pending.SOURCE_CHANGED, "", 0, 0);
+    }
+
+    /** Одна очистка с предварительной проверкой неизменности источника. */
+    private Resolution clearOnce(PendingOp op, Role role, Reason reason) {
+        Source cur = backendSnapshotSafe(role);
+        Source stored = sourceOf(op.snapshot, role);
+        // Если источник успели наполнить новыми реквизитами — не удалять.
+        if (!sameCredentials(stored, cur) && hasCredentials(cur)) {
+            return changed();
+        }
+        if (!remove(role)) {
+            return new Resolution(Status.INCOMPLETE, reason,
+                    Pending.SOURCE_CLEAR, "", 0, 0);
+        }
+        return null;
+    }
+
+    private Resolution finish(Reason reason, Plan plan) {
+        Source enc = snapshot(Role.ENCRYPTED);
         Outcome after = CredentialAudit.check(enc,
-                backend.snapshot(Role.PLAIN), backend.snapshot(Role.DEFAULT));
+                snapshot(Role.PLAIN), snapshot(Role.DEFAULT));
         if (after.verdict == Verdict.READY_SECURED) {
-            pendingState = Pending.NONE;
+            coord.pending = null;
             return new Resolution(Status.READY, after.reason, Pending.NONE,
                     enc.token.string, enc.effectiveChatId(),
                     enc.effectiveAlertChatId());
         }
-        if (after.verdict == Verdict.EMPTY) {
-            pendingState = Pending.NONE;
+        if (after.verdict == Verdict.EMPTY
+                && (plan == null || plan.token.isEmpty())) {
+            coord.pending = null;
             return new Resolution(Status.EMPTY, after.reason, Pending.NONE,
                     "", 0, 0);
         }
-        // Очистка частично не сохранилась либо появились новые данные —
-        // миграция не объявляется завершённой.
-        pendingState = Pending.SOURCE_CLEAR;
-        return new Resolution(Status.INCOMPLETE, after.reason, pendingState,
-                "", 0, 0);
+        // Итог не соответствует завершённой операции — не завершена.
+        return new Resolution(Status.INCOMPLETE, after.reason,
+                Pending.SOURCE_CLEAR, "", 0, 0);
+    }
+
+    private boolean put(Plan plan) {
+        try {
+            return backend.putCredentials(plan.token, plan.chatId,
+                    plan.alertChatId);
+        } catch (RuntimeException e) {
+            return false; // как commit=false: кеш грязный, диск не подтверждён
+        }
+    }
+
+    private boolean remove(Role role) {
+        try {
+            return backend.removeCredentials(role);
+        } catch (RuntimeException e) {
+            return false;
+        }
+    }
+
+    private Source snapshot(Role role) {
+        return backendSnapshotSafe(role);
+    }
+
+    private Source backendSnapshotSafe(Role role) {
+        try {
+            Source s = backend.snapshot(role);
+            return s == null ? Source.corrupt(role) : s;
+        } catch (RuntimeException e) {
+            return Source.corrupt(role);
+        }
+    }
+
+    private static Pending pendingOf(PendingOp op) {
+        if (op == null) {
+            return Pending.NONE;
+        }
+        if (op.destinationUnconfirmed) {
+            return Pending.DESTINATION_WRITE;
+        }
+        return Pending.SOURCE_CLEAR;
+    }
+
+    /** Источник содержит какие-либо ключи реквизитов. */
+    private static boolean hasCredentials(Source s) {
+        return s != null && s.hasKey();
+    }
+
+    /** Текущие реквизиты источника равны значениям плана (наша запись). */
+    private static boolean matchesPlan(Source s, Plan plan) {
+        return s != null && plan != null
+                && s.token.kind == Entry.Kind.PRESENT
+                && s.token.string.equals(plan.token)
+                && s.effectiveChatId() == plan.chatId
+                && s.effectiveAlertChatId() == plan.alertChatId;
     }
 
     private static Source sourceOf(Source[] snapshot, Role role) {
         for (Source s : snapshot) {
-            if (s.role == role) {
+            if (s != null && s.role == role) {
                 return s;
             }
         }
         return null;
     }
 
-    /** Сравнение реквизитов двух снимков (kind+тип+значение по трём ключам). */
     private static boolean sameCredentials(Source a, Source b) {
         if (a == null || b == null) {
             return false;
