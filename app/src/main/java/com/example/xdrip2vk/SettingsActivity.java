@@ -240,7 +240,7 @@ public class SettingsActivity extends AppCompatActivity {
             }
         }
 
-        private void onTokenFileSelected(Uri uri) {
+        void onTokenFileSelected(Uri uri) { // package-private — проверка пути импорта в тестах
             if (uri == null || getContext() == null) {
                 return;
             }
@@ -271,7 +271,10 @@ public class SettingsActivity extends AppCompatActivity {
                 }
                 Toast.makeText(requireContext(), "Токен импортирован", Toast.LENGTH_SHORT).show();
             } catch (IOException e) {
-                Toast.makeText(requireContext(), "Ошибка чтения файла: " + e.getMessage(), Toast.LENGTH_LONG).show();
+                // getMessage() может содержать фрагмент содержимого файла —
+                // пользователю показывается только фиксированная причина.
+                Toast.makeText(requireContext(), "Ошибка чтения файла",
+                        Toast.LENGTH_LONG).show();
             }
         }
     }

@@ -177,7 +177,7 @@ public class VkSenderService extends Service {
      */
     void onWorkerFailure(Thread thread, Throwable ex) {
         Logger.e(TAG, "Критическая ошибка в фоновом потоке: "
-                + (ex == null ? "unknown" : ex.getMessage()));
+                + (ex == null ? "unknown" : ex.getClass().getSimpleName()));
         workerFailed = true;
         if (activeInstance == this) {
             isRunning = false; // сервис больше не считается работающим
@@ -1257,7 +1257,10 @@ public class VkSenderService extends Service {
                 scheduleNextAlarm();
             }
         } catch (Exception e) {
-            Logger.e(TAG, "Ошибка при опросе xDrip+: " + e.getMessage());
+            // На пути данных исключение может нести фрагмент ответа —
+            // в лог только класс исключения.
+            Logger.e(TAG, "Ошибка при опросе xDrip+: "
+                    + e.getClass().getSimpleName());
         } finally {
             if (acquired && wakeLock != null && wakeLock.isHeld()) {
                 try {

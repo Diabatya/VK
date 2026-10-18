@@ -24,7 +24,7 @@ public class VkApi {
     private static final int CONNECT_TIMEOUT = 10000;
     private static final int READ_TIMEOUT = 10000;
 
-    private static final class RawResponse {
+    static final class RawResponse {
         final int httpCode;
         final String body;
 
@@ -55,10 +55,44 @@ public class VkApi {
                 response == null ? -1 : response.httpCode,
                 response == null ? null : response.body);
         if (result != SendResult.SENT) {
-            Logger.e(TAG, "Ошибка отправки сообщения ВК (" + result + "): "
-                    + (response == null ? "нет ответа" : response.body));
+            // Безопасная диагностика: тело ответа может содержать токен,
+            // текст сообщения и peer_id в request_params — в лог не выводим.
+            int errorCode = extractErrorCode(
+                    response == null ? null : response.body);
+            Logger.e(TAG, "Ошибка отправки сообщения ВК: op=messages.send"
+                    + ", http=" + (response == null ? -1 : response.httpCode)
+                    + ", result=" + result
+                    + (errorCode >= 0 ? ", error_code=" + errorCode : ""));
         }
         return result;
+    }
+
+    /**
+     * Числовой error_code из тела ответа VK; -1 — не извлечён (битый JSON,
+     * нет объекта error, нецелое значение). Входные данные в лог не пишутся.
+     */
+    static int extractErrorCode(String body) {
+        if (body == null || body.isEmpty()) {
+            return -1;
+        }
+        try {
+            JSONObject error = new JSONObject(body).optJSONObject("error");
+            if (error == null) {
+                return -1;
+            }
+            Object code = error.opt("error_code");
+            if (!(code instanceof Number)) {
+                return -1;
+            }
+            double d = ((Number) code).doubleValue();
+            long l = ((Number) code).longValue();
+            if (d != l || l < 0 || l > Integer.MAX_VALUE) {
+                return -1; // дробный/отрицательный/переполнение — не код
+            }
+            return (int) l;
+        } catch (JSONException e) {
+            return -1;
+        }
     }
 
     /** Классификация ответа: сетевая ошибка отличается от ошибки авторизации и ошибки API. */
@@ -192,9 +226,24 @@ public class VkApi {
         return r == null ? null : r.body;
     }
 
+    /**
+     * Подменяемый транспорт — только для тестов без сети. Исключение
+     * транспорта проходит тот же путь безопасного журналирования, что и
+     * сетевая ошибка.
+     */
+    interface Transport {
+        RawResponse apply(String method, String token, Map<String, String> params);
+    }
+
+    static volatile Transport transportOverride;
+
     private static RawResponse requestRaw(String method, String token, Map<String, String> params) {
         HttpURLConnection connection = null;
         try {
+            Transport t = transportOverride;
+            if (t != null) {
+                return t.apply(method, token, params);
+            }
             StringBuilder body = new StringBuilder();
             body.append("access_token=").append(URLEncoder.encode(token, StandardCharsets.UTF_8.name()))
                 .append("&v=").append(API_VERSION);
@@ -239,7 +288,10 @@ public class VkApi {
                 return new RawResponse(responseCode, response.toString());
             }
         } catch (Exception e) {
-            Logger.e(TAG, "Исключение при запросе к API ВКонтакте: " + e.getMessage());
+            // e.getMessage() может содержать текст исключения с данными
+            // запроса — фиксированная причина + класс исключения.
+            Logger.e(TAG, "Сбой запроса к API ВКонтакте: "
+                    + e.getClass().getSimpleName());
             return null;
         } finally {
             if (connection != null) {

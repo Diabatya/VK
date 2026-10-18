@@ -109,9 +109,12 @@ public class VkConversationsActivity extends AppCompatActivity {
             JSONObject responseObj = new JSONObject(json);
 
             if (responseObj.has("error")) {
-                String errorMsg = responseObj.getJSONObject("error").getString("error_msg");
+                // error_msg/request_params могут содержать токен и данные
+                // запроса — показываем фиксированное сообщение + числовой код.
+                int code = VkApi.extractErrorCode(json);
                 runOnUiThread(() -> {
-                    Toast.makeText(this, "Ошибка VK: " + errorMsg, Toast.LENGTH_LONG).show();
+                    Toast.makeText(this, describeApiError(code),
+                            Toast.LENGTH_LONG).show();
                     finishLoad();
                 });
                 return;
@@ -166,11 +169,28 @@ public class VkConversationsActivity extends AppCompatActivity {
             });
 
         } catch (Exception e) {
-            e.printStackTrace();
+            // getMessage() может включать фрагмент ответа — только фиксированная
+            // причина и класс исключения в журнал, фиксированный текст в Toast.
+            Logger.e("VkConversations", "Некорректный ответ VK при загрузке бесед: "
+                    + e.getClass().getSimpleName());
             runOnUiThread(() -> {
-                Toast.makeText(this, "Ошибка парсинга: " + e.getMessage(), Toast.LENGTH_LONG).show();
+                Toast.makeText(this, "Некорректный ответ VK", Toast.LENGTH_LONG).show();
                 finishLoad();
             });
         }
+    }
+
+    /**
+     * Понятное сообщение по числовому коду ошибки VK без сырого текста ответа.
+     * Код 5 — отказ авторизации (контракт VK API); прочие коды — общий отказ.
+     */
+    private static String describeApiError(int code) {
+        if (code == 5) {
+            return "Ошибка авторизации VK";
+        }
+        if (code >= 0) {
+            return "Не удалось загрузить беседы (код " + code + ")";
+        }
+        return "Не удалось загрузить беседы";
     }
 }

@@ -24,7 +24,10 @@ public final class TokenStorage {
                     EncryptedSharedPreferences.PrefValueEncryptionScheme.AES256_GCM
             );
         } catch (Exception e) {
-            Logger.w("TokenStorage", "Защищённое хранилище недоступно, используем обычное: " + e.getMessage());
+            // Диагностика без e.getMessage(): произвольный текст исключения
+            // в лог не передаётся.
+            Logger.w("TokenStorage", "Защищённое хранилище недоступно, используем обычное: "
+                    + e.getClass().getSimpleName());
             return context.getApplicationContext().getSharedPreferences(FILENAME + "_plain", Context.MODE_PRIVATE);
         }
     }
