@@ -65,9 +65,11 @@ public class CredentialStoreTest {
         final Map<Role, Read> readState = new EnumMap<>(Role.class);
         Object storageId = new Object(); // id процессного хранилища
         int failWrites;      // сколько putCredentials вернут false
-        boolean throwOnWrite, throwOnClear, throwOnSnapshot;
+        boolean throwOnWrite, throwOnClear, throwOnSnapshot, throwOnDelete;
         final java.util.Set<Integer> throwWriteOn = new java.util.HashSet<>();
         final java.util.Set<Integer> failClearOn = new java.util.HashSet<>();
+        final java.util.Set<Integer> failDeleteOn = new java.util.HashSet<>();
+        int deleteCalls;
         final java.util.Set<Integer> failReadOn = new java.util.HashSet<>();
         int writeCalls, clearCalls;
         final AtomicInteger snapshots = new AtomicInteger();
@@ -169,12 +171,32 @@ public class CredentialStoreTest {
         }
 
         @Override
+        public ServiceState serviceState(Role role) {
+            V v = cache.get(role).get("meta");
+            if (v == null) {
+                return ServiceState.ABSENT;
+            }
+            if (v.wrongType || v.s == null) {
+                return ServiceState.INVALID;
+            }
+            if (CredentialBackend.STATE_ACTIVE.equals(v.s)) {
+                return ServiceState.ACTIVE;
+            }
+            if (CredentialBackend.STATE_DELETED.equals(v.s)) {
+                return ServiceState.DELETED;
+            }
+            return ServiceState.INVALID;
+        }
+
+        @Override
         public boolean putCredentials(String token, long chatId,
-                                      long alertChatId) {
+                                      long alertChatId,
+                                      String serviceState) {
             writeCalls++;
             cache.get(Role.ENCRYPTED).put("token", V.str(token));
             cache.get(Role.ENCRYPTED).put("chat", V.num(chatId));
             cache.get(Role.ENCRYPTED).put("alert", V.num(alertChatId));
+            cache.get(Role.ENCRYPTED).put("meta", V.str(serviceState));
             if (putStarted != null) {
                 putStarted.countDown();
             }
@@ -193,6 +215,28 @@ public class CredentialStoreTest {
                 return false;
             }
             disk.get(Role.ENCRYPTED).putAll(cache.get(Role.ENCRYPTED));
+            return true;
+        }
+
+        @Override
+        public boolean deleteCredentials() {
+            deleteCalls++;
+            Map<String, V> c = cache.get(Role.ENCRYPTED);
+            c.remove("token");
+            c.remove("chat");
+            c.remove("alert");
+            c.put("meta", V.str(CredentialBackend.STATE_DELETED));
+            if (throwOnDelete) {
+                throw new RuntimeException("delete failed after cache");
+            }
+            if (failDeleteOn.contains(deleteCalls)) {
+                return false; // кеш «удалён», диск — нет
+            }
+            Map<String, V> d = disk.get(Role.ENCRYPTED);
+            d.remove("token");
+            d.remove("chat");
+            d.remove("alert");
+            d.put("meta", V.str(CredentialBackend.STATE_DELETED));
             return true;
         }
 
@@ -1115,6 +1159,269 @@ public class CredentialStoreTest {
         assertEquals(Status.READY, r.status);
         assertEquals(T_A, r.token);
         assertTrue(b.disk.get(Role.PLAIN).isEmpty());
+    }
+
+    // --- 2Г.3В.1: сохранение и удаление ---
+
+    @Test
+    public void savePersistsAndRecovers() throws Exception {
+        FakeBackend b = new FakeBackend();
+        CredentialStore s = new CredentialStore(b);
+        try {
+            Resolution r = s.saveAsync(T_A, 5L, -2L).get(10,
+                    TimeUnit.SECONDS);
+            assertEquals(Status.READY, r.status);
+            assertEquals(T_A, r.token);
+            assertEquals(5L, r.chatId);
+            assertEquals(-2L, r.alertChatId);
+            assertEquals(1, b.writeCalls);
+            // Новый процесс читает диск — реквизиты и состояние целы.
+            FakeBackend b2 = b.reloadFromDisk();
+            CredentialStore s2 = new CredentialStore(b2);
+            Resolution r2 = await(s2);
+            assertEquals(Status.READY, r2.status);
+            assertEquals(T_A, r2.token);
+            s2.close();
+        } finally {
+            s.close();
+        }
+    }
+
+    @Test
+    public void saveCommitFalseKeepsProtectionAcrossHandles()
+            throws Exception {
+        FakeBackend b = new FakeBackend();
+        b.failWrites = 1;
+        CredentialStore s1 = new CredentialStore(b);
+        Resolution r1 = s1.saveAsync(T_A, 5L, 0L).get(10,
+                TimeUnit.SECONDS);
+        assertEquals(Status.INCOMPLETE, r1.status);
+        s1.close();
+        // Другой handle: грязный кеш не публикуется как READY.
+        CredentialStore s2 = new CredentialStore(b);
+        try {
+            Resolution r2 = await(s2);
+            assertEquals(Status.READY, r2.status);
+            assertEquals(2, b.writeCalls); // реальный повтор записи
+        } finally {
+            s2.close();
+        }
+    }
+
+    @Test
+    public void emptyTokenSaveIsRejected() throws Exception {
+        FakeBackend b = new FakeBackend();
+        CredentialStore s = new CredentialStore(b);
+        try {
+            Resolution r = s.saveAsync("   ", 5L, 0L).get(10,
+                    TimeUnit.SECONDS);
+            assertEquals(Status.BLOCKED, r.status);
+            assertEquals(Reason.INVALID_INPUT, r.reason);
+            assertEquals(0, b.writeCalls);
+        } finally {
+            s.close();
+        }
+    }
+
+    @Test
+    public void saveBlockedInConflict() throws Exception {
+        FakeBackend b = new FakeBackend();
+        b.seed(Role.ENCRYPTED, T_A, 5L, null);
+        b.seed(Role.PLAIN, T_B, 5L, null);
+        CredentialStore s = new CredentialStore(b);
+        try {
+            Resolution r = s.saveAsync(T_A, 5L, 0L).get(10,
+                    TimeUnit.SECONDS);
+            assertEquals(Status.BLOCKED, r.status);
+            assertEquals(0, b.writeCalls);
+        } finally {
+            s.close();
+        }
+    }
+
+    @Test
+    public void deleteWritesMarkerAndBlocksLegacyResurrection()
+            throws Exception {
+        FakeBackend b = new FakeBackend();
+        b.seed(Role.ENCRYPTED, T_A, 5L, null);
+        b.seed(Role.PLAIN, T_B, 6L, null); // legacy-остаток
+        CredentialStore s = new CredentialStore(b);
+        try {
+            // Конфликт токенов: delete сначала заблокирован аудитом.
+            Resolution r0 = s.deleteAsync().get(10, TimeUnit.SECONDS);
+            assertEquals(Status.BLOCKED, r0.status);
+        } finally {
+            s.close();
+        }
+
+        FakeBackend c = new FakeBackend();
+        c.seed(Role.ENCRYPTED, T_A, 5L, null);
+        c.seed(Role.PLAIN, T_B, 6L, null);
+        c.cache.get(Role.PLAIN).clear(); // сценарий «удаление + legacy»
+        c.disk.get(Role.PLAIN).clear();
+        CredentialStore s2 = new CredentialStore(c);
+        try {
+            Resolution r = s2.deleteAsync().get(10, TimeUnit.SECONDS);
+            assertEquals(Status.DELETED, r.status);
+            // Оставшийся legacy-токен в plain: миграции и отправки нет.
+            c.cache.get(Role.PLAIN).put("token", V.str(T_B));
+            c.disk.get(Role.PLAIN).put("token", V.str(T_B));
+            Resolution r2 = await(s2);
+            assertEquals(Status.DELETED, r2.status);
+            assertFalse(r2.sendPermitted());
+            assertEquals(0, c.writeCalls); // legacy не тронут, не мигрирован
+        } finally {
+            s2.close();
+        }
+    }
+
+    @Test
+    public void deleteFailureRetriedAndRecoveredFromDisk()
+            throws Exception {
+        FakeBackend b = new FakeBackend();
+        b.seed(Role.ENCRYPTED, T_A, 5L, null);
+        b.failDeleteOn.add(1);
+        CredentialStore s = new CredentialStore(b);
+        try {
+            Resolution r = s.deleteAsync().get(10, TimeUnit.SECONDS);
+            assertEquals(Status.INCOMPLETE, r.status);
+            assertEquals(Pending.DELETE, r.pending);
+            // Диск не изменён — «удалено» не подтверждено.
+            assertEquals(T_A, b.disk.get(Role.ENCRYPTED).get("token").s);
+            Resolution r2 = await(s); // реальный повтор удаления
+            assertEquals(Status.DELETED, r2.status);
+            assertEquals(2, b.deleteCalls);
+        } finally {
+            s.close();
+        }
+        // Новый процесс: восстановление из disk показывает удаление.
+        FakeBackend b2 = b.reloadFromDisk();
+        Resolution r3 = await(new CredentialStore(b2));
+        assertEquals(Status.DELETED, r3.status);
+    }
+
+    @Test
+    public void saveAfterDeleteSucceedsAtomically() throws Exception {
+        FakeBackend b = new FakeBackend();
+        b.seed(Role.ENCRYPTED, T_A, 5L, null);
+        CredentialStore s = new CredentialStore(b);
+        try {
+            assertEquals(Status.DELETED,
+                    s.deleteAsync().get(10, TimeUnit.SECONDS).status);
+            Resolution r = s.saveAsync(T_B, 9L, 0L).get(10,
+                    TimeUnit.SECONDS);
+            assertEquals(Status.READY, r.status);
+            assertEquals(T_B, r.token);
+            assertEquals(CredentialBackend.STATE_ACTIVE,
+                    b.disk.get(Role.ENCRYPTED).get("meta").s);
+        } finally {
+            s.close();
+        }
+    }
+
+    @Test
+    public void saveAfterDeleteFailureKeepsDeletedState() throws Exception {
+        FakeBackend b = new FakeBackend();
+        b.seed(Role.ENCRYPTED, T_A, 5L, null);
+        CredentialStore s = new CredentialStore(b);
+        try {
+            assertEquals(Status.DELETED,
+                    s.deleteAsync().get(10, TimeUnit.SECONDS).status);
+            b.failWrites = 1;
+            Resolution r = s.saveAsync(T_B, 9L, 0L).get(10,
+                    TimeUnit.SECONDS);
+            assertEquals(Status.INCOMPLETE, r.status);
+            // Новый процесс: сохранение не подтверждено — состояние
+            // удаления остаётся, T_B активным не считается.
+            FakeBackend b2 = b.reloadFromDisk();
+            Resolution r2 = await(new CredentialStore(b2));
+            assertEquals(Status.DELETED, r2.status);
+            assertFalse(r2.sendPermitted());
+        } finally {
+            s.close();
+        }
+    }
+
+    @Test
+    public void invalidServiceStateBlocksAll() throws Exception {
+        FakeBackend b = new FakeBackend();
+        b.seed(Role.ENCRYPTED, T_A, 5L, null);
+        b.cache.get(Role.ENCRYPTED).put("meta", V.str("v9:weird"));
+        b.disk.get(Role.ENCRYPTED).put("meta", V.str("v9:weird"));
+        CredentialStore s = new CredentialStore(b);
+        try {
+            Resolution r = await(s);
+            assertEquals(Status.BLOCKED, r.status);
+            assertEquals(Reason.SERVICE_STATE_INVALID, r.reason);
+            Resolution r2 = s.saveAsync(T_B, 1L, 0L).get(10,
+                    TimeUnit.SECONDS);
+            assertEquals(Status.BLOCKED, r2.status);
+            Resolution r3 = s.deleteAsync().get(10, TimeUnit.SECONDS);
+            assertEquals(Status.BLOCKED, r3.status);
+            assertEquals(0, b.writeCalls);
+        } finally {
+            s.close();
+        }
+    }
+
+    @Test
+    public void commandsSerializeWithResolve() throws Exception {
+        FakeBackend b = new FakeBackend();
+        CredentialStore s1 = new CredentialStore(b);
+        CredentialStore s2 = new CredentialStore(b);
+        try {
+            java.util.concurrent.Future<Resolution> f1 =
+                    s1.saveAsync(T_A, 5L, 0L);
+            java.util.concurrent.Future<Resolution> f2 = s2.resolveAsync();
+            assertEquals(Status.READY, f1.get(10, TimeUnit.SECONDS).status);
+            assertEquals(Status.READY, f2.get(10, TimeUnit.SECONDS).status);
+            assertEquals(1, b.writeCalls);
+        } finally {
+            s1.close();
+            s2.close();
+        }
+    }
+
+    @Test
+    public void pendingMigrationNotBypassedBySave() throws Exception {
+        FakeBackend b = new FakeBackend();
+        b.seed(Role.PLAIN, T_A, 5L, null);
+        b.failClearOn.add(1);
+        CredentialStore s = new CredentialStore(b);
+        try {
+            assertEquals(Status.INCOMPLETE, await(s).status);
+            // Команда записи не обходит незавершённую миграцию.
+            Resolution r = s.saveAsync(T_B, 9L, 0L).get(10,
+                    TimeUnit.SECONDS);
+            assertEquals(Status.INCOMPLETE, r.status);
+            assertEquals(1, b.writeCalls); // только запись миграции
+            assertEquals(T_A, b.disk.get(Role.ENCRYPTED).get("token").s);
+            // После достройки миграции сохранение разрешено.
+            assertEquals(Status.READY, await(s).status);
+            Resolution r2 = s.saveAsync(T_B, 9L, 0L).get(10,
+                    TimeUnit.SECONDS);
+            assertEquals(Status.READY, r2.status);
+            assertEquals(T_B, r2.token);
+        } finally {
+            s.close();
+        }
+    }
+
+    @Test
+    public void commandsAfterCloseRejected() throws Exception {
+        FakeBackend b = new FakeBackend();
+        CredentialStore s = new CredentialStore(b);
+        s.close();
+        try {
+            s.saveAsync(T_A, 1L, 0L);
+            fail("saveAsync после close должен отклоняться");
+        } catch (IllegalStateException expected) {
+        }
+        try {
+            s.deleteAsync();
+            fail("deleteAsync после close должен отклоняться");
+        } catch (IllegalStateException expected) {
+        }
     }
 
     @Test

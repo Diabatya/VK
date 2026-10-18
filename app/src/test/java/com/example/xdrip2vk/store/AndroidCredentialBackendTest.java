@@ -133,9 +133,49 @@ public class AndroidCredentialBackendTest {
 
     @Test
     public void putCredentialsCommitsAllThree() {
-        assertTrue(backend.putCredentials("SYNTH_TKN_a5", 8L, -4L));
+        assertTrue(backend.putCredentials("SYNTH_TKN_a5", 8L, -4L,
+                CredentialBackend.STATE_ACTIVE));
         assertEquals("SYNTH_TKN_a5", secure.getString("vk_token", ""));
         assertEquals(8L, secure.getLong("vk_chat_id", 0));
         assertEquals(-4L, secure.getLong("alert_chat_id", 0));
+    }
+
+    @Test
+    public void credentialsAndStateChangeInOneCommit() {
+        // Реквизиты и служебное состояние — один Editor.commit.
+        assertTrue(backend.putCredentials("SYNTH_TKN_a6", 7L, 0L,
+                CredentialBackend.STATE_ACTIVE));
+        assertEquals("SYNTH_TKN_a6", secure.getString("vk_token", ""));
+        assertEquals("v1:active", secure.getString("cred_service_state", ""));
+        assertEquals(CredentialBackend.ServiceState.ACTIVE,
+                backend.serviceState(Role.ENCRYPTED));
+    }
+
+    @Test
+    public void deleteTouchesOnlyCredentialsAndState() {
+        secure.edit().putString("vk_token", "SYNTH_TKN_a7")
+                .putLong("vk_chat_id", 1L)
+                .putLong("alert_chat_id", -1L)
+                .putString("__androidx_security_crypto_encrypted_prefs_key_keyset__",
+                        "KEYSET")
+                .commit();
+        assertTrue(backend.deleteCredentials());
+        assertFalse(secure.contains("vk_token"));
+        assertFalse(secure.contains("vk_chat_id"));
+        assertFalse(secure.contains("alert_chat_id"));
+        assertEquals("v1:deleted",
+                secure.getString("cred_service_state", ""));
+        // keyset и сам файл не тронуты.
+        assertTrue(secure.contains(
+                "__androidx_security_crypto_encrypted_prefs_key_keyset__"));
+        assertEquals(CredentialBackend.ServiceState.DELETED,
+                backend.serviceState(Role.ENCRYPTED));
+    }
+
+    @Test
+    public void unknownServiceStateIsInvalid() {
+        secure.edit().putString("cred_service_state", "v9:weird").commit();
+        assertEquals(CredentialBackend.ServiceState.INVALID,
+                backend.serviceState(Role.ENCRYPTED));
     }
 }

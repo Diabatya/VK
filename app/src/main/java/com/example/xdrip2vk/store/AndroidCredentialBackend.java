@@ -38,6 +38,16 @@ public final class AndroidCredentialBackend implements CredentialBackend {
     static final String KEY_TOKEN = "vk_token";
     static final String KEY_CHAT = "vk_chat_id";
     static final String KEY_ALERT = "alert_chat_id";
+    /**
+     * Служебное состояние — ключ внутри secure_tokens (тот же файл и
+     * тот же commit, что реквизиты): "v1:active"/"v1:deleted".
+     * Отсутствие ключа — существующая установка; неизвестное значение —
+     * INVALID. Маркер в default prefs не используется: два файла не
+     * являются одной транзакцией.
+     */
+    static final String KEY_STATE = "cred_service_state";
+    static final String STATE_ACTIVE = "v1:active";
+    static final String STATE_DELETED = "v1:deleted";
 
     /** Граница открытия encrypted-хранилища (AndroidKeyStore). */
     public interface EncryptedOpener {
@@ -137,16 +147,60 @@ public final class AndroidCredentialBackend implements CredentialBackend {
     }
 
     @Override
+    public ServiceState serviceState(Role role) {
+        if (role != Role.ENCRYPTED) {
+            return ServiceState.ABSENT; // состояние живёт только в enc
+        }
+        try {
+            SharedPreferences p = prefs(Role.ENCRYPTED);
+            if (!p.contains(KEY_STATE)) {
+                return ServiceState.ABSENT;
+            }
+            String v = p.getString(KEY_STATE, "");
+            if (STATE_ACTIVE.equals(v)) {
+                return ServiceState.ACTIVE;
+            }
+            if (STATE_DELETED.equals(v)) {
+                return ServiceState.DELETED;
+            }
+            return ServiceState.INVALID; // неизвестное значение/версия
+        } catch (Exception e) {
+            Logger.w("CredBackend", "Служебное состояние не читается: "
+                    + e.getClass().getSimpleName());
+            return ServiceState.INVALID; // блокирующе, без маскировки
+        }
+    }
+
+    @Override
     public boolean putCredentials(String token, long chatId,
-                                  long alertChatId) {
+                                  long alertChatId, String serviceState) {
         try {
             return prefs(Role.ENCRYPTED).edit()
                     .putString(KEY_TOKEN, token)
                     .putLong(KEY_CHAT, chatId)
                     .putLong(KEY_ALERT, alertChatId)
+                    .putString(KEY_STATE, serviceState)
                     .commit();
         } catch (Exception e) {
             Logger.w("CredBackend", "Запись реквизитов не выполнена: "
+                    + e.getClass().getSimpleName());
+            return false;
+        }
+    }
+
+    @Override
+    public boolean deleteCredentials() {
+        // Подтверждённое удаление одним commit того же файла: реквизиты +
+        // служебное состояние. Keyset и сам файл не трогаем.
+        try {
+            return prefs(Role.ENCRYPTED).edit()
+                    .remove(KEY_TOKEN)
+                    .remove(KEY_CHAT)
+                    .remove(KEY_ALERT)
+                    .putString(KEY_STATE, STATE_DELETED)
+                    .commit();
+        } catch (Exception e) {
+            Logger.w("CredBackend", "Удаление реквизитов не выполнено: "
                     + e.getClass().getSimpleName());
             return false;
         }

@@ -87,7 +87,11 @@ public final class CredentialAudit {
         /** Токен в одном источнике, адресаты без токена — в другом. */
         SPLIT_CREDENTIALS,
         /** Назначение не совпадает с ожидаемыми реквизитами операции. */
-        DESTINATION_MISMATCH
+        DESTINATION_MISMATCH,
+        /** Служебное состояние присутствует, но значение/версия неизвестны. */
+        SERVICE_STATE_INVALID,
+        /** Подтверждённое удаление реквизитов пользователем. */
+        DELETED_BY_USER
     }
 
     /** Одно значение ключа в снимке источника. */
@@ -247,6 +251,13 @@ public final class CredentialAudit {
         public final List<Role> clearSources;
         /** true — запись в encrypted не требуется (данные уже там). */
         public final boolean alreadyEncrypted;
+
+        public static Plan of(String token, long chatId, long alertChatId,
+                              List<Role> clearSources,
+                              boolean alreadyEncrypted) {
+            return new Plan(token, chatId, alertChatId, clearSources,
+                    alreadyEncrypted);
+        }
 
         private Plan(String token, long chatId, long alertChatId,
                      List<Role> clearSources, boolean alreadyEncrypted) {

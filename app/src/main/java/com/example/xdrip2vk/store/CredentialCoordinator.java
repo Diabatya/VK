@@ -37,8 +37,14 @@ final class CredentialCoordinator {
     private static final Map<Object, CredentialCoordinator> INSTANCES =
             new HashMap<>();
 
+    /** Вид незавершённой операции. */
+    enum OpKind {
+        MIGRATION, SAVE, DELETE
+    }
+
     /** Незавершённая операция: исходные снимки + раздельные шаги. */
     static final class PendingOp {
+        final OpKind kind;
         /** Снимки трёх источников на момент начала операции. */
         final Source[] snapshot;
         final Plan plan;
@@ -56,7 +62,8 @@ final class CredentialCoordinator {
         /** Очистка подтверждена — источник обязан оставаться пустым. */
         final Set<Role> confirmedClears = EnumSet.noneOf(Role.class);
 
-        PendingOp(Source[] snapshot, Plan plan) {
+        PendingOp(OpKind kind, Source[] snapshot, Plan plan) {
+            this.kind = kind;
             this.snapshot = snapshot;
             this.plan = plan;
         }
