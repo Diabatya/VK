@@ -3,7 +3,9 @@ package com.example.xdrip2vk;
 import android.content.Context;
 import android.content.SharedPreferences;
 
+import com.example.xdrip2vk.core.CredentialAudit;
 import com.example.xdrip2vk.store.AndroidCredentialBackend;
+import com.example.xdrip2vk.store.CredentialBackend;
 import com.example.xdrip2vk.store.CredentialStore;
 
 
@@ -15,6 +17,40 @@ import com.example.xdrip2vk.store.CredentialStore;
  * слоя. Все значения синтетические.
  */
 final class CredHelper {
+
+    /**
+     * Делегирующий backend с барьерными хуками чтения/записи —
+     * для точных воспроизведений гонок без sleep.
+     */
+    static final class HookedBackend implements CredentialBackend {
+        interface Put {
+            boolean call(String token, long chatId, long alertChatId, String state);
+        }
+        final CredentialBackend d;
+        java.util.function.Function<CredentialAudit.Role, CredentialAudit.Source>
+                snapshotOverride;
+        Put putOverride;
+
+        HookedBackend(CredentialBackend d) { this.d = d; }
+
+        @Override public Object storageId() { return d.storageId(); }
+        @Override public CredentialAudit.Source snapshot(CredentialAudit.Role role) {
+            return snapshotOverride != null
+                    ? snapshotOverride.apply(role) : d.snapshot(role);
+        }
+        @Override public ServiceState serviceState(CredentialAudit.Role role) {
+            return d.serviceState(role);
+        }
+        @Override public boolean putCredentials(String t, long c, long a, String st) {
+            return putOverride != null ? putOverride.call(t, c, a, st)
+                    : d.putCredentials(t, c, a, st);
+        }
+        @Override public boolean deleteCredentials() { return d.deleteCredentials(); }
+        @Override public boolean removeCredentials(CredentialAudit.Role role) {
+            return d.removeCredentials(role);
+        }
+    }
+
 
     static SharedPreferences enc(Context c) {
         return c.getSharedPreferences("secure_tokens", Context.MODE_PRIVATE);

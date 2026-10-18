@@ -20,20 +20,35 @@ import java.util.function.Consumer;
 import java.util.function.Supplier;
 
 /**
- * Единая точка доступа приложения к реквизитам (задание 2Г.4).
- * Один процессный экземпляр над CredentialStore: все Activity, receivers
- * и сервис читают один опубликованный снимок и ставят команды на общий
- * координатор storageId. Независимых кешей и собственных алгоритмов
- * выбора источника в вызывающем коде нет.
+ * Единая точка доступа приложения к реквизитам (задание 2Г.4, протокол
+ * исправлен в 2Г.4А). Один процессный экземпляр над CredentialStore: все
+ * Activity, receivers и сервис читают один опубликованный снимок и ставят
+ * команды на общий координатор storageId. Независимых кешей и собственных
+ * алгоритмов выбора источника в вызывающем коде нет.
  *
- * Публикация состояния:
- * - published — последний ПОДТВЕРЖДЁННЫЙ снимок (результат завершённого
- *   resolve/команды), начальное значение LOADING;
- * - mutationPending — выставляется синхронно в момент запроса записи:
- *   до подтверждения операции snapshot() не выдаёт READY старой версии,
- *   новая отправка со старыми реквизитами не может начаться;
- * - generation — поколение запроса: поздний результат старого запроса
- *   не заменяет состояние более нового.
+ * Протокол поколений:
+ * - под {@link #lock} атомарно: присвоение номера запроса (generation),
+ *   постановка операции в очередь координатора и постановка задачи
+ *   публикации в publishExec. Порядок поколений == порядок операций ==
+ *   порядок задач публикации — устаревший результат никогда не вытесняет
+ *   более новый. Lock не удерживается во время ожидания Future или
+ *   дисковых операций — только на постановку в очереди.
+ * - mutationPending ставится синхронно при запросе записи: до
+ *   подтверждения операции snapshot() не выдаёт READY старой версии.
+ *   Снимается ТОЛЬКО завершением новейшей принятой записи
+ *   (gen == latestMutationGen) — первая из двух записей не снимает запрет
+ *   второй; промежуточные чтения запрет не отменяют и не отменяют учёт
+ *   завершения записи.
+ * - Результат, устаревший относительно более нового запроса, нигде не
+ *   доставляется как актуальное состояние: resolveBlocking и все
+ *   callback-доставки проходят {@link #effective} — проверку в момент
+ *   ответа. Устаревший запрос получает текущее состояние фасада
+ *   (с учётом запрета), а не сырой результат своей операции.
+ *
+ * Контракт callback'ов команд (setTokenOnMain и др.): доставленный
+ * Snapshot — результат ЭТОЙ команды, если она осталась актуальной,
+ * иначе текущее состояние фасада; он не является обещанием разрешения
+ * отправки в будущем.
  *
  * Потоки:
  * - snapshot() — только память, безопасен из любого потока, никогда не
@@ -59,7 +74,7 @@ public final class Credentials {
         DELETED,
         /** Конфликт/недоступность/повреждение — смотреть reason. */
         BLOCKED,
-        /** Запрошенная операция ещё не подтверждена на диске. */
+        /** Операция с реквизитами не подтверждена на диске. */
         INCOMPLETE
     }
 
@@ -174,7 +189,11 @@ public final class Credentials {
     private final Object lock = new Object();
 
     private Snapshot published = Snapshot.loading();
+    /** Номер последнего выданного запроса (любого вида). */
     private long generation;
+    /** Номер новейшей принятой записи; 0 — записей не было. */
+    private long latestMutationGen;
+    /** Есть запись, ещё не завершившаяся — снимок вне READY. */
     private boolean mutationPending;
 
     private Credentials(CredentialBackend backend) {
@@ -232,21 +251,93 @@ public final class Credentials {
         }
     }
 
+    /** Выданный запрос: номер поколения + Future результата. */
+    private static final class Issued {
+        final long gen;
+        final Future<Resolution> future;
+        Issued(long gen, Future<Resolution> future) {
+            this.gen = gen;
+            this.future = future;
+        }
+    }
+
+    /**
+     * Общая постановка операции. Под lock: номер запроса, enqueue в
+     * координатор, enqueue публикации — порядок всех трёх одинаковый.
+     * Ожидания Future и диска под lock нет.
+     */
+    private Issued issue(boolean mutation, Supplier<Future<Resolution>> command) {
+        synchronized (lock) {
+            long gen = ++generation;
+            if (mutation) {
+                latestMutationGen = gen;
+                mutationPending = true;
+            }
+            Future<Resolution> f = command.get();
+            enqueuePublish(f, gen, mutation);
+            return new Issued(gen, f);
+        }
+    }
+
+    /**
+     * Публикация результата. Задачи publishExec идут строго в порядке
+     * поколений, поэтому published — всегда новейший ЗАВЕРШИВШИЙСЯ
+     * результат; stale-перезаписи невозможны.
+     */
+    private void enqueuePublish(Future<Resolution> f, long gen, boolean mutation) {
+        publishExec.execute(() -> {
+            try {
+                Resolution r = f.get();
+                synchronized (lock) {
+                    if (mutation && gen == latestMutationGen) {
+                        mutationPending = false;
+                    }
+                    published = Snapshot.of(r);
+                }
+            } catch (InterruptedException e) {
+                Thread.currentThread().interrupt();
+            } catch (ExecutionException e) {
+                synchronized (lock) {
+                    if (mutation && gen == latestMutationGen) {
+                        mutationPending = false;
+                    }
+                    published = Snapshot.incomplete();
+                }
+            }
+        });
+    }
+
+    /**
+     * Результат операции → снимок для вызывающего, с проверкой в момент
+     * ответа: если с момента постановки принят более новый запрос или
+     * запись ещё в полёте — возвращается текущее состояние фасада
+     * (маскированное запретом), а не сырой устаревший результат.
+     * Бесконечных повторных чтений нет: недостоверное — блокирующее.
+     */
+    private Snapshot effective(Resolution r, long gen) {
+        synchronized (lock) {
+            if (r != null && gen == generation && !mutationPending) {
+                return Snapshot.of(r);
+            }
+            return mutationPending ? Snapshot.incomplete() : published;
+        }
+    }
+
     /**
      * Асинхронный resolve: состояние читается на worker координатора,
-     * результат публикуется, если поколение запроса ещё актуально.
+     * результат публикуется в порядке поколений.
      */
     public Future<Resolution> resolveAsync() {
-        final long gen = nextGeneration();
-        Future<Resolution> f = store.resolveAsync();
-        awaitPublish(f, gen, false);
-        return f;
+        return issue(false, store::resolveAsync).future;
     }
 
     /**
      * Блокирующий resolve для фоновых потоков вызывающего (service worker,
      * switchExecutor). Запрещён на главном потоке и на worker
-     * координатора: там ждать Future нельзя.
+     * координатора: там ждать Future нельзя. Результат проходит проверку
+     * актуальности: чтение, устаревшее относительно запроса записи,
+     * отправку не разрешает; таймаут/ошибка — блокирующее состояние,
+     * а не старый READY.
      */
     public Snapshot resolveBlocking() {
         if (Looper.myLooper() == Looper.getMainLooper()
@@ -258,9 +349,9 @@ public final class Credentials {
             throw new IllegalStateException(
                     "resolveBlocking on the credential worker would deadlock");
         }
+        Issued op = issue(false, store::resolveAsync);
         try {
-            Resolution r = resolveAsync().get(30, TimeUnit.SECONDS);
-            return Snapshot.of(r);
+            return effective(op.future.get(30, TimeUnit.SECONDS), op.gen);
         } catch (InterruptedException e) {
             Thread.currentThread().interrupt();
             return Snapshot.incomplete();
@@ -269,128 +360,87 @@ public final class Credentials {
         }
     }
 
-    /** Resolve, результат-снимок доставляется на главный поток. */
+    /** Resolve, актуальный на момент доставки снимок — на главный поток. */
     public void resolveOnMain(Consumer<Snapshot> callback) {
-        deliverOnMain(resolveAsync(), callback);
+        deliverOnMain(issue(false, store::resolveAsync), callback);
     }
 
     /**
-     * Resolve, результат-снимок доставляется на фоновый поток фасада —
-     * для receivers и служебных путей, которым не нужен main.
+     * Resolve, актуальный на момент доставки снимок — на фоновый поток
+     * фасада (для receivers и служебных путей).
      */
     public void resolveOnBackground(Consumer<Snapshot> callback) {
-        final long gen = nextGeneration();
-        Future<Resolution> f = store.resolveAsync();
-        awaitPublish(f, gen, false);
+        final Issued op = issue(false, store::resolveAsync);
         publishExec.execute(() -> {
+            Resolution r;
             try {
-                callback.accept(Snapshot.of(f.get()));
+                r = op.future.get();
             } catch (InterruptedException e) {
                 Thread.currentThread().interrupt();
+                return;
             } catch (ExecutionException e) {
-                callback.accept(Snapshot.incomplete());
+                r = null;
             }
+            callback.accept(effective(r, op.gen));
         });
     }
 
     // --- команды изменения: немедленный запрет старой версии ---
 
     public Future<Resolution> setTokenAsync(String token) {
-        return mutate(() -> store.setTokenAsync(token));
+        return issue(true, () -> store.setTokenAsync(token)).future;
     }
 
     public Future<Resolution> deleteAsync() {
-        return mutate(store::deleteAsync);
+        return issue(true, store::deleteAsync).future;
     }
 
     public Future<Resolution> setChatIdAsync(long chatId, String expectedTokenFingerprint) {
-        return mutate(() -> store.setChatIdAsync(chatId, expectedTokenFingerprint));
+        return issue(true, () -> store.setChatIdAsync(chatId, expectedTokenFingerprint)).future;
     }
 
     public Future<Resolution> setAlertChatIdAsync(long alertChatId, String expectedTokenFingerprint) {
-        return mutate(() -> store.setAlertChatIdAsync(alertChatId, expectedTokenFingerprint));
+        return issue(true, () -> store.setAlertChatIdAsync(alertChatId, expectedTokenFingerprint)).future;
     }
 
     public Future<Resolution> clearChatIdsAsync(String expectedTokenFingerprint) {
-        return mutate(() -> store.clearChatIdsAsync(expectedTokenFingerprint));
+        return issue(true, () -> store.clearChatIdsAsync(expectedTokenFingerprint)).future;
     }
 
-    /** Команда записи; итоговый снимок доставляется на главный поток. */
+    /** Команда записи; актуальный снимок результата — на главный поток. */
     public void setTokenOnMain(String token, Consumer<Snapshot> callback) {
-        deliverOnMain(setTokenAsync(token), callback);
+        deliverOnMain(issue(true, () -> store.setTokenAsync(token)), callback);
     }
 
     public void setChatIdOnMain(long chatId, String expectedTokenFingerprint,
                               Consumer<Snapshot> callback) {
-        deliverOnMain(setChatIdAsync(chatId, expectedTokenFingerprint), callback);
+        deliverOnMain(issue(true, () -> store.setChatIdAsync(chatId, expectedTokenFingerprint)),
+                callback);
     }
 
     public void setAlertChatIdOnMain(long alertChatId, String expectedTokenFingerprint,
                                    Consumer<Snapshot> callback) {
-        deliverOnMain(setAlertChatIdAsync(alertChatId, expectedTokenFingerprint), callback);
+        deliverOnMain(issue(true, () -> store.setAlertChatIdAsync(alertChatId, expectedTokenFingerprint)),
+                callback);
     }
 
     // --- внутреннее ---
 
-    private long nextGeneration() {
-        synchronized (lock) {
-            return ++generation;
-        }
-    }
-
-    /**
-     * Мутация: поколение увеличивается и mutationPending ставится ДО
-     * постановки команды — новый сетевой запуск со старым снимком
-     * невозможен уже с момента запроса. Опубликованный ранее снимок
-     * остаётся для начатой сетевой попытки (её протокол не прерывается).
-     */
-    private Future<Resolution> mutate(Supplier<Future<Resolution>> command) {
-        final long gen;
-        synchronized (lock) {
-            gen = ++generation;
-            mutationPending = true;
-        }
-        Future<Resolution> f = command.get();
-        awaitPublish(f, gen, true);
-        return f;
-    }
-
-    private void awaitPublish(Future<Resolution> f, long gen, boolean mutation) {
+    private void deliverOnMain(Issued op, Consumer<Snapshot> callback) {
         publishExec.execute(() -> {
+            Resolution r;
             try {
-                Resolution r = f.get();
-                synchronized (lock) {
-                    if (gen == generation) {
-                        if (mutation) mutationPending = false;
-                        published = Snapshot.of(r);
-                    }
-                }
-            } catch (InterruptedException e) {
-                Thread.currentThread().interrupt();
-            } catch (ExecutionException e) {
-                synchronized (lock) {
-                    if (gen == generation) {
-                        if (mutation) mutationPending = false;
-                        published = Snapshot.incomplete();
-                    }
-                }
-            }
-        });
-    }
-
-    private void deliverOnMain(Future<Resolution> f, Consumer<Snapshot> callback) {
-        publishExec.execute(() -> {
-            Snapshot s;
-            try {
-                s = Snapshot.of(f.get());
+                r = op.future.get();
             } catch (InterruptedException e) {
                 Thread.currentThread().interrupt();
                 return;
             } catch (ExecutionException e) {
-                s = Snapshot.incomplete();
+                r = null;
             }
-            Snapshot result = s;
-            mainHandler.post(() -> callback.accept(result));
+            final Resolution res = r;
+            // Проверка актуальности в момент фактической доставки: callback
+            // мог ждать в очереди main уже после более нового запроса.
+            mainHandler.post(() -> callback.accept(effective(res, op.gen)));
         });
     }
 }

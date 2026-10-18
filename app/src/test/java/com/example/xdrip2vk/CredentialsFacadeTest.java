@@ -23,6 +23,7 @@ import org.robolectric.annotation.Config;
 
 import java.util.concurrent.Future;
 import java.util.concurrent.TimeUnit;
+import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.concurrent.atomic.AtomicReference;
 
 /**
@@ -37,23 +38,29 @@ import java.util.concurrent.atomic.AtomicReference;
 @Config(sdk = 34)
 public class CredentialsFacadeTest {
 
-    /** Обёртка над настоящим backend с хуками записи/вызова. */
+    /** Обёртка над настоящим backend с хуками записи/чтения/вызова. */
     private static class WrappingBackend implements CredentialBackend {
+        /** Подмена записи: получает аргументы, возвращает результат commit. */
+        interface PutCall {
+            boolean call(String token, long chatId, long alertChatId, String state);
+        }
         final CredentialBackend d;
-        java.util.function.Supplier<Boolean> putOverride;
+        PutCall putOverride;
+        java.util.function.Function<Role, Source> snapshotOverride;
         Runnable onAnyCall;
         WrappingBackend(CredentialBackend d) { this.d = d; }
         @Override public Object storageId() { return d.storageId(); }
         @Override public Source snapshot(Role role) {
             if (onAnyCall != null) onAnyCall.run();
-            return d.snapshot(role);
+            return snapshotOverride != null
+                    ? snapshotOverride.apply(role) : d.snapshot(role);
         }
         @Override public ServiceState serviceState(Role role) {
             return d.serviceState(role);
         }
         @Override public boolean putCredentials(String t, long c, long a, String st) {
             if (onAnyCall != null) onAnyCall.run();
-            return putOverride != null ? putOverride.get()
+            return putOverride != null ? putOverride.call(t, c, a, st)
                     : d.putCredentials(t, c, a, st);
         }
         @Override public boolean deleteCredentials() { return d.deleteCredentials(); }
@@ -95,7 +102,7 @@ public class CredentialsFacadeTest {
         SharedPreferences enc = CredHelper.enc(context);
         WrappingBackend b = new WrappingBackend(
                 new AndroidCredentialBackend(context, ctx -> enc));
-        b.putOverride = () -> false; // commit не подтверждён
+        b.putOverride = (t, c, a, st) -> false; // commit не подтверждён
         installBackend(b);
     }
 
@@ -251,15 +258,14 @@ public class CredentialsFacadeTest {
         SharedPreferences enc = CredHelper.enc(context);
         WrappingBackend b = new WrappingBackend(
                 new AndroidCredentialBackend(context, ctx -> enc));
-        b.putOverride = () -> {
+        b.putOverride = (t, c, a, st) -> {
             entered.countDown();
             try {
                 release.await(10, TimeUnit.SECONDS);
             } catch (InterruptedException e) {
                 Thread.currentThread().interrupt();
             }
-            return b.d.putCredentials("SYNTH_TOKEN_B", 5, 0,
-                    CredentialBackend.STATE_ACTIVE);
+            return b.d.putCredentials(t, c, a, st);
         };
         installBackend(b);
 
@@ -343,5 +349,475 @@ public class CredentialsFacadeTest {
         assertEquals(CredentialStore.Status.READY, r.status);
         assertTrue("операции хранилища на worker координатора: " + threadName.get(),
                 threadName.get().startsWith("credential-store"));
+    }
+
+    // ==================== 2Г.4А: протокол поколений ====================
+
+    /**
+     * Точное воспроизведение №1: setTokenAsync(B) удержан → resolveAsync
+     * между запросом и завершением записи → после завершения записи и
+     * чтения запрет снят, снимок — READY(B). Раньше чтение инвалидировало
+     * учёт завершения записи и mutationPending оставался навсегда.
+     */
+    @Test
+    public void readDuringMutationDoesNotLeaveStuckBlock() throws Exception {
+        final SharedPreferences enc = CredHelper.enc(context);
+        enc.edit().putString("vk_token", "SYNTH_TOKEN_A")
+                .putLong("vk_chat_id", 5).commit();
+        final java.util.concurrent.CountDownLatch entered =
+                new java.util.concurrent.CountDownLatch(1);
+        final java.util.concurrent.CountDownLatch release =
+                new java.util.concurrent.CountDownLatch(1);
+        WrappingBackend b = new WrappingBackend(
+                new AndroidCredentialBackend(context, ctx -> enc));
+        b.putOverride = (t, c, a, st) -> {
+            entered.countDown();
+            try {
+                release.await(10, TimeUnit.SECONDS);
+            } catch (InterruptedException e) {
+                Thread.currentThread().interrupt();
+            }
+            return b.d.putCredentials(t, c, a, st);
+        };
+        installBackend(b);
+        Credentials creds = Credentials.get(context);
+        assertEquals(CredentialStore.Status.READY,
+                await(creds.resolveAsync()).status);
+        creds.awaitPublishIdleForTest();
+        assertTrue(creds.snapshot().sendPermitted());
+
+        Future<CredentialStore.Resolution> write =
+                creds.setTokenAsync("SYNTH_TOKEN_B"); // gen N
+        assertTrue("запись вошла и удержана", entered.await(10, TimeUnit.SECONDS));
+        Future<CredentialStore.Resolution> read = creds.resolveAsync(); // gen N+1
+        assertEquals(Credentials.State.INCOMPLETE, creds.snapshot().state);
+
+        release.countDown();
+        assertEquals(CredentialStore.Status.READY,
+                write.get(10, TimeUnit.SECONDS).status);
+        assertEquals(CredentialStore.Status.READY,
+                read.get(10, TimeUnit.SECONDS).status);
+        creds.awaitPublishIdleForTest();
+        Credentials.Snapshot s = creds.snapshot();
+        assertEquals("запрет не завис: чтение не отменило учёт записи",
+                Credentials.State.READY, s.state);
+        assertEquals("SYNTH_TOKEN_B", s.token);
+    }
+
+    /**
+     * Две записи и чтение между ними: завершение первой НЕ снимает запрет
+     * второй — между ними снимок не возвращается к READY.
+     */
+    @Test
+    public void firstMutationDoesNotLiftSecondBlock() throws Exception {
+        final SharedPreferences enc = CredHelper.enc(context);
+        enc.edit().putString("vk_token", "SYNTH_TOKEN_A")
+                .putLong("vk_chat_id", 5).commit();
+        final java.util.concurrent.CountDownLatch entB =
+                new java.util.concurrent.CountDownLatch(1);
+        final java.util.concurrent.CountDownLatch relB =
+                new java.util.concurrent.CountDownLatch(1);
+        final java.util.concurrent.CountDownLatch entC =
+                new java.util.concurrent.CountDownLatch(1);
+        final java.util.concurrent.CountDownLatch relC =
+                new java.util.concurrent.CountDownLatch(1);
+        WrappingBackend b = new WrappingBackend(
+                new AndroidCredentialBackend(context, ctx -> enc));
+        b.putOverride = (t, c, a, st) -> {
+            if ("SYNTH_TOKEN_B".equals(t)) {
+                entB.countDown();
+                try { relB.await(10, TimeUnit.SECONDS); }
+                catch (InterruptedException e) { Thread.currentThread().interrupt(); }
+            } else if ("SYNTH_TOKEN_C".equals(t)) {
+                entC.countDown();
+                try { relC.await(10, TimeUnit.SECONDS); }
+                catch (InterruptedException e) { Thread.currentThread().interrupt(); }
+            }
+            return b.d.putCredentials(t, c, a, st);
+        };
+        installBackend(b);
+        Credentials creds = Credentials.get(context);
+        await(creds.resolveAsync());
+        creds.awaitPublishIdleForTest();
+
+        Future<CredentialStore.Resolution> m1 = creds.setTokenAsync("SYNTH_TOKEN_B");
+        assertTrue(entB.await(10, TimeUnit.SECONDS));       // put(B) удержан
+        Future<CredentialStore.Resolution> r = creds.resolveAsync();
+        Future<CredentialStore.Resolution> m2 = creds.setTokenAsync("SYNTH_TOKEN_C");
+
+        relB.countDown();
+        assertEquals(CredentialStore.Status.READY,
+                m1.get(10, TimeUnit.SECONDS).status);       // первая запись завершена
+        assertFalse("первая запись не сняла запрет второй",
+                creds.snapshot().sendPermitted());
+
+        relC.countDown();
+        CredentialStore.Resolution readRes = r.get(10, TimeUnit.SECONDS);
+        assertEquals(CredentialStore.Status.READY, readRes.status);
+        assertEquals("чтение исполнилось после commit B", "SYNTH_TOKEN_B",
+                readRes.token);
+        assertEquals(CredentialStore.Status.READY,
+                m2.get(10, TimeUnit.SECONDS).status);
+        creds.awaitPublishIdleForTest();
+        Credentials.Snapshot s = creds.snapshot();
+        assertEquals(Credentials.State.READY, s.state);
+        assertEquals("SYNTH_TOKEN_C", s.token);
+        assertEquals(5, s.chatId); // адресаты сохранены через обе записи
+    }
+
+    /**
+     * Точное воспроизведение №2: удержанное чтение A + запрошенная запись
+     * B → resolveBlocking возвращает блокирующее состояние, а не старый
+     * READY с A. Запись удерживается до завершения resolveBlocking.
+     */
+    @Test
+    public void resolveBlockingNeverReturnsStaleReady() throws Exception {
+        final SharedPreferences enc = CredHelper.enc(context);
+        enc.edit().putString("vk_token", "SYNTH_TOKEN_A")
+                .putLong("vk_chat_id", 5).commit();
+        final java.util.concurrent.CountDownLatch readEntered =
+                new java.util.concurrent.CountDownLatch(1);
+        final java.util.concurrent.CountDownLatch readRelease =
+                new java.util.concurrent.CountDownLatch(1);
+        final java.util.concurrent.CountDownLatch putEntered =
+                new java.util.concurrent.CountDownLatch(1);
+        final java.util.concurrent.CountDownLatch putRelease =
+                new java.util.concurrent.CountDownLatch(1);
+        final AtomicBoolean holdRead = new AtomicBoolean(false);
+        WrappingBackend b = new WrappingBackend(
+                new AndroidCredentialBackend(context, ctx -> enc));
+        b.snapshotOverride = role -> {
+            if (role == Role.ENCRYPTED && holdRead.get()) {
+                readEntered.countDown();
+                try { readRelease.await(10, TimeUnit.SECONDS); }
+                catch (InterruptedException e) { Thread.currentThread().interrupt(); }
+            }
+            return b.d.snapshot(role);
+        };
+        b.putOverride = (t, c, a, st) -> {
+            putEntered.countDown();
+            try { putRelease.await(10, TimeUnit.SECONDS); }
+            catch (InterruptedException e) { Thread.currentThread().interrupt(); }
+            return b.d.putCredentials(t, c, a, st);
+        };
+        installBackend(b);
+        Credentials creds = Credentials.get(context);
+        await(creds.resolveAsync());
+        creds.awaitPublishIdleForTest();
+        assertTrue(creds.snapshot().sendPermitted());
+
+        // Фоновый resolveBlocking начинает чтение A — удерживаем его.
+        holdRead.set(true);
+        final AtomicReference<Credentials.Snapshot> blocked =
+                new AtomicReference<>();
+        Thread caller = new Thread(() -> blocked.set(creds.resolveBlocking()));
+        caller.start();
+        assertTrue("чтение A началось и удержано",
+                readEntered.await(10, TimeUnit.SECONDS));
+
+        // Запрос записи B: немедленный запрет уже установлен.
+        Future<CredentialStore.Resolution> mut =
+                creds.setTokenAsync("SYNTH_TOKEN_B");
+        assertFalse(creds.snapshot().sendPermitted());
+
+        // Чтение завершается со старым A; запись B удержана.
+        readRelease.countDown();
+        assertTrue("запись B удержана", putEntered.await(10, TimeUnit.SECONDS));
+        caller.join(10_000);
+
+        Credentials.Snapshot s = blocked.get();
+        assertNotNull("resolveBlocking завершился", s);
+        assertFalse("устаревшее чтение не разрешило отправку",
+                s.sendPermitted());
+        assertEquals(Credentials.State.INCOMPLETE, s.state);
+
+        putRelease.countDown();
+        assertEquals(CredentialStore.Status.READY,
+                mut.get(10, TimeUnit.SECONDS).status);
+        creds.awaitPublishIdleForTest();
+        assertEquals("SYNTH_TOKEN_B", creds.snapshot().token);
+    }
+
+    /**
+     * Поздний main-callback старого чтения не обновляет экран устаревшим
+     * READY: в момент доставки действует текущий запрет/состояние.
+     */
+    @Test
+    public void staleMainCallbackDeliversNoOldReady() throws Exception {
+        final SharedPreferences enc = CredHelper.enc(context);
+        enc.edit().putString("vk_token", "SYNTH_TOKEN_A")
+                .putLong("vk_chat_id", 5).commit();
+        final java.util.concurrent.CountDownLatch readEntered =
+                new java.util.concurrent.CountDownLatch(1);
+        final java.util.concurrent.CountDownLatch readRelease =
+                new java.util.concurrent.CountDownLatch(1);
+        final java.util.concurrent.CountDownLatch putRelease =
+                new java.util.concurrent.CountDownLatch(1);
+        final AtomicBoolean holdRead = new AtomicBoolean(false);
+        WrappingBackend b = new WrappingBackend(
+                new AndroidCredentialBackend(context, ctx -> enc));
+        b.snapshotOverride = role -> {
+            if (role == Role.ENCRYPTED && holdRead.get()) {
+                readEntered.countDown();
+                try { readRelease.await(10, TimeUnit.SECONDS); }
+                catch (InterruptedException e) { Thread.currentThread().interrupt(); }
+            }
+            return b.d.snapshot(role);
+        };
+        b.putOverride = (t, c, a, st) -> {
+            try { putRelease.await(10, TimeUnit.SECONDS); }
+            catch (InterruptedException e) { Thread.currentThread().interrupt(); }
+            return b.d.putCredentials(t, c, a, st);
+        };
+        installBackend(b);
+        Credentials creds = Credentials.get(context);
+        await(creds.resolveAsync());
+        creds.awaitPublishIdleForTest();
+
+        holdRead.set(true);
+        final java.util.concurrent.CountDownLatch delivered =
+                new java.util.concurrent.CountDownLatch(1);
+        final AtomicReference<Credentials.Snapshot> got =
+                new AtomicReference<>();
+        creds.resolveOnMain(s -> {
+            got.set(s);
+            delivered.countDown();
+        });
+        assertTrue(readEntered.await(10, TimeUnit.SECONDS));
+        readRelease.countDown();
+        // Маркер за задачей доставки гарантирует: callback уже в очереди
+        // main — модель «callback ждал в очереди после завершения чтения».
+        creds.awaitPublishIdleForTest();
+        // Более новый запрос — запись B (удержана) — пришёл ПОСЛЕ того,
+        // как callback старого чтения ждал доставки.
+        Future<CredentialStore.Resolution> mut =
+                creds.setTokenAsync("SYNTH_TOKEN_B");
+        org.robolectric.Shadows.shadowOf(android.os.Looper.getMainLooper())
+                .idle();
+        assertTrue(delivered.await(10, TimeUnit.SECONDS));
+        Credentials.Snapshot s = got.get();
+        // Доставленный снимок — актуальное состояние с учётом запрета;
+        // устаревший READY(A) недопустим.
+        assertFalse("SYNTH_TOKEN_A".equals(s.token) && s.sendPermitted());
+        assertEquals(Credentials.State.INCOMPLETE, s.state);
+
+        putRelease.countDown();
+        assertEquals(CredentialStore.Status.READY,
+                mut.get(10, TimeUnit.SECONDS).status);
+    }
+
+    /**
+     * Аналог для background-callback: поздний результат старого чтения
+     * не приходит как действующее разрешение.
+     */
+    @Test
+    public void staleBackgroundCallbackDeliversNoOldReady() throws Exception {
+        final SharedPreferences enc = CredHelper.enc(context);
+        enc.edit().putString("vk_token", "SYNTH_TOKEN_A")
+                .putLong("vk_chat_id", 5).commit();
+        final java.util.concurrent.CountDownLatch readEntered =
+                new java.util.concurrent.CountDownLatch(1);
+        final java.util.concurrent.CountDownLatch readRelease =
+                new java.util.concurrent.CountDownLatch(1);
+        final java.util.concurrent.CountDownLatch putRelease =
+                new java.util.concurrent.CountDownLatch(1);
+        final AtomicBoolean holdRead = new AtomicBoolean(false);
+        WrappingBackend b = new WrappingBackend(
+                new AndroidCredentialBackend(context, ctx -> enc));
+        b.snapshotOverride = role -> {
+            if (role == Role.ENCRYPTED && holdRead.get()) {
+                readEntered.countDown();
+                try { readRelease.await(10, TimeUnit.SECONDS); }
+                catch (InterruptedException e) { Thread.currentThread().interrupt(); }
+            }
+            return b.d.snapshot(role);
+        };
+        b.putOverride = (t, c, a, st) -> {
+            try { putRelease.await(10, TimeUnit.SECONDS); }
+            catch (InterruptedException e) { Thread.currentThread().interrupt(); }
+            return b.d.putCredentials(t, c, a, st);
+        };
+        installBackend(b);
+        Credentials creds = Credentials.get(context);
+        await(creds.resolveAsync());
+        creds.awaitPublishIdleForTest();
+
+        holdRead.set(true);
+        final java.util.concurrent.CountDownLatch delivered =
+                new java.util.concurrent.CountDownLatch(1);
+        final AtomicReference<Credentials.Snapshot> got =
+                new AtomicReference<>();
+        creds.resolveOnBackground(s -> {
+            got.set(s);
+            delivered.countDown();
+        });
+        assertTrue(readEntered.await(10, TimeUnit.SECONDS));
+        Future<CredentialStore.Resolution> mut =
+                creds.setTokenAsync("SYNTH_TOKEN_B");
+        readRelease.countDown();
+
+        assertTrue(delivered.await(10, TimeUnit.SECONDS));
+        Credentials.Snapshot s = got.get();
+        assertFalse("фоновый callback не получил старый READY(A)",
+                "SYNTH_TOKEN_A".equals(s.token) && s.sendPermitted());
+
+        putRelease.countDown();
+        assertEquals(CredentialStore.Status.READY,
+                mut.get(10, TimeUnit.SECONDS).status);
+    }
+
+    /**
+     * Два вызывающих потока: порядок исполнения операций соответствует
+     * порядку выдачи поколений — последняя принятая запись побеждает
+     * и на диске, и в опубликованном снимке.
+     */
+    @Test
+    public void callerOrderDefinesOperationOrder() throws Exception {
+        final SharedPreferences enc = CredHelper.enc(context);
+        final java.util.List<String> puts =
+                java.util.Collections.synchronizedList(new java.util.ArrayList<>());
+        final java.util.concurrent.CountDownLatch firstPut =
+                new java.util.concurrent.CountDownLatch(1);
+        final java.util.concurrent.CountDownLatch relFirst =
+                new java.util.concurrent.CountDownLatch(1);
+        final AtomicBoolean firstSeen = new AtomicBoolean(true);
+        WrappingBackend b = new WrappingBackend(
+                new AndroidCredentialBackend(context, ctx -> enc));
+        b.putOverride = (t, c, a, st) -> {
+            puts.add(t);
+            if (firstSeen.compareAndSet(true, false)) {
+                firstPut.countDown();
+                try { relFirst.await(10, TimeUnit.SECONDS); }
+                catch (InterruptedException e) { Thread.currentThread().interrupt(); }
+            }
+            return b.d.putCredentials(t, c, a, st);
+        };
+        installBackend(b);
+        Credentials creds = Credentials.get(context);
+        await(creds.resolveAsync());
+        creds.awaitPublishIdleForTest();
+
+        // T1 ставит X, полностью выдаёт свой запрос до старта T2.
+        final java.util.concurrent.CountDownLatch t1Done =
+                new java.util.concurrent.CountDownLatch(1);
+        final AtomicReference<Future<CredentialStore.Resolution>> f1 =
+                new AtomicReference<>();
+        Thread t1 = new Thread(() -> {
+            f1.set(creds.setTokenAsync("SYNTH_TOKEN_X"));
+            t1Done.countDown();
+        });
+        t1.start();
+        assertTrue(t1Done.await(10, TimeUnit.SECONDS));
+        assertTrue("первая запись исполняется", firstPut.await(10, TimeUnit.SECONDS));
+
+        final AtomicReference<Future<CredentialStore.Resolution>> f2 =
+                new AtomicReference<>();
+        Thread t2 = new Thread(() -> f2.set(creds.setTokenAsync("SYNTH_TOKEN_Y")));
+        t2.start();
+        t2.join(10_000);
+
+        relFirst.countDown();
+        assertEquals(CredentialStore.Status.READY,
+                f1.get().get(10, TimeUnit.SECONDS).status);
+        assertEquals(CredentialStore.Status.READY,
+                f2.get().get(10, TimeUnit.SECONDS).status);
+        creds.awaitPublishIdleForTest();
+
+        assertEquals(java.util.Arrays.asList("SYNTH_TOKEN_X", "SYNTH_TOKEN_Y"),
+                puts);
+        assertEquals("SYNTH_TOKEN_Y", CredHelper.getToken(context));
+        assertEquals("SYNTH_TOKEN_Y", creds.snapshot().token);
+    }
+
+    /**
+     * Одновременные записи двух потоков: итог диска и опубликованного
+     * снимка равен последней ИСПОЛНЕННОЙ записи — порядок операций и
+     * порядок публикаций не расходятся.
+     */
+    @Test
+    public void concurrentMutationsStayConsistent() throws Exception {
+        final SharedPreferences enc = CredHelper.enc(context);
+        final java.util.List<String> puts =
+                java.util.Collections.synchronizedList(new java.util.ArrayList<>());
+        WrappingBackend b = new WrappingBackend(
+                new AndroidCredentialBackend(context, ctx -> enc));
+        b.putOverride = (t, c, a, st) -> {
+            puts.add(t);
+            return b.d.putCredentials(t, c, a, st);
+        };
+        installBackend(b);
+        Credentials creds = Credentials.get(context);
+        await(creds.resolveAsync());
+        creds.awaitPublishIdleForTest();
+
+        final java.util.concurrent.CyclicBarrier start =
+                new java.util.concurrent.CyclicBarrier(3);
+        final AtomicReference<Future<CredentialStore.Resolution>> f1 =
+                new AtomicReference<>();
+        final AtomicReference<Future<CredentialStore.Resolution>> f2 =
+                new AtomicReference<>();
+        Thread t1 = new Thread(() -> {
+            try {
+                start.await(10, TimeUnit.SECONDS);
+                f1.set(creds.setTokenAsync("SYNTH_TOKEN_X"));
+            } catch (Exception ignored) { }
+        });
+        Thread t2 = new Thread(() -> {
+            try {
+                start.await(10, TimeUnit.SECONDS);
+                f2.set(creds.setTokenAsync("SYNTH_TOKEN_Y"));
+            } catch (Exception ignored) { }
+        });
+        t1.start();
+        t2.start();
+        start.await(10, TimeUnit.SECONDS);
+        t1.join(10_000);
+        t2.join(10_000);
+        assertNotNull(f1.get());
+        assertNotNull(f2.get());
+        f1.get().get(10, TimeUnit.SECONDS);
+        f2.get().get(10, TimeUnit.SECONDS);
+        creds.awaitPublishIdleForTest();
+
+        assertEquals("порядок записей = порядок поколений, 2 записи", 2, puts.size());
+        String last = puts.get(puts.size() - 1);
+        assertEquals(last, CredHelper.getToken(context));
+        Credentials.Snapshot s = creds.snapshot();
+        assertEquals(Credentials.State.READY, s.state);
+        assertEquals("опубликованный снимок = последняя исполненная запись",
+                last, s.token);
+    }
+
+    /**
+     * commit=false сохраняет блокировку; следующий resolve повторяет
+     * реальный commit и публикует актуальный READY — запрет не вечный.
+     */
+    @Test
+    public void commitFalseKeepsBlockThenRecoveryPublishesReady() throws Exception {
+        final SharedPreferences enc = CredHelper.enc(context);
+        final AtomicBoolean failNext = new AtomicBoolean(true);
+        WrappingBackend b = new WrappingBackend(
+                new AndroidCredentialBackend(context, ctx -> enc));
+        b.putOverride = (t, c, a, st) -> !failNext.getAndSet(false)
+                && b.d.putCredentials(t, c, a, st);
+        installBackend(b);
+        Credentials creds = Credentials.get(context);
+
+        CredentialStore.Resolution r1 =
+                await(creds.setTokenAsync("SYNTH_TOKEN_B"));
+        assertEquals(CredentialStore.Status.INCOMPLETE, r1.status);
+        creds.awaitPublishIdleForTest();
+        assertFalse("commit=false сохраняет блокировку",
+                creds.snapshot().sendPermitted());
+
+        // Следующее чтение повторяет commit на диске — запрет снимается
+        // подтверждённым результатом, а не устаревшим состоянием.
+        CredentialStore.Resolution r2 = await(creds.resolveAsync());
+        assertEquals(CredentialStore.Status.READY, r2.status);
+        creds.awaitPublishIdleForTest();
+        Credentials.Snapshot s = creds.snapshot();
+        assertTrue(s.sendPermitted());
+        assertEquals("SYNTH_TOKEN_B", s.token);
+        assertEquals("SYNTH_TOKEN_B", CredHelper.getToken(context));
     }
 }

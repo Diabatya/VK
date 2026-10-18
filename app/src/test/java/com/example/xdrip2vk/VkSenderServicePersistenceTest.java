@@ -26,6 +26,7 @@ import org.robolectric.annotation.Config;
 import java.util.ArrayList;
 import java.util.Collections;
 import java.util.List;
+import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.concurrent.atomic.AtomicReference;
 
 /**
@@ -579,5 +580,99 @@ public class VkSenderServicePersistenceTest {
         assertEquals(rid, rids.get(1).intValue()); // прежний random_id
         assertEquals(0, s2.pendingForTest().size());
         s2.onDestroy();
+    }
+
+    /**
+     * №2Г.4А: смена токена, запрошенная во время drain — следующая
+     * попытка sender.send со старой версией реквизитов не начинается.
+     * Два ожидающих сообщения; первая попытка завершается по прежнему
+     * протоколу (её результат учтён), вторая блокируется актуальностью:
+     * resolveBlocking не возвращает устаревший READY(A) — он видит либо
+     * запрет, либо READY(B) с другим fingerprint.
+     */
+    @Test
+    public void tokenChangeDuringDrainBlocksNextSend() throws Exception {
+        long future = System.currentTimeMillis() + 600_000;
+        store.history.add("{\"v\":1,\"lastSeenBgMs\":0,\"treatInit\":false,"
+                + "\"blockedFp\":\"\",\"missedAlertMs\":0,\"seenTreat\":[],"
+                + "\"outbox\":{\"messages\":["
+                + "{\"key\":\"bg:1\",\"peer\":\"777\",\"text\":\"m1\",\"rid\":101,"
+                + "\"exp\":" + future + ",\"att\":0,\"nb\":0,\"term\":false,"
+                + "\"err\":\"\",\"snd\":\"user:1\",\"fp\":\"fp1\",\"po\":\"user:1\"},"
+                + "{\"key\":\"bg:2\",\"peer\":\"777\",\"text\":\"m2\",\"rid\":102,"
+                + "\"exp\":" + future + ",\"att\":0,\"nb\":0,\"term\":false,"
+                + "\"err\":\"\",\"snd\":\"user:1\",\"fp\":\"fp1\",\"po\":\"user:1\"}"
+                + "]}}");
+        // Backend с удержанием записи токена B — пока запись не
+        // подтверждена, запрет фасада действует на каждую проверку.
+        final java.util.concurrent.CountDownLatch putEntered =
+                new java.util.concurrent.CountDownLatch(1);
+        final java.util.concurrent.CountDownLatch putRelease =
+                new java.util.concurrent.CountDownLatch(1);
+        CredHelper.HookedBackend hb = new CredHelper.HookedBackend(
+                new com.example.xdrip2vk.store.AndroidCredentialBackend(
+                        context, c -> CredHelper.enc(context)));
+        hb.putOverride = (t, c, a, st) -> {
+            if ("SYNTH_TOKEN_B".equals(t)) {
+                putEntered.countDown();
+                try {
+                    putRelease.await(10, java.util.concurrent.TimeUnit.SECONDS);
+                } catch (InterruptedException e) {
+                    Thread.currentThread().interrupt();
+                }
+            }
+            return hb.d.putCredentials(t, c, a, st);
+        };
+        com.example.xdrip2vk.store.CredentialStore
+                .resetCoordinatorForTest(hb);
+        Credentials.resetForTest();
+        Credentials.backendForTest = hb;
+        Credentials.permitMainBlockingForTest = true;
+
+        final AtomicBoolean once = new AtomicBoolean(true);
+        final AtomicReference<String> tokenAtSecondSend =
+                new AtomicReference<>("");
+        VkSenderService.senderOverride = (peer, text, rid) -> {
+            if (once.compareAndSet(true, false)) {
+                peers.add(peer);
+                rids.add(rid);
+                // Запрос записи B внутри первой попытки — немедленный
+                // запрет старой версии уже установлен.
+                Credentials.get(context).setTokenAsync("SYNTH_TOKEN_B");
+            } else {
+                // Если попытка случилась — под каким токеном на диске?
+                tokenAtSecondSend.set(CredHelper.getToken(context));
+                peers.add(peer);
+            }
+            return SendResult.SENT;
+        };
+
+        VkSenderService s = Robolectric.buildService(VkSenderService.class)
+                .create().get();
+        // Drain гоним на отдельном потоке: он встанет в проверке
+        // актуальности, пока запись B удержана координатором.
+        Thread pump = new Thread(
+                () -> Shadows.shadowOf(s.workerLooperForTest()).idle());
+        pump.start();
+
+        assertTrue("запись B исполняется и удержана", putEntered.await(
+                10, java.util.concurrent.TimeUnit.SECONDS));
+        assertEquals("попытка после запроса смены токена не началась",
+                1, peers.size());
+        assertEquals("m1 завершена по прежнему протоколу", 101,
+                rids.get(0).intValue());
+
+        putRelease.countDown();
+        pump.join(15_000);
+        Credentials.get(context).awaitPublishIdleForTest();
+        Credentials.Snapshot snap = Credentials.get(context).snapshot();
+        assertTrue(snap.sendPermitted());
+        assertEquals("SYNTH_TOKEN_B", snap.token);
+        assertEquals("SYNTH_TOKEN_B", CredHelper.getToken(context));
+        if (peers.size() > 1) {
+            // Продолжение допустимо только под подтверждённой версией B.
+            assertEquals("SYNTH_TOKEN_B", tokenAtSecondSend.get());
+        }
+        s.onDestroy();
     }
 }
