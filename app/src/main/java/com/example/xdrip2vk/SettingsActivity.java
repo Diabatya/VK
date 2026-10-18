@@ -291,9 +291,28 @@ public class SettingsActivity extends AppCompatActivity {
          * значений и текста исключения. Закрытый экран не обновляется,
          * подтверждённая операция хранения при этом не теряется.
          */
-        private void applyTokenResult(Credentials.Snapshot s,
+        private void applyTokenResult(Credentials.CommandResult res,
                                       String readyMessage, String deletedMessage) {
             if (!isAdded()) {
+                return;
+            }
+            Credentials.Snapshot s = res.outcome;
+            if (res.superseded) {
+                // Запоздавший исход старой записи: экран обновляется по
+                // актуальному снимку, старое значение не заявляется
+                // текущим. Отказ самой команды показываем с её причиной.
+                refreshCredentialViews();
+                if (s.sendPermitted() || s.state == Credentials.State.EMPTY
+                        || s.state == Credentials.State.DELETED) {
+                    Toast.makeText(requireContext(),
+                            Credentials.describe(creds.snapshot()),
+                            Toast.LENGTH_SHORT).show();
+                } else {
+                    Toast.makeText(requireContext(),
+                            "Не удалось сохранить токен: "
+                                    + Credentials.describe(s),
+                            Toast.LENGTH_LONG).show();
+                }
                 return;
             }
             switch (s.state) {

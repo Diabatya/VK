@@ -8,8 +8,10 @@ import android.content.SharedPreferences;
 import androidx.preference.PreferenceManager;
 import androidx.test.core.app.ApplicationProvider;
 
+import com.example.xdrip2vk.core.CredentialAudit.Reason;
 import com.example.xdrip2vk.core.CredentialAudit.Role;
 import com.example.xdrip2vk.core.CredentialAudit.Source;
+import com.example.xdrip2vk.core.Fingerprint;
 import com.example.xdrip2vk.store.AndroidCredentialBackend;
 import com.example.xdrip2vk.store.CredentialBackend;
 
@@ -819,5 +821,94 @@ public class CredentialsFacadeTest {
         assertTrue(s.sendPermitted());
         assertEquals("SYNTH_TOKEN_B", s.token);
         assertEquals("SYNTH_TOKEN_B", CredHelper.getToken(context));
+    }
+
+    // ==================== 2Г.4А.1: исход команды vs состояние ====================
+
+    /**
+     * Точное воспроизведение №2Г.4А.1: отклонённая команда выбора чата
+     * (STALE_TOKEN) + последующий resolve READY(B,777) → задержанный
+     * callback получает ИСХОД СВОЕЙ команды, а не чужой READY.
+     */
+    @Test
+    public void rejectedCommandKeepsOwnOutcome() throws Exception {
+        CredHelper.setToken(context, "SYNTH_TOKEN_B");
+        CredHelper.setChatId(context, 777);
+        Credentials creds = Credentials.get(context);
+        await(creds.resolveAsync());
+        creds.awaitPublishIdleForTest();
+
+        final java.util.concurrent.CountDownLatch delivered =
+                new java.util.concurrent.CountDownLatch(1);
+        final AtomicReference<Credentials.CommandResult> got =
+                new AtomicReference<>();
+        // Список был загружен с токеном A — fingerprint устарел.
+        creds.setChatIdOnMain(999, Fingerprint.of("SYNTH_TOKEN_A"), r -> {
+            got.set(r);
+            delivered.countDown();
+        });
+        // Команда исполнена и её callback поставлен в main-очередь,
+        // но ещё не исполнен — моделируем отложенную доставку.
+        creds.awaitPublishIdleForTest();
+        // Более новое чтение публикует READY(B, 777).
+        CredentialStore.Resolution r2 = await(creds.resolveAsync());
+        assertEquals(CredentialStore.Status.READY, r2.status);
+        assertEquals("SYNTH_TOKEN_B", r2.token);
+        creds.awaitPublishIdleForTest();
+
+        // Исполняем задержанный callback.
+        org.robolectric.Shadows.shadowOf(android.os.Looper.getMainLooper())
+                .idle();
+        assertTrue(delivered.await(10, TimeUnit.SECONDS));
+
+        Credentials.CommandResult cr = got.get();
+        assertNotNull(cr);
+        assertEquals("отказ команды сохранён, чужой READY его не закрыл",
+                Credentials.State.BLOCKED, cr.outcome.state);
+        assertEquals(Reason.STALE_TOKEN, cr.outcome.reason);
+        assertFalse("чтение не замещает команду", cr.superseded);
+        assertFalse(cr.outcome.sendPermitted());
+        assertEquals("адресат 777 не изменён", 777,
+                CredHelper.getChatId(context));
+    }
+
+    /**
+     * Подтверждённая старая запись, замещённая более новым изменением до
+     * доставки callback: outcome — её собственный READY, но superseded
+     * запрещает показывать старое значение как текущее.
+     */
+    @Test
+    public void supersededSuccessFlaggedNotCurrent() throws Exception {
+        CredHelper.setToken(context, "SYNTH_TOKEN_A");
+        Credentials creds = Credentials.get(context);
+        await(creds.resolveAsync());
+        creds.awaitPublishIdleForTest();
+
+        final java.util.concurrent.CountDownLatch delivered =
+                new java.util.concurrent.CountDownLatch(1);
+        final AtomicReference<Credentials.CommandResult> got =
+                new AtomicReference<>();
+        creds.setTokenOnMain("SYNTH_TOKEN_B", r -> {
+            got.set(r);
+            delivered.countDown();
+        });
+        // Команда подтверждена, callback ждёт в main-очереди.
+        creds.awaitPublishIdleForTest();
+        // Более новое изменение принято до исполнения callback.
+        assertEquals(CredentialStore.Status.READY,
+                await(creds.setTokenAsync("SYNTH_TOKEN_C")).status);
+        creds.awaitPublishIdleForTest();
+
+        org.robolectric.Shadows.shadowOf(android.os.Looper.getMainLooper())
+                .idle();
+        assertTrue(delivered.await(10, TimeUnit.SECONDS));
+
+        Credentials.CommandResult cr = got.get();
+        assertEquals("исход самой команды сохранён",
+                Credentials.State.READY, cr.outcome.state);
+        assertEquals("SYNTH_TOKEN_B", cr.outcome.token);
+        assertTrue("успех замещён более новым изменением", cr.superseded);
+        assertEquals("SYNTH_TOKEN_C", creds.snapshot().token);
+        assertEquals("SYNTH_TOKEN_C", CredHelper.getToken(context));
     }
 }

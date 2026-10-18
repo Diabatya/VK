@@ -217,29 +217,35 @@ public class VkConversationsActivity extends AppCompatActivity {
         }
     }
 
-    private void onSelectionResult(Conversation selected, Credentials.Snapshot s) {
+    private void onSelectionResult(Conversation selected,
+                                   Credentials.CommandResult res) {
         if (isFinishing() || isDestroyed()) {
             return;
         }
         progressBar.setVisibility(View.GONE);
-        switch (s.state) {
-            case READY:
-                Toast.makeText(this, "Выбрано: " + selected.title, Toast.LENGTH_SHORT).show();
-                finish();
-                break;
-            case BLOCKED:
-                if (s.reason == CredentialAudit.Reason.STALE_TOKEN) {
-                    Toast.makeText(this,
-                            "Токен изменился, загрузите список бесед заново",
-                            Toast.LENGTH_LONG).show();
-                } else {
-                    Toast.makeText(this, Credentials.describe(s), Toast.LENGTH_LONG).show();
-                }
-                break;
-            default:
-                Toast.makeText(this, Credentials.describe(s), Toast.LENGTH_LONG).show();
-                break;
+        // Исход ЭТОЙ команды: чужой READY не делает отклонённый выбор
+        // успешным. Замещённый более новым изменением успех не
+        // подтверждает старое значение как текущее — статус по
+        // актуальному снимку фасада.
+        Credentials.Snapshot s = res.outcome;
+        if (s.state == Credentials.State.READY && !res.superseded) {
+            Toast.makeText(this, "Выбрано: " + selected.title,
+                    Toast.LENGTH_SHORT).show();
+            finish();
+            return;
         }
+        if (s.state == Credentials.State.BLOCKED
+                && s.reason == CredentialAudit.Reason.STALE_TOKEN) {
+            Toast.makeText(this,
+                    "Токен изменился, загрузите список бесед заново",
+                    Toast.LENGTH_LONG).show();
+            return;
+        }
+        Toast.makeText(this,
+                res.superseded
+                        ? Credentials.describe(Credentials.get(this).snapshot())
+                        : Credentials.describe(s),
+                Toast.LENGTH_LONG).show();
     }
 
     /**

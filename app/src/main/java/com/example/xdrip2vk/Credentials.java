@@ -46,9 +46,12 @@ import java.util.function.Supplier;
  *   (с учётом запрета), а не сырой результат своей операции.
  *
  * Контракт callback'ов команд (setTokenOnMain и др.): доставленный
- * Snapshot — результат ЭТОЙ команды, если она осталась актуальной,
- * иначе текущее состояние фасада; он не является обещанием разрешения
- * отправки в будущем.
+ * {@link CommandResult} — исход ЭТОЙ команды, никогда не заменяемый
+ * состоянием других операций: отклонённая запись не становится успешной
+ * от чужого READY. Флаг superseded отличает актуальный успех от
+ * запоздавшего, замещённого более новым изменением. Результат команды
+ * не является разрешением отправки — сервис читает актуальный снимок
+ * по действующему протоколу.
  *
  * Потоки:
  * - snapshot() — только память, безопасен из любого потока, никогда не
@@ -130,6 +133,25 @@ public final class Credentials {
                 default:
                     return new Snapshot(State.INCOMPLETE, r.reason, "", 0, 0);
             }
+        }
+    }
+
+    /**
+     * Исход конкретной команды записи (2Г.4А.1).
+     * outcome — результат ЭТОЙ команды: READY означает, что её commit
+     * подтверждён; отказ сохраняет свою причину (включая STALE_TOKEN)
+     * и никогда не подменяется чужим состоянием.
+     * superseded — после этой команды принято более новое изменение:
+     * запоздавший успех нельзя показывать как текущее состояние;
+     * экран обновляется по {@link #snapshot()} фасада.
+     */
+    public static final class CommandResult {
+        public final Snapshot outcome;
+        public final boolean superseded;
+
+        private CommandResult(Snapshot outcome, boolean superseded) {
+            this.outcome = outcome;
+            this.superseded = superseded;
         }
     }
 
@@ -407,20 +429,23 @@ public final class Credentials {
         return issue(true, () -> store.clearChatIdsAsync(expectedTokenFingerprint)).future;
     }
 
-    /** Команда записи; актуальный снимок результата — на главный поток. */
-    public void setTokenOnMain(String token, Consumer<Snapshot> callback) {
-        deliverOnMain(issue(true, () -> store.setTokenAsync(token)), callback);
+    /**
+     * Команда записи; callback получает исход ИМЕННО этой команды
+     * ({@link CommandResult}) на главном потоке.
+     */
+    public void setTokenOnMain(String token, Consumer<CommandResult> callback) {
+        deliverCommandOnMain(issue(true, () -> store.setTokenAsync(token)), callback);
     }
 
     public void setChatIdOnMain(long chatId, String expectedTokenFingerprint,
-                              Consumer<Snapshot> callback) {
-        deliverOnMain(issue(true, () -> store.setChatIdAsync(chatId, expectedTokenFingerprint)),
+                              Consumer<CommandResult> callback) {
+        deliverCommandOnMain(issue(true, () -> store.setChatIdAsync(chatId, expectedTokenFingerprint)),
                 callback);
     }
 
     public void setAlertChatIdOnMain(long alertChatId, String expectedTokenFingerprint,
-                                   Consumer<Snapshot> callback) {
-        deliverOnMain(issue(true, () -> store.setAlertChatIdAsync(alertChatId, expectedTokenFingerprint)),
+                                     Consumer<CommandResult> callback) {
+        deliverCommandOnMain(issue(true, () -> store.setAlertChatIdAsync(alertChatId, expectedTokenFingerprint)),
                 callback);
     }
 
@@ -441,6 +466,35 @@ public final class Credentials {
             // Проверка актуальности в момент фактической доставки: callback
             // мог ждать в очереди main уже после более нового запроса.
             mainHandler.post(() -> callback.accept(effective(res, op.gen)));
+        });
+    }
+
+    /**
+     * Доставка исхода команды: callback получает результат ЕЁ операции
+     * (никогда не замещаемый чужим состоянием) + признак, что после неё
+     * принято более новое изменение — проверка в момент фактической
+     * доставки на main.
+     */
+    private void deliverCommandOnMain(Issued op, Consumer<CommandResult> callback) {
+        publishExec.execute(() -> {
+            Resolution r;
+            try {
+                r = op.future.get();
+            } catch (InterruptedException e) {
+                Thread.currentThread().interrupt();
+                return;
+            } catch (ExecutionException e) {
+                r = null;
+            }
+            final Snapshot out = r == null
+                    ? Snapshot.incomplete() : Snapshot.of(r);
+            mainHandler.post(() -> {
+                boolean superseded;
+                synchronized (lock) {
+                    superseded = latestMutationGen > op.gen;
+                }
+                callback.accept(new CommandResult(out, superseded));
+            });
         });
     }
 }

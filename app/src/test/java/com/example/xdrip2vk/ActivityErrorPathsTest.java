@@ -249,4 +249,201 @@ public class ActivityErrorPathsTest {
         assertEquals("Ошибка чтения файла", latestToast());
         assertNoMarkersInLogs(mark);
     }
+
+    // ==================== 2Г.4А.1: исход команды vs состояние ====================
+
+    private VkConversationsActivity startConversationsWithChat(String type)
+            throws Exception {
+        String body = "{\"response\":{\"count\":1,\"items\":[{"
+                + "\"conversation\":{\"peer\":{\"id\":2000000001,"
+                + "\"type\":\"chat\"},\"chat_settings\":{\"title\":\""
+                + TITLE_MARK + "\"}}}]}}";
+        VkApi.transportOverride = (m, t, p) -> new VkApi.RawResponse(200, body);
+        VkConversationsActivity.loadDoneForTest = new CountDownLatch(1);
+        Intent i = new Intent(context, VkConversationsActivity.class);
+        i.putExtra("chat_type", type);
+        VkConversationsActivity a = Robolectric
+                .buildActivity(VkConversationsActivity.class, i)
+                .create().get();
+        opened.add(a);
+        awaitLoadAndIdle();
+        return a;
+    }
+
+    private void clickFirstConversation(VkConversationsActivity a) {
+        ListView lv = a.findViewById(R.id.list_conversations);
+        lv.performItemClick(lv.getAdapter().getView(0, null, lv), 0,
+                lv.getAdapter().getItemId(0));
+    }
+
+    /**
+     * Точное воспроизведение: список загружен с токеном A, токен сменился
+     * на B, выбор отклонён STALE_TOKEN — callback уже ждёт в main-очереди,
+     * когда resolve публикует READY(B). Задержанный callback не объявляет
+     * выбор успешным и не закрывает экран.
+     */
+    @Test
+    public void staleSelectionAfterTokenChangeShowsNoSuccess() throws Exception {
+        VkConversationsActivity a = startConversationsWithChat("normal");
+        // Токен сменился после загрузки списка — fingerprint устарел.
+        assertEquals(com.example.xdrip2vk.store.CredentialStore.Status.READY,
+                Credentials.get(context).setTokenAsync("SYNTH_TOKEN_B")
+                        .get(AWAIT_MS, TimeUnit.MILLISECONDS).status);
+        Credentials.get(context).awaitPublishIdleForTest();
+
+        clickFirstConversation(a);
+        // Команда исполнена и отклонена; её callback уже в main-очереди.
+        Credentials.get(context).awaitPublishIdleForTest();
+        // Более новое чтение публикует READY(B).
+        Credentials.get(context).resolveAsync()
+                .get(AWAIT_MS, TimeUnit.MILLISECONDS);
+        Credentials.get(context).awaitPublishIdleForTest();
+
+        shadowOf(Looper.getMainLooper()).idle();
+
+        String toast = latestToast();
+        assertNotNull("ожидался Toast с причиной", toast);
+        assertTrue("устаревший токен — просьба загрузить список заново: "
+                + toast, toast.contains("изменился"));
+        assertFalse("ложного «Выбрано» нет", toast.contains("Выбрано"));
+        assertFalse("экран не закрыт как при успехе", a.isFinishing());
+        assertEquals("запись не выполнена — адресат не изменён", 0,
+                CredHelper.getChatId(context));
+    }
+
+    /** Аналогичный сценарий для тревожного адресата. */
+    @Test
+    public void staleAlertSelectionShowsNoSuccess() throws Exception {
+        VkConversationsActivity a = startConversationsWithChat("alert");
+        assertEquals(com.example.xdrip2vk.store.CredentialStore.Status.READY,
+                Credentials.get(context).setTokenAsync("SYNTH_TOKEN_B")
+                        .get(AWAIT_MS, TimeUnit.MILLISECONDS).status);
+        Credentials.get(context).awaitPublishIdleForTest();
+
+        clickFirstConversation(a);
+        Credentials.get(context).awaitPublishIdleForTest();
+        Credentials.get(context).resolveAsync()
+                .get(AWAIT_MS, TimeUnit.MILLISECONDS);
+        Credentials.get(context).awaitPublishIdleForTest();
+        shadowOf(Looper.getMainLooper()).idle();
+
+        String toast = latestToast();
+        assertNotNull(toast);
+        assertTrue(toast.contains("изменился"));
+        assertFalse(toast.contains("Выбрано"));
+        assertFalse(a.isFinishing());
+        assertEquals(0, CredHelper.getAlertChatId(context));
+    }
+
+    /**
+     * Подтверждённый выбор, замещённый более новым изменением токена до
+     * доставки callback: интерфейс не подтверждает старое значение.
+     */
+    @Test
+    public void supersededSelectionNotReportedAsChosen() throws Exception {
+        VkConversationsActivity a = startConversationsWithChat("normal");
+        clickFirstConversation(a); // commit быстрый, callback в очереди
+        Credentials.get(context).awaitPublishIdleForTest();
+        // Более новое изменение принято до исполнения callback.
+        assertEquals(com.example.xdrip2vk.store.CredentialStore.Status.READY,
+                Credentials.get(context).setTokenAsync("SYNTH_TOKEN_C")
+                        .get(AWAIT_MS, TimeUnit.MILLISECONDS).status);
+        Credentials.get(context).awaitPublishIdleForTest();
+        shadowOf(Looper.getMainLooper()).idle();
+
+        String toast = latestToast();
+        assertFalse("запоздавший успех не подтверждает старый выбор",
+                toast != null && toast.contains("Выбрано"));
+        assertFalse("экран не закрыт как при успехе", a.isFinishing());
+        assertEquals("SYNTH_TOKEN_C", CredHelper.getToken(context));
+    }
+
+    /** Обычный успешный выбор беседы после commit=true работает. */
+    @Test
+    public void successfulSelectionShowsChosen() throws Exception {
+        VkConversationsActivity a = startConversationsWithChat("normal");
+        clickFirstConversation(a);
+        Credentials.get(context).awaitPublishIdleForTest();
+        shadowOf(Looper.getMainLooper()).idle();
+
+        assertEquals("Выбрано: " + TITLE_MARK, latestToast());
+        assertTrue(a.isFinishing());
+        assertEquals(2000000001L, CredHelper.getChatId(context));
+    }
+
+    /**
+     * Неподтверждённая запись токена (commit=false) не получает
+     * «Токен сохранён» от последующего READY — callback несёт исход
+     * своей команды.
+     */
+    @Test
+    public void uncommittedTokenWriteGetsNoSavedToast() throws Exception {
+        final java.util.concurrent.atomic.AtomicBoolean failOnce =
+                new java.util.concurrent.atomic.AtomicBoolean(true);
+        CredHelper.HookedBackend hb = new CredHelper.HookedBackend(
+                new com.example.xdrip2vk.store.AndroidCredentialBackend(
+                        context, c -> CredHelper.enc(context)));
+        hb.putOverride = (t, c, a, st) -> !failOnce.getAndSet(false)
+                && hb.d.putCredentials(t, c, a, st);
+        com.example.xdrip2vk.store.CredentialStore
+                .resetCoordinatorForTest(hb);
+        Credentials.resetForTest();
+        Credentials.backendForTest = hb;
+        Credentials.permitMainBlockingForTest = true;
+
+        SettingsActivity activity = Robolectric
+                .buildActivity(SettingsActivity.class).create().start()
+                .resume().get();
+        opened.add(activity);
+        SettingsActivity.SettingsFragment fragment =
+                (SettingsActivity.SettingsFragment) activity
+                        .getSupportFragmentManager()
+                        .findFragmentById(R.id.settings_container);
+        assertNotNull(fragment);
+
+        // Ручной ввод токена — реальный путь OnPreferenceChangeListener.
+        androidx.preference.EditTextPreference tokenPref =
+                fragment.findPreference("vk_token");
+        assertNotNull(tokenPref);
+        tokenPref.callChangeListener("SYNTH_TOKEN_UI1");
+        // Запись отклонена commit=false; callback в main-очереди.
+        Credentials.get(context).awaitPublishIdleForTest();
+        // Последующее чтение повторяет commit → READY опубликован ДО
+        // исполнения callback старой команды.
+        Credentials.get(context).resolveAsync()
+                .get(AWAIT_MS, TimeUnit.MILLISECONDS);
+        Credentials.get(context).awaitPublishIdleForTest();
+        shadowOf(Looper.getMainLooper()).idle();
+
+        String toast = latestToast();
+        assertNotNull("ожидался Toast с причиной отказа", toast);
+        assertFalse("неподтверждённая запись не получила «сохранён»",
+                toast.contains("Токен сохранён"));
+        assertTrue("причина — незавершённая операция: " + toast,
+                toast.contains("не завершена") || toast.contains("Не удалось"));
+    }
+
+    /** Обычное успешное сохранение токена после commit=true работает. */
+    @Test
+    public void successfulTokenEntryShowsSaved() throws Exception {
+        SettingsActivity activity = Robolectric
+                .buildActivity(SettingsActivity.class).create().start()
+                .resume().get();
+        opened.add(activity);
+        SettingsActivity.SettingsFragment fragment =
+                (SettingsActivity.SettingsFragment) activity
+                        .getSupportFragmentManager()
+                        .findFragmentById(R.id.settings_container);
+        assertNotNull(fragment);
+        androidx.preference.EditTextPreference tokenPref =
+                fragment.findPreference("vk_token");
+        assertNotNull(tokenPref);
+
+        tokenPref.callChangeListener("SYNTH_TOKEN_UI2");
+        Credentials.get(context).awaitPublishIdleForTest();
+        shadowOf(Looper.getMainLooper()).idle();
+
+        assertEquals("Токен сохранён", latestToast());
+        assertEquals("SYNTH_TOKEN_UI2", CredHelper.getToken(context));
+    }
 }
