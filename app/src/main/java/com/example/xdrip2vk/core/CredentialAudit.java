@@ -215,11 +215,11 @@ public final class CredentialAudit {
         }
 
         /** Эффективный адресат: отсутствующий ключ и явный 0 равнозначны. */
-        long effectiveChatId() {
+        public long effectiveChatId() {
             return chatId.kind == Entry.Kind.PRESENT ? chatId.number : 0;
         }
 
-        long effectiveAlertChatId() {
+        public long effectiveAlertChatId() {
             return alertChatId.kind == Entry.Kind.PRESENT
                     ? alertChatId.number : 0;
         }
