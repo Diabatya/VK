@@ -203,6 +203,18 @@ public final class Credentials {
         permitMainBlockingForTest = false;
     }
 
+    /** Для тестов: дождаться обработки очереди публикаций фасада. */
+    void awaitPublishIdleForTest() {
+        java.util.concurrent.CountDownLatch l =
+                new java.util.concurrent.CountDownLatch(1);
+        publishExec.execute(l::countDown);
+        try {
+            l.await(10, TimeUnit.SECONDS);
+        } catch (InterruptedException e) {
+            Thread.currentThread().interrupt();
+        }
+    }
+
     /** Проверка: вызываем ли мы с рабочего потока координатора. */
     static boolean isOnCoordinatorThreadForTest() {
         Thread t = Thread.currentThread();

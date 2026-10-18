@@ -221,6 +221,7 @@ public class CredentialsFacadeTest {
                 await(Credentials.get(context).setTokenAsync("SYNTH_TOKEN_X"));
 
         assertEquals(CredentialStore.Status.INCOMPLETE, r.status);
+        Credentials.get(context).awaitPublishIdleForTest();
         Credentials.Snapshot s = Credentials.get(context).snapshot();
         assertFalse("неподтверждённый кеш не публикуется как READY",
                 s.sendPermitted());
@@ -238,7 +239,8 @@ public class CredentialsFacadeTest {
         CredentialStore.Resolution ready =
                 await(Credentials.get(context).resolveAsync());
         assertEquals(CredentialStore.Status.READY, ready.status);
-        // Опубликованный снимок — READY.
+        // Опубликованный снимок — READY (публикация идёт после future).
+        Credentials.get(context).awaitPublishIdleForTest();
         assertTrue(Credentials.get(context).snapshot().sendPermitted());
 
         // Блокирующий backend: putCredentials ждёт разрешения теста.
@@ -262,6 +264,7 @@ public class CredentialsFacadeTest {
         installBackend(b);
 
         Credentials.get(context).resolveAsync().get(10, TimeUnit.SECONDS);
+        Credentials.get(context).awaitPublishIdleForTest();
         assertTrue(Credentials.get(context).snapshot().sendPermitted());
 
         Future<CredentialStore.Resolution> pending =
@@ -276,10 +279,10 @@ public class CredentialsFacadeTest {
         release.countDown();
         CredentialStore.Resolution r = pending.get(10, TimeUnit.SECONDS);
         assertEquals(CredentialStore.Status.READY, r.status);
-        // Нужен ещё один цикл публикации на потоке фасада.
-        Thread.sleep(50);
-        assertEquals("SYNTH_TOKEN_B",
-                Credentials.get(context).resolveBlocking().token);
+        Credentials.get(context).awaitPublishIdleForTest();
+        Credentials.Snapshot after = Credentials.get(context).snapshot();
+        assertTrue(after.sendPermitted());
+        assertEquals("SYNTH_TOKEN_B", after.token);
     }
 
     /**
