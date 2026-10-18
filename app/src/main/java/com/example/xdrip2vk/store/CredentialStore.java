@@ -1,6 +1,7 @@
 package com.example.xdrip2vk.store;
 
 import com.example.xdrip2vk.core.CredentialAudit;
+import com.example.xdrip2vk.core.Fingerprint;
 import com.example.xdrip2vk.core.CredentialAudit.Entry;
 import com.example.xdrip2vk.core.CredentialAudit.Outcome;
 import com.example.xdrip2vk.core.CredentialAudit.Plan;
@@ -140,6 +141,62 @@ public final class CredentialStore implements AutoCloseable {
             throw new IllegalStateException("credential store closed");
         }
         return coord.submit(this::doDelete);
+    }
+
+    /**
+     * Изменение только токена (2Г.3В.2): актуальные реквизиты читаются
+     * на worker — от вызывающего полный набор не принимается. Для READY
+     * сохраняются текущие адресаты (принадлежность аккаунту проверяет
+     * существующая логика сервиса, команда хранения владельца VK не
+     * подтверждает); для EMPTY/согласованного DELETED адресаты = 0.
+     * Пустой после trim токен — подтверждённое удаление, а не ACTIVE
+     * с пустым значением.
+     */
+    public synchronized Future<Resolution> setTokenAsync(String token) {
+        if (closed) {
+            throw new IllegalStateException("credential store closed");
+        }
+        return coord.submit(() -> doSetToken(token));
+    }
+
+    /**
+     * Изменение только обычного адресата. expectedTokenFingerprint —
+     * SHA-256 ({@link com.example.xdrip2vk.core.Fingerprint}) токена,
+     * с которым загружался список бесед: токен мог смениться, пока
+     * пользователь выбирал. Несовпадение — STALE_TOKEN без записи.
+     * Fingerprint не заменяет подтверждение владельца VK.
+     */
+    public synchronized Future<Resolution> setChatIdAsync(
+            long chatId, String expectedTokenFingerprint) {
+        if (closed) {
+            throw new IllegalStateException("credential store closed");
+        }
+        return coord.submit(() ->
+                doUpdateFields(chatId, null, expectedTokenFingerprint));
+    }
+
+    /** Изменение только тревожного адресата; отрицательный допустим. */
+    public synchronized Future<Resolution> setAlertChatIdAsync(
+            long alertChatId, String expectedTokenFingerprint) {
+        if (closed) {
+            throw new IllegalStateException("credential store closed");
+        }
+        return coord.submit(() ->
+                doUpdateFields(null, alertChatId, expectedTokenFingerprint));
+    }
+
+    /**
+     * Сброс обоих адресатов одним подтверждённым commit с сохранением
+     * актуального токена. fingerprint обязателен: устаревший результат
+     * проверки владельца не должен сбросить чаты нового токена.
+     */
+    public synchronized Future<Resolution> clearChatIdsAsync(
+            String expectedTokenFingerprint) {
+        if (closed) {
+            throw new IllegalStateException("credential store closed");
+        }
+        return coord.submit(() ->
+                doUpdateFields(0L, 0L, expectedTokenFingerprint));
     }
 
     /**
@@ -436,8 +493,17 @@ public final class CredentialStore implements AutoCloseable {
                         Pending.NONE, "", 0, 0);
             }
         }
-        PendingOp save = new PendingOp(OpKind.SAVE, snap,
-                plan(t, chatId, alertChatId), meta, ServiceState.ACTIVE);
+        return startSave(snap, meta, plan(t, chatId, alertChatId));
+    }
+
+    /**
+     * Запуск подтверждённой записи полного набора: новый PendingOp,
+     * реальный commit, после commit()==true — проверка результата.
+     */
+    private Resolution startSave(Source[] snap, ServiceState meta,
+                                 Plan plan) {
+        PendingOp save = new PendingOp(OpKind.SAVE, snap, plan, meta,
+                ServiceState.ACTIVE);
         coord.pending = save;
         if (!put(save.plan)) {
             save.destinationUnconfirmed = true;
@@ -477,6 +543,86 @@ public final class CredentialStore implements AutoCloseable {
         }
         del.deleteConfirmed = true;
         return confirmDeleted();
+    }
+
+    /**
+     * Изменение токена на worker'е: актуальные реквизиты проверяются
+     * настоящим аудитом, принятые адресаты сохраняются. Пустой токен —
+     * подтверждённое удаление. Незавершённую операцию не обходим.
+     */
+    private Resolution doSetToken(String token) {
+        String t = token == null ? "" : token.trim();
+        if (t.isEmpty()) {
+            return doDelete(); // пустой токен = команда удаления
+        }
+        Source[] snap = snapshots();
+        PendingOp op = coord.pending;
+        if (op != null) {
+            return incompleteFor(op);
+        }
+        ServiceState meta = serviceState(Role.ENCRYPTED);
+        if (meta == ServiceState.INVALID) {
+            return new Resolution(Status.BLOCKED,
+                    Reason.SERVICE_STATE_INVALID, Pending.NONE, "", 0, 0);
+        }
+        long chatId = 0;
+        long alertChatId = 0;
+        if (meta == ServiceState.DELETED) {
+            Resolution bad = deletedStateCheck(snap);
+            if (bad != null) {
+                return bad;
+            }
+        } else {
+            Outcome o = check(snap);
+            if (o.verdict == Verdict.READY_SECURED) {
+                Source enc = sourceOf(snap, Role.ENCRYPTED);
+                chatId = enc.effectiveChatId();
+                alertChatId = enc.effectiveAlertChatId();
+            } else if (o.verdict != Verdict.EMPTY) {
+                return new Resolution(Status.BLOCKED, o.reason,
+                        Pending.NONE, "", 0, 0);
+            }
+        }
+        return startSave(snap, meta, plan(t, chatId, alertChatId));
+    }
+
+    /**
+     * Изменение адресатов с проверкой версии токена: разрешено только
+     * из READY и только если fingerprint ожидаемого токена совпадает с
+     * актуальным. null-поле сохраняется; чужие данные не затираются.
+     */
+    private Resolution doUpdateFields(Long chatId, Long alertChatId,
+                                      String expectedFingerprint) {
+        Source[] snap = snapshots();
+        PendingOp op = coord.pending;
+        if (op != null) {
+            return incompleteFor(op);
+        }
+        ServiceState meta = serviceState(Role.ENCRYPTED);
+        if (meta == ServiceState.INVALID) {
+            return new Resolution(Status.BLOCKED,
+                    Reason.SERVICE_STATE_INVALID, Pending.NONE, "", 0, 0);
+        }
+        if (meta == ServiceState.DELETED) {
+            return deleted(Pending.NONE); // без токена выбора нет
+        }
+        Outcome o = check(snap);
+        if (o.verdict != Verdict.READY_SECURED) {
+            Status st = o.verdict == Verdict.EMPTY
+                    ? Status.EMPTY : Status.BLOCKED;
+            return new Resolution(st, o.reason, Pending.NONE, "", 0, 0);
+        }
+        Source enc = sourceOf(snap, Role.ENCRYPTED);
+        if (!Fingerprint.of(enc.token.string).equals(expectedFingerprint)) {
+            // Список загружался другим токеном — данные устарели.
+            return new Resolution(Status.BLOCKED, Reason.STALE_TOKEN,
+                    Pending.NONE, "", 0, 0);
+        }
+        long chat = chatId != null ? chatId : enc.effectiveChatId();
+        long alert = alertChatId != null
+                ? alertChatId : enc.effectiveAlertChatId();
+        return startSave(snap, meta,
+                plan(enc.token.string, chat, alert));
     }
 
     private Resolution incompleteFor(PendingOp op) {

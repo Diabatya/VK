@@ -3,6 +3,7 @@ package com.example.xdrip2vk.store;
 import static org.junit.Assert.*;
 
 import com.example.xdrip2vk.core.CredentialAudit.Entry;
+import com.example.xdrip2vk.core.Fingerprint;
 import com.example.xdrip2vk.core.CredentialAudit.Read;
 import com.example.xdrip2vk.core.CredentialAudit.Reason;
 import com.example.xdrip2vk.core.CredentialAudit.Role;
@@ -1999,6 +2000,303 @@ public class CredentialStoreTest {
             assertTrue(b.disk.get(Role.PLAIN).isEmpty());
         } finally {
             s.close();
+        }
+    }
+
+    // --- 2Г.3В.2: изменение отдельных реквизитов ---
+
+    /** Изменение токена сохраняет актуальные адресаты. */
+    @Test
+    public void setTokenKeepsCurrentChatIds() throws Exception {
+        FakeBackend b = new FakeBackend();
+        b.seed(Role.ENCRYPTED, T_A, 5L, -2L);
+        CredentialStore s = new CredentialStore(b);
+        try {
+            Resolution r = s.setTokenAsync(T_B).get(10, TimeUnit.SECONDS);
+            assertEquals(Status.READY, r.status);
+            assertEquals(T_B, r.token);
+            assertEquals(5L, r.chatId);
+            assertEquals(-2L, r.alertChatId);
+            Map<String, V> d = b.disk.get(Role.ENCRYPTED);
+            assertEquals(T_B, d.get("token").s);
+            assertEquals(5L, (long) d.get("chat").n);
+            assertEquals(-2L, (long) d.get("alert").n);
+            assertEquals(1, b.writeCalls);
+        } finally {
+            s.close();
+        }
+    }
+
+    /** Изменение обычного адресата сохраняет токен и тревожный. */
+    @Test
+    public void setChatIdKeepsTokenAndAlert() throws Exception {
+        FakeBackend b = new FakeBackend();
+        b.seed(Role.ENCRYPTED, T_A, 5L, -2L);
+        CredentialStore s = new CredentialStore(b);
+        try {
+            Resolution r = s.setChatIdAsync(7L, Fingerprint.of(T_A))
+                    .get(10, TimeUnit.SECONDS);
+            assertEquals(Status.READY, r.status);
+            Map<String, V> d = b.disk.get(Role.ENCRYPTED);
+            assertEquals(T_A, d.get("token").s);
+            assertEquals(7L, (long) d.get("chat").n);
+            assertEquals(-2L, (long) d.get("alert").n);
+        } finally {
+            s.close();
+        }
+    }
+
+    /** Изменение тревожного сохраняет обычный; отрицательное значение ок. */
+    @Test
+    public void setAlertChatIdKeepsChatAndNegative() throws Exception {
+        FakeBackend b = new FakeBackend();
+        b.seed(Role.ENCRYPTED, T_A, 5L, -2L);
+        CredentialStore s = new CredentialStore(b);
+        try {
+            Resolution r = s.setAlertChatIdAsync(-9L, Fingerprint.of(T_A))
+                    .get(10, TimeUnit.SECONDS);
+            assertEquals(Status.READY, r.status);
+            Map<String, V> d = b.disk.get(Role.ENCRYPTED);
+            assertEquals(5L, (long) d.get("chat").n);
+            assertEquals(-9L, (long) d.get("alert").n);
+        } finally {
+            s.close();
+        }
+    }
+
+    /** Сброс обоих адресатов — одна запись, токен сохранён. */
+    @Test
+    public void clearChatIdsSingleCommit() throws Exception {
+        FakeBackend b = new FakeBackend();
+        b.seed(Role.ENCRYPTED, T_A, 5L, -2L);
+        CredentialStore s = new CredentialStore(b);
+        try {
+            Resolution r = s.clearChatIdsAsync(Fingerprint.of(T_A))
+                    .get(10, TimeUnit.SECONDS);
+            assertEquals(Status.READY, r.status);
+            Map<String, V> d = b.disk.get(Role.ENCRYPTED);
+            assertEquals(T_A, d.get("token").s);
+            assertEquals(0L, (long) d.get("chat").n);
+            assertEquals(0L, (long) d.get("alert").n);
+            assertEquals(1, b.writeCalls);
+        } finally {
+            s.close();
+        }
+    }
+
+    /**
+     * Список загружен с T_A, затем сохранён T_B, затем выбран чат из
+     * списка A: запись отклонена, данные B целы.
+     */
+    @Test
+    public void staleTokenRejectsChatChoice() throws Exception {
+        FakeBackend b = new FakeBackend();
+        b.seed(Role.ENCRYPTED, T_A, 5L, -2L);
+        CredentialStore s = new CredentialStore(b);
+        try {
+            String fpA = Fingerprint.of(T_A);
+            assertEquals(Status.READY,
+                    s.setTokenAsync(T_B).get(10, TimeUnit.SECONDS).status);
+            int writes = b.writeCalls;
+            Resolution r = s.setChatIdAsync(9L, fpA).get(10,
+                    TimeUnit.SECONDS);
+            assertEquals(Status.BLOCKED, r.status);
+            assertEquals(Reason.STALE_TOKEN, r.reason);
+            assertFalse(r.sendPermitted());
+            assertEquals(writes, b.writeCalls); // записи не было
+            Map<String, V> d = b.disk.get(Role.ENCRYPTED);
+            assertEquals(T_B, d.get("token").s);
+            assertEquals(5L, (long) d.get("chat").n);
+        } finally {
+            s.close();
+        }
+    }
+
+    /** Устаревшая команда сброса не меняет чаты нового токена. */
+    @Test
+    public void staleClearDoesNotTouchNewTokenChats() throws Exception {
+        FakeBackend b = new FakeBackend();
+        b.seed(Role.ENCRYPTED, T_A, 5L, -2L);
+        CredentialStore s = new CredentialStore(b);
+        try {
+            String fpA = Fingerprint.of(T_A);
+            assertEquals(Status.READY,
+                    s.setTokenAsync(T_B).get(10, TimeUnit.SECONDS).status);
+            Resolution r = s.clearChatIdsAsync(fpA).get(10,
+                    TimeUnit.SECONDS);
+            assertEquals(Status.BLOCKED, r.status);
+            assertEquals(Reason.STALE_TOKEN, r.reason);
+            Map<String, V> d = b.disk.get(Role.ENCRYPTED);
+            assertEquals(T_B, d.get("token").s);
+            assertEquals(5L, (long) d.get("chat").n);
+            assertEquals(-2L, (long) d.get("alert").n);
+        } finally {
+            s.close();
+        }
+    }
+
+    /**
+     * Две команды разных handle, меняющие разные поля, сериализованы и
+     * не теряют изменений друг друга.
+     */
+    @Test
+    public void twoHandlesDifferentFieldsBothApplied() throws Exception {
+        FakeBackend b = new FakeBackend();
+        b.seed(Role.ENCRYPTED, T_A, 5L, -2L);
+        CredentialStore s1 = new CredentialStore(b);
+        // Второй backend того же storageId: общий диск/кеш, свои счётчики.
+        FakeBackend b2 = b.sameProcessStorage();
+        CredentialStore s2 = new CredentialStore(b2);
+        try {
+            String fp = Fingerprint.of(T_A);
+            java.util.concurrent.Future<Resolution> f1 =
+                    s1.setChatIdAsync(7L, fp);
+            java.util.concurrent.Future<Resolution> f2 =
+                    s2.setAlertChatIdAsync(-4L, fp);
+            assertEquals(Status.READY, f1.get(10, TimeUnit.SECONDS).status);
+            assertEquals(Status.READY, f2.get(10, TimeUnit.SECONDS).status);
+            Map<String, V> d = b.disk.get(Role.ENCRYPTED);
+            assertEquals(T_A, d.get("token").s);
+            assertEquals(7L, (long) d.get("chat").n);
+            assertEquals(-4L, (long) d.get("alert").n);
+            assertEquals(2, b.writeCalls + b2.writeCalls);
+        } finally {
+            s1.close();
+            s2.close();
+        }
+    }
+
+    /**
+     * Изменение токена и адресата в одной очереди выполняются по
+     * порядку: результат второй команды видит итог первой.
+     */
+    @Test
+    public void tokenAndChatCommandsRunInOrder() throws Exception {
+        FakeBackend b = new FakeBackend();
+        b.seed(Role.ENCRYPTED, T_A, 5L, -2L);
+        CredentialStore s = new CredentialStore(b);
+        try {
+            String fpA = Fingerprint.of(T_A);
+            java.util.concurrent.Future<Resolution> f1 =
+                    s.setTokenAsync(T_B);
+            java.util.concurrent.Future<Resolution> f2 =
+                    s.setChatIdAsync(9L, fpA); // устаревший fingerprint
+            assertEquals(Status.READY, f1.get(10, TimeUnit.SECONDS).status);
+            Resolution r2 = f2.get(10, TimeUnit.SECONDS);
+            // Команда встала после смены токена: fpA устарел → отказ.
+            assertEquals(Status.BLOCKED, r2.status);
+            assertEquals(Reason.STALE_TOKEN, r2.reason);
+            Map<String, V> d = b.disk.get(Role.ENCRYPTED);
+            assertEquals(T_B, d.get("token").s);
+            assertEquals(5L, (long) d.get("chat").n);
+            // С актуальным fingerprint — разрешено.
+            Resolution r3 = s.setChatIdAsync(9L, Fingerprint.of(T_B))
+                    .get(10, TimeUnit.SECONDS);
+            assertEquals(Status.READY, r3.status);
+            assertEquals(9L, (long) b.disk.get(Role.ENCRYPTED)
+                    .get("chat").n);
+        } finally {
+            s.close();
+        }
+    }
+
+    /** EMPTY и DELETED не позволяют выбрать чат без токена. */
+    @Test
+    public void emptyOrDeletedCannotChooseChat() throws Exception {
+        FakeBackend b = new FakeBackend();
+        CredentialStore s = new CredentialStore(b);
+        try {
+            Resolution r = s.setChatIdAsync(9L, Fingerprint.of(T_A))
+                    .get(10, TimeUnit.SECONDS);
+            assertEquals(Status.EMPTY, r.status);
+            assertFalse(r.sendPermitted());
+            assertEquals(0, b.writeCalls);
+            assertEquals(Status.DELETED,
+                    s.deleteAsync().get(10, TimeUnit.SECONDS).status);
+            Resolution r2 = s.setChatIdAsync(9L, Fingerprint.of(T_A))
+                    .get(10, TimeUnit.SECONDS);
+            assertEquals(Status.DELETED, r2.status);
+            assertEquals(0, b.writeCalls);
+        } finally {
+            s.close();
+        }
+    }
+
+    /** Пустой после trim токен выполняет подтверждённое удаление. */
+    @Test
+    public void emptyTokenPerformsConfirmedDelete() throws Exception {
+        FakeBackend b = new FakeBackend();
+        b.seed(Role.ENCRYPTED, T_A, 5L, -2L);
+        CredentialStore s = new CredentialStore(b);
+        try {
+            Resolution r = s.setTokenAsync("   ").get(10,
+                    TimeUnit.SECONDS);
+            assertEquals(Status.DELETED, r.status);
+            assertFalse(r.sendPermitted());
+            Map<String, V> d = b.disk.get(Role.ENCRYPTED);
+            assertNull(d.get("token"));
+            assertNull(d.get("chat"));
+            assertEquals(CredentialBackend.STATE_DELETED, d.get("meta").s);
+            assertEquals(1, b.deleteCalls);
+            assertEquals(0, b.writeCalls);
+        } finally {
+            s.close();
+        }
+    }
+
+    /** commit=false изменения поля: грязный кеш не публикуется, повтор реален. */
+    @Test
+    public void fieldUpdateCommitFalseKeepsProtection() throws Exception {
+        FakeBackend b = new FakeBackend();
+        b.seed(Role.ENCRYPTED, T_A, 5L, -2L);
+        b.failWrites = 1;
+        CredentialStore s = new CredentialStore(b);
+        FakeBackend b2 = b.sameProcessStorage();
+        CredentialStore s2 = new CredentialStore(b2);
+        try {
+            Resolution r = s.setChatIdAsync(7L, Fingerprint.of(T_A))
+                    .get(10, TimeUnit.SECONDS);
+            assertEquals(Status.INCOMPLETE, r.status);
+            // Грязный кеш (T_A,7) не подтверждён: другой handle не
+            // публикует его, а реальный повтор доводит commit.
+            Resolution r2 = await(s2);
+            assertEquals(Status.READY, r2.status);
+            assertEquals(2, b.writeCalls + b2.writeCalls);
+            Map<String, V> d = b.disk.get(Role.ENCRYPTED);
+            assertEquals(T_A, d.get("token").s);
+            assertEquals(7L, (long) d.get("chat").n);
+            assertEquals(-2L, (long) d.get("alert").n);
+        } finally {
+            s.close();
+            s2.close();
+        }
+    }
+
+    /** После close команды изменения полей отклоняются. */
+    @Test
+    public void closedHandleRejectsFieldCommands() {
+        FakeBackend b = new FakeBackend();
+        CredentialStore s = new CredentialStore(b);
+        s.close();
+        try {
+            s.setTokenAsync(T_A);
+            fail("setTokenAsync после close должен отклоняться");
+        } catch (IllegalStateException expected) {
+        }
+        try {
+            s.setChatIdAsync(1L, Fingerprint.of(T_A));
+            fail("setChatIdAsync после close должен отклоняться");
+        } catch (IllegalStateException expected) {
+        }
+        try {
+            s.setAlertChatIdAsync(1L, Fingerprint.of(T_A));
+            fail("setAlertChatIdAsync после close должен отклоняться");
+        } catch (IllegalStateException expected) {
+        }
+        try {
+            s.clearChatIdsAsync(Fingerprint.of(T_A));
+            fail("clearChatIdsAsync после close должен отклоняться");
+        } catch (IllegalStateException expected) {
         }
     }
 
