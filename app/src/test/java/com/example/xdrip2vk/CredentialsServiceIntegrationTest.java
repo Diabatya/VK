@@ -339,10 +339,14 @@ public class CredentialsServiceIntegrationTest {
         failing.set(false);
         assertEquals(CredentialStore.Status.READY, Credentials.get(context)
                 .resolveAsync().get(10, TimeUnit.SECONDS).status);
+        Credentials.get(context).awaitPublishIdleForTest();
         assertEquals("сброс применён на диске", 0,
                 CredHelper.getChatId(context));
 
-        // Обход без новых данных фиксирует завершение перехода.
+        // Обход без новых данных фиксирует завершение перехода; запрет
+        // публикации снимается асинхронно — ждём очередь и повторяем обход.
+        bareDrain(s2);
+        Credentials.get(context).awaitPublishIdleForTest();
         bareDrain(s2);
         assertEquals("user:2", prefs.getString(LAST_SENDER, ""));
 
@@ -351,6 +355,7 @@ public class CredentialsServiceIntegrationTest {
                 .setChatIdAsync(888,
                         com.example.xdrip2vk.core.Fingerprint.of("SYNTH_TOKEN_B"))
                 .get(10, TimeUnit.SECONDS).status);
+        Credentials.get(context).awaitPublishIdleForTest();
 
         // Новое свежее показание доставлено новым аккаунтом ровно один раз;
         // старое сообщение (enqueued до перехода) аккаунтом B не ушло.
@@ -401,6 +406,8 @@ public class CredentialsServiceIntegrationTest {
         // новый экземпляр сервиса подхватывает завершение перехода.
         VkSenderService s3 = startService();
         bareDrain(s3);
+        Credentials.get(context).awaitPublishIdleForTest();
+        bareDrain(s3);
         assertEquals("user:2", prefs.getString(LAST_SENDER, ""));
         assertEquals(0, CredHelper.getChatId(context));
         s3.onDestroy();
@@ -427,6 +434,8 @@ public class CredentialsServiceIntegrationTest {
         sends.clear();
         VkSenderService s = startService();
         bareDrain(s);
+        Credentials.get(context).awaitPublishIdleForTest();
+        bareDrain(s);
 
         assertEquals("переход доведён до конца без повторного стирания",
                 "user:2", prefs.getString(LAST_SENDER, ""));
@@ -435,6 +444,7 @@ public class CredentialsServiceIntegrationTest {
                 .setChatIdAsync(888,
                         com.example.xdrip2vk.core.Fingerprint.of("SYNTH_TOKEN_B"))
                 .get(10, TimeUnit.SECONDS).status);
+        Credentials.get(context).awaitPublishIdleForTest();
         s.onStartCommand(autoUpdate(122, System.currentTimeMillis()), 0, 4);
         idle(s);
         assertEquals(1, sends.size());
@@ -469,6 +479,8 @@ public class CredentialsServiceIntegrationTest {
 
         sends.clear();
         VkSenderService s = startService();
+        bareDrain(s);
+        Credentials.get(context).awaitPublishIdleForTest();
         bareDrain(s);
 
         // Переход выполнен под C: унаследованные адресаты B сброшены.
@@ -558,6 +570,7 @@ public class CredentialsServiceIntegrationTest {
         failing.set(false);
         assertEquals(CredentialStore.Status.READY, Credentials.get(context)
                 .resolveAsync().get(10, TimeUnit.SECONDS).status);
+        Credentials.get(context).awaitPublishIdleForTest();
         assertEquals(0, CredHelper.getChatId(context));
 
         // Явный выбор новой беседы БЕЗ промежуточного обхода сервиса.
@@ -565,6 +578,7 @@ public class CredentialsServiceIntegrationTest {
                 .setChatIdAsync(888,
                         com.example.xdrip2vk.core.Fingerprint.of("SYNTH_TOKEN_B"))
                 .get(10, TimeUnit.SECONDS).status);
+        Credentials.get(context).awaitPublishIdleForTest();
 
         // Следующий обход с cached verified: завершение перехода не
         // стирает 888, новое свежее показание уходит в него один раз.
@@ -615,6 +629,7 @@ public class CredentialsServiceIntegrationTest {
         failing.set(false);
         assertEquals(CredentialStore.Status.READY, Credentials.get(context)
                 .resolveAsync().get(10, TimeUnit.SECONDS).status);
+        Credentials.get(context).awaitPublishIdleForTest();
         assertEquals(0, CredHelper.getAlertChatId(context));
 
         // Новый выбор тревожного адресата без обхода сервиса.
@@ -622,7 +637,10 @@ public class CredentialsServiceIntegrationTest {
                 .setAlertChatIdAsync(-999,
                         com.example.xdrip2vk.core.Fingerprint.of("SYNTH_TOKEN_B"))
                 .get(10, TimeUnit.SECONDS).status);
+        Credentials.get(context).awaitPublishIdleForTest();
 
+        bareDrain(s2);
+        Credentials.get(context).awaitPublishIdleForTest();
         bareDrain(s2);
         assertEquals("user:2", prefs.getString(LAST_SENDER, ""));
         assertEquals("тревожный адресат сохранён", -999,
@@ -680,11 +698,20 @@ public class CredentialsServiceIntegrationTest {
         failing.set(false);
         assertEquals(CredentialStore.Status.READY, Credentials.get(context)
                 .resolveAsync().get(10, TimeUnit.SECONDS).status);
+        Credentials.get(context).awaitPublishIdleForTest();
 
         assertEquals(CredentialStore.Status.READY, Credentials.get(context)
                 .setChatIdAsync(888,
                         com.example.xdrip2vk.core.Fingerprint.of("SYNTH_TOKEN_B"))
                 .get(10, TimeUnit.SECONDS).status);
+        Credentials.get(context).awaitPublishIdleForTest();
+
+        // Завершение перехода до постановки нового сообщения: peerOwner
+        // нового сообщения — уже user:2.
+        bareDrain(s2);
+        Credentials.get(context).awaitPublishIdleForTest();
+        bareDrain(s2);
+        assertEquals("user:2", prefs.getString(LAST_SENDER, ""));
 
         s2.onStartCommand(autoUpdate(122, System.currentTimeMillis()), 0, 4);
         idle(s2);
@@ -726,15 +753,19 @@ public class CredentialsServiceIntegrationTest {
         failing.set(false);
         assertEquals(CredentialStore.Status.READY, Credentials.get(context)
                 .resolveAsync().get(10, TimeUnit.SECONDS).status);
+        Credentials.get(context).awaitPublishIdleForTest();
         assertEquals(CredentialStore.Status.READY, Credentials.get(context)
                 .setChatIdAsync(888,
                         com.example.xdrip2vk.core.Fingerprint.of("SYNTH_TOKEN_B"))
                 .get(10, TimeUnit.SECONDS).status);
+        Credentials.get(context).awaitPublishIdleForTest();
 
         // Настоящий «новый процесс»: координатор и pending сброшены,
         // файлы и маркер перехода сохранены.
         CredHelper.recreate(context);
         VkSenderService s3 = startService();
+        bareDrain(s3);
+        Credentials.get(context).awaitPublishIdleForTest();
         bareDrain(s3);
 
         assertEquals("user:2", prefs.getString(LAST_SENDER, ""));
@@ -781,6 +812,8 @@ public class CredentialsServiceIntegrationTest {
         // Подменяемый backend заменяется на обычный — запись работает.
         CredHelper.recreate(context);
         VkSenderService s3 = startService();
+        bareDrain(s3);
+        Credentials.get(context).awaitPublishIdleForTest();
         bareDrain(s3);
 
         assertEquals("user:2", prefs.getString(LAST_SENDER, ""));
@@ -874,6 +907,8 @@ public class CredentialsServiceIntegrationTest {
 
         // Переход заново под подтверждённым владельцем C.
         allowC.set(true);
+        bareDrain(s2);
+        Credentials.get(context).awaitPublishIdleForTest();
         bareDrain(s2);
         assertEquals("user:3", prefs.getString(LAST_SENDER, ""));
         assertEquals(0, CredHelper.getChatId(context));
