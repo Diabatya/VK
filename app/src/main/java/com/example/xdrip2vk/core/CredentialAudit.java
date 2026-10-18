@@ -202,7 +202,7 @@ public final class CredentialAudit {
                             && e.type != Entry.Type.NUMBER);
         }
 
-        boolean hasFieldTypeMismatch() {
+        public boolean hasFieldTypeMismatch() {
             return badToken(token) || badAddress(chatId)
                     || badAddress(alertChatId);
         }

@@ -65,12 +65,17 @@ public class CredentialStoreTest {
         final Map<Role, Read> readState = new EnumMap<>(Role.class);
         Object storageId = new Object(); // id процессного хранилища
         int failWrites;      // сколько putCredentials вернут false
-        boolean throwOnWrite, throwOnClear;
+        boolean throwOnWrite, throwOnClear, throwOnSnapshot;
+        final java.util.Set<Integer> throwWriteOn = new java.util.HashSet<>();
         final java.util.Set<Integer> failClearOn = new java.util.HashSet<>();
+        final java.util.Set<Integer> failReadOn = new java.util.HashSet<>();
         int writeCalls, clearCalls;
         final AtomicInteger snapshots = new AtomicInteger();
         Runnable onNthSnapshot;
         volatile String threadName;
+        // Удержание записи для тестов передачи worker без sleep.
+        volatile java.util.concurrent.CountDownLatch putStarted;
+        volatile java.util.concurrent.CountDownLatch putGate;
 
         FakeBackend() {
             for (Role r : Role.values()) {
@@ -145,11 +150,15 @@ public class CredentialStoreTest {
 
         @Override
         public Source snapshot(Role role) {
+            if (throwOnSnapshot) {
+                throw new RuntimeException("snapshot failed");
+            }
             int n = snapshots.incrementAndGet();
             if (onNthSnapshot != null && n == 4) {
                 onNthSnapshot.run(); // изменение до перепроверки очистки
             }
-            if (readState.get(role) != Read.READABLE) {
+            if (readState.get(role) != Read.READABLE
+                    || failReadOn.contains(n)) {
                 return readState.get(role) == Read.CORRUPT
                         ? Source.corrupt(role) : Source.unavailable(role);
             }
@@ -165,7 +174,17 @@ public class CredentialStoreTest {
             cache.get(Role.ENCRYPTED).put("token", V.str(token));
             cache.get(Role.ENCRYPTED).put("chat", V.num(chatId));
             cache.get(Role.ENCRYPTED).put("alert", V.num(alertChatId));
-            if (throwOnWrite) {
+            if (putStarted != null) {
+                putStarted.countDown();
+            }
+            if (putGate != null) {
+                try {
+                    putGate.await(15, java.util.concurrent.TimeUnit.SECONDS);
+                } catch (InterruptedException e) {
+                    Thread.currentThread().interrupt();
+                }
+            }
+            if (throwOnWrite || throwWriteOn.contains(writeCalls)) {
                 throw new RuntimeException("write failed after cache");
             }
             if (failWrites > 0) {
@@ -638,6 +657,267 @@ public class CredentialStoreTest {
             assertTrue(b.disk.get(Role.PLAIN).isEmpty());
         } finally {
             store.close();
+        }
+    }
+
+    // --- регрессии 2Г.3Б.2 ---
+
+    @Test
+    public void confirmedClearExpectsEmptyNotOriginalSnapshot()
+            throws Exception {
+        // Воспроизведение №1: enc+plain+default копии; PLAIN очищен,
+        // DEFAULT — кеш очищен, commit=false. Повтор раньше давал
+        // SOURCE_CHANGED по сравнению PLAIN с непустым снимком.
+        FakeBackend b = new FakeBackend();
+        b.seed(Role.ENCRYPTED, T_A, 5L, null);
+        b.seed(Role.PLAIN, T_A, 5L, null);
+        b.seed(Role.DEFAULT, T_A, 5L, null);
+        b.failClearOn.add(2); // DEFAULT
+        CredentialStore store = new CredentialStore(b);
+        try {
+            assertEquals(Status.INCOMPLETE, await(store).status);
+            assertTrue(b.disk.get(Role.PLAIN).isEmpty());
+            assertEquals(T_A, b.disk.get(Role.DEFAULT).get("token").s);
+
+            Resolution r = await(store);
+            assertEquals(Status.READY, r.status);
+            assertEquals(3, b.clearCalls); // DEFAULT реально повторён
+            assertTrue(b.disk.get(Role.DEFAULT).isEmpty());
+        } finally {
+            store.close();
+        }
+    }
+
+    @Test
+    public void secondAndThirdClearFailuresAndRepeat() throws Exception {
+        // Осиротевшие ключи во всех трёх: очистка ENCRYPTED ок,
+        // отказы PLAIN (шаг 2) и DEFAULT (повтор, шаг 4) → потом EMPTY.
+        FakeBackend b = new FakeBackend();
+        b.putRaw(Role.ENCRYPTED, "chat", V.num(1L));
+        b.putRaw(Role.PLAIN, "chat", V.num(2L));
+        b.putRaw(Role.DEFAULT, "chat", V.num(3L));
+        b.failClearOn.add(2);
+        b.failClearOn.add(4);
+        CredentialStore store = new CredentialStore(b);
+        try {
+            assertEquals(Status.INCOMPLETE, await(store).status);
+            assertTrue(b.disk.get(Role.ENCRYPTED).isEmpty());
+            assertEquals(2L, (long) b.disk.get(Role.PLAIN).get("chat").n);
+            assertEquals(Status.INCOMPLETE, await(store).status);
+            assertEquals(Status.EMPTY, await(store).status);
+            assertTrue(b.disk.get(Role.PLAIN).isEmpty());
+            assertTrue(b.disk.get(Role.DEFAULT).isEmpty());
+            assertEquals(5, b.clearCalls);
+        } finally {
+            store.close();
+        }
+    }
+
+    @Test
+    public void newCredsInConfirmedClearedSourceBlock() throws Exception {
+        FakeBackend b = new FakeBackend();
+        b.seed(Role.ENCRYPTED, T_A, 5L, null);
+        b.seed(Role.PLAIN, T_A, 5L, null);
+        b.seed(Role.DEFAULT, T_A, 5L, null);
+        b.failClearOn.add(2);
+        CredentialStore store = new CredentialStore(b);
+        try {
+            assertEquals(Status.INCOMPLETE, await(store).status);
+            // Новые реквизиты в уже очищенном PLAIN — не удалять.
+            b.cache.get(Role.PLAIN).put("token", V.str(T_B));
+            b.disk.get(Role.PLAIN).put("token", V.str(T_B));
+            Resolution r = await(store);
+            assertEquals(Status.INCOMPLETE, r.status);
+            assertEquals(Pending.SOURCE_CHANGED, r.pending);
+            assertEquals(T_B, b.disk.get(Role.PLAIN).get("token").s);
+        } finally {
+            store.close();
+        }
+    }
+
+    @Test
+    public void unavailableSourceIsNotEmptyBeforeClear() throws Exception {
+        // Воспроизведение №2: snapshot(PLAIN)=UNAVAILABLE перед очисткой —
+        // remove не вызывается, операция не завершается READY.
+        FakeBackend b = new FakeBackend();
+        b.seed(Role.PLAIN, T_A, 5L, null);
+        b.failReadOn.add(4); // 3 снимка аудита + перепроверка PLAIN
+        CredentialStore store = new CredentialStore(b);
+        try {
+            Resolution r = await(store);
+            assertEquals(Status.INCOMPLETE, r.status);
+            assertEquals(Reason.SOURCE_UNAVAILABLE, r.reason);
+            assertEquals(Pending.UNREADABLE, r.pending);
+            assertEquals(0, b.clearCalls);
+            assertEquals(T_A, b.disk.get(Role.PLAIN).get("token").s);
+
+            Resolution r2 = await(store); // источник снова читаем
+            assertEquals(Status.READY, r2.status);
+            assertTrue(b.disk.get(Role.PLAIN).isEmpty());
+        } finally {
+            store.close();
+        }
+    }
+
+    @Test
+    public void corruptSnapshotBlocksResumeAfterFailedClear()
+            throws Exception {
+        FakeBackend b = new FakeBackend();
+        b.seed(Role.PLAIN, T_A, 5L, null);
+        b.failClearOn.add(1);
+        CredentialStore store = new CredentialStore(b);
+        try {
+            assertEquals(Status.INCOMPLETE, await(store).status);
+            b.throwOnSnapshot = true; // исключение чтения при resume
+            Resolution r = await(store);
+            assertEquals(Status.INCOMPLETE, r.status);
+            assertEquals(Reason.SOURCE_CORRUPT, r.reason);
+            b.throwOnSnapshot = false;
+            assertEquals(Status.READY, await(store).status);
+        } finally {
+            store.close();
+        }
+    }
+
+    @Test
+    public void unreadableEncryptedBlocksRewrite() throws Exception {
+        // Нельзя повторять запись поверх назначения, которое не читается.
+        FakeBackend b = new FakeBackend();
+        b.seed(Role.PLAIN, T_A, 5L, null);
+        b.failWrites = 1;
+        CredentialStore store = new CredentialStore(b);
+        try {
+            assertEquals(Status.INCOMPLETE, await(store).status);
+            b.readState.put(Role.ENCRYPTED, Read.UNAVAILABLE);
+            Resolution r = await(store);
+            assertEquals(Status.INCOMPLETE, r.status);
+            assertEquals(1, b.writeCalls); // старая запись не повторена
+            assertEquals(T_A, b.disk.get(Role.PLAIN).get("token").s);
+            b.readState.put(Role.ENCRYPTED, Read.READABLE);
+            assertEquals(Status.READY, await(store).status);
+            assertEquals(2, b.writeCalls);
+        } finally {
+            store.close();
+        }
+    }
+
+    // --- передача worker без параллельной работы ---
+
+    @Test
+    public void workerHandoverHeldCommitTrue() throws Exception {
+        // Воспроизведение №3: удержанный commit, close/open handle.
+        FakeBackend b = new FakeBackend();
+        b.seed(Role.PLAIN, T_A, 5L, null);
+        b.putStarted = new java.util.concurrent.CountDownLatch(1);
+        b.putGate = new java.util.concurrent.CountDownLatch(1);
+        CredentialStore s1 = new CredentialStore(b);
+        java.util.concurrent.Future<Resolution> f1 = s1.resolveAsync();
+        assertTrue(b.putStarted.await(10, TimeUnit.SECONDS));
+        s1.close(); // последний handle закрыт — задача продолжается
+
+        CredentialStore s2 = new CredentialStore(b);
+        java.util.concurrent.Future<Resolution> f2 = s2.resolveAsync();
+        // До освобождения записи — ни одного нового put/remove:
+        assertEquals(1, b.writeCalls);
+        assertEquals(0, b.clearCalls);
+        assertEquals(T_A, b.disk.get(Role.PLAIN).get("token").s);
+        b.putGate.countDown();
+
+        assertEquals(Status.READY, f1.get(10, TimeUnit.SECONDS).status);
+        assertEquals(Status.READY, f2.get(10, TimeUnit.SECONDS).status);
+        assertEquals(1, b.writeCalls); // подтверждённый commit не повторяется
+        assertEquals(1, b.clearCalls);
+        s2.close();
+    }
+
+    @Test
+    public void workerHandoverHeldCommitFalse() throws Exception {
+        FakeBackend b = new FakeBackend();
+        b.seed(Role.PLAIN, T_A, 5L, null);
+        b.failWrites = 1;
+        b.putStarted = new java.util.concurrent.CountDownLatch(1);
+        b.putGate = new java.util.concurrent.CountDownLatch(1);
+        CredentialStore s1 = new CredentialStore(b);
+        java.util.concurrent.Future<Resolution> f1 = s1.resolveAsync();
+        assertTrue(b.putStarted.await(10, TimeUnit.SECONDS));
+        s1.close();
+        CredentialStore s2 = new CredentialStore(b);
+        java.util.concurrent.Future<Resolution> f2 = s2.resolveAsync();
+        assertEquals(T_A, b.disk.get(Role.PLAIN).get("token").s);
+        b.putGate.countDown();
+
+        // Отказ назначения: исходник на диске до подтверждённого повтора.
+        assertEquals(Status.INCOMPLETE, f1.get(10, TimeUnit.SECONDS).status);
+        assertEquals(Status.READY, f2.get(10, TimeUnit.SECONDS).status);
+        assertEquals(2, b.writeCalls); // реальный повтор записи
+        assertTrue(b.disk.get(Role.PLAIN).isEmpty());
+        s2.close();
+    }
+
+    @Test
+    public void workerHandoverHeldCommitThrows() throws Exception {
+        FakeBackend b = new FakeBackend();
+        b.seed(Role.PLAIN, T_A, 5L, null);
+        b.throwWriteOn.add(1); // исключение после изменения кеша, один раз
+        b.putStarted = new java.util.concurrent.CountDownLatch(1);
+        b.putGate = new java.util.concurrent.CountDownLatch(1);
+        CredentialStore s1 = new CredentialStore(b);
+        java.util.concurrent.Future<Resolution> f1 = s1.resolveAsync();
+        assertTrue(b.putStarted.await(10, TimeUnit.SECONDS));
+        s1.close();
+        CredentialStore s2 = new CredentialStore(b);
+        java.util.concurrent.Future<Resolution> f2 = s2.resolveAsync();
+        b.putGate.countDown();
+        assertEquals(Status.INCOMPLETE, f1.get(10, TimeUnit.SECONDS).status);
+        assertEquals(Status.READY, f2.get(10, TimeUnit.SECONDS).status);
+        s2.close();
+    }
+
+    @Test
+    public void closeOpenCyclesStaySerialized() throws Exception {
+        FakeBackend b = new FakeBackend();
+        b.seed(Role.PLAIN, T_A, 5L, null);
+        for (int i = 0; i < 3; i++) {
+            CredentialStore s = new CredentialStore(b);
+            Resolution r = s.resolveAsync().get(10, TimeUnit.SECONDS);
+            s.close();
+            if (i == 0) {
+                assertEquals(Status.READY, r.status);
+            }
+        }
+        assertEquals(1, b.writeCalls);
+        assertEquals(1, b.clearCalls);
+    }
+
+    @Test
+    public void resolveAfterCloseIsRejected() throws Exception {
+        FakeBackend b = new FakeBackend();
+        b.seed(Role.ENCRYPTED, T_A, 5L, null);
+        CredentialStore s = new CredentialStore(b);
+        await(s);
+        s.close();
+        try {
+            s.resolveAsync();
+            fail("resolveAsync после close должен отклоняться");
+        } catch (IllegalStateException expected) {
+            // отклонено до постановки задачи
+        }
+    }
+
+    @Test
+    public void closeIsIdempotentAndThreadSafe() throws Exception {
+        FakeBackend b = new FakeBackend();
+        CredentialStore s = new CredentialStore(b);
+        s.close();
+        s.close(); // повторный close — без эффекта
+        Thread t = new Thread(s::close);
+        t.start();
+        t.join(5000);
+        // handle закрыт: новые задачи отклоняются
+        try {
+            s.resolveAsync();
+            fail("ожидался отказ после close");
+        } catch (IllegalStateException expected) {
         }
     }
 

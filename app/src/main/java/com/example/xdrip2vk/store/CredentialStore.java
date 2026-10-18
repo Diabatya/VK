@@ -4,6 +4,7 @@ import com.example.xdrip2vk.core.CredentialAudit;
 import com.example.xdrip2vk.core.CredentialAudit.Entry;
 import com.example.xdrip2vk.core.CredentialAudit.Outcome;
 import com.example.xdrip2vk.core.CredentialAudit.Plan;
+import com.example.xdrip2vk.core.CredentialAudit.Read;
 import com.example.xdrip2vk.core.CredentialAudit.Reason;
 import com.example.xdrip2vk.core.CredentialAudit.Role;
 import com.example.xdrip2vk.core.CredentialAudit.Source;
@@ -11,26 +12,25 @@ import com.example.xdrip2vk.core.CredentialAudit.Verdict;
 import com.example.xdrip2vk.store.CredentialCoordinator.PendingOp;
 
 import java.util.ArrayList;
-import java.util.List;
 import java.util.concurrent.Future;
 
 /**
- * Исполнитель слоя реквизитов (задания 2Г.3Б/2Г.3Б.1): читает снимки
+ * Исполнитель слоя реквизитов (задания 2Г.3Б/3Б.1/3Б.2): читает снимки
  * через {@link CredentialBackend}, решает настоящим
  * {@link CredentialAudit} и выполняет только однозначный план.
- *
  * Не подключён к действующим TokenStorage/Activity/receivers/сервису.
  *
- * Владение состоянием: сериализация и незавершённые операции живут в
- * {@link CredentialCoordinator} по storageId хранилища — общие для всех
- * handle/backend в процессе. Замена Store или backend не является
- * новым процессом и не делает кеш достоверным: неподтверждённые записи
- * и очистки учитываются всеми экземплярами. Только настоящий новый
- * процесс восстанавливается из реально сохранённых данных на диске.
+ * Незавершённая операция — конкретная: в {@link PendingOp} раздельно
+ * учитываются подтверждённые (confirmedClears) и неподтверждённые
+ * (pendingClears) шаги. Подтверждённо очищенный источник ожидается
+ * пустым; неподтверждённый — как исходник либо пустой кеш, и повтор
+ * реально вызывает remove. UNAVAILABLE/CORRUPT снимок не доказательство
+ * пустоты: зависимые записи и удаления не выполняются, причина
+ * фиксированная (SOURCE_UNAVAILABLE/SOURCE_CORRUPT), операция сохранена.
  *
- * commit()==true — единственное подтверждение записи/очистки:
- * read-back из того же SharedPreferences не доверяется. READY/EMPTY из
- * аудита грязного кеша не снимают незавершённую операцию.
+ * commit()==true — единственное подтверждение; read-back не доверяется.
+ * Владение — {@link CredentialCoordinator} по storageId: новый handle или
+ * backend — не новый процесс, защиту не обходит.
  */
 public final class CredentialStore implements AutoCloseable {
 
@@ -42,7 +42,9 @@ public final class CredentialStore implements AutoCloseable {
         /** Очистка одного или нескольких источников не подтверждена. */
         SOURCE_CLEAR,
         /** Реквизиты изменились во время операции — нужна новая проверка. */
-        SOURCE_CHANGED
+        SOURCE_CHANGED,
+        /** Источник недоступен/повреждён — состояние недостоверно. */
+        UNREADABLE
     }
 
     /** Фиксированные коды исходов — без значений. */
@@ -90,22 +92,30 @@ public final class CredentialStore implements AutoCloseable {
 
     private final CredentialBackend backend;
     private final CredentialCoordinator coord;
-    private volatile boolean closed;
+    private boolean closed; // под synchronized(this)
 
     public CredentialStore(CredentialBackend backend) {
         this.backend = backend;
         this.coord = CredentialCoordinator.acquire(backend.storageId());
     }
 
-    /** Сериализованная проверка/миграция — на общем рабочем потоке хранилища. */
-    public Future<Resolution> resolveAsync() {
+    /**
+     * Сериализованная проверка/миграция на общем worker хранилища.
+     * После close() — отклоняется до постановки задачи; гонка с close()
+     * согласована: задача либо принята и корректно завершится, либо
+     * отклонена — обхода владения координатором нет.
+     */
+    public synchronized Future<Resolution> resolveAsync() {
+        if (closed) {
+            throw new IllegalStateException("credential store closed");
+        }
         return coord.submit(this::resolve);
     }
 
     /**
-     * Закрытие handle: состояние координатора сохраняется, общий worker
-     * завершается мягко, когда закрыт последний handle (без прерывания
-     * выполняющегося commit).
+     * Закрытие handle: идемпотентно и потокобезопасно; состояние
+     * координатора сохраняется, общий worker продолжает поставленные
+     * задачи — выполняющийся commit не прерывается.
      */
     public void shutdown() {
         close();
@@ -113,10 +123,13 @@ public final class CredentialStore implements AutoCloseable {
 
     @Override
     public void close() {
-        if (!closed) {
+        synchronized (this) {
+            if (closed) {
+                return;
+            }
             closed = true;
-            coord.release();
         }
+        coord.release();
     }
 
     private Resolution resolve() {
@@ -125,9 +138,7 @@ public final class CredentialStore implements AutoCloseable {
         Source def = snapshot(Role.DEFAULT);
         Source[] snap = {enc, plain, def};
 
-        // Незавершённая операция приоритетнее нового аудита кеша:
-        // очищенный в кеше источник не отменяет долг подтвердить очистку,
-        // грязный encrypted-кеш не делает запись назначения подтверждённой.
+        // Незавершённая операция приоритетнее нового аудита кеша.
         PendingOp op = coord.pending;
         if (op != null) {
             return resume(op, snap);
@@ -146,7 +157,7 @@ public final class CredentialStore implements AutoCloseable {
                 return startPlan(o, snap);
             default: // CONFLICT / UNAVAILABLE / CORRUPT — ничего не писать
                 return new Resolution(Status.BLOCKED, o.reason,
-                        pendingOf(coord.pending), "", 0, 0);
+                        Pending.NONE, "", 0, 0);
         }
     }
 
@@ -174,22 +185,32 @@ public final class CredentialStore implements AutoCloseable {
                 return r;
             }
             op.pendingClears.remove(role);
+            op.confirmedClears.add(role);
         }
         return finish(o.reason, plan);
     }
 
     /**
      * Продолжение незавершённой операции любым handle этого хранилища:
-     * сначала поверка источников относительно исходного снимка, затем
-     * повтор неподтверждённых шагов.
+     * поверка источников относительно ожидаемого состояния, затем повтор
+     * неподтверждённых шагов.
      */
     private Resolution resume(PendingOp op, Source[] snap) {
         for (Role role : Role.values()) {
-            Source stored = sourceOf(op.snapshot, role);
             Source cur = sourceOf(snap, role);
-            if (op.pendingClears.contains(role)) {
-                // Цель очистки: старые реквизиты либо пропавшие из кеша —
-                // ок; иные непустые значения — чужие данные, не удалять.
+            Resolution bad = unreadable(cur, Pending.UNREADABLE);
+            if (bad != null) {
+                return bad;
+            }
+            Source stored = sourceOf(op.snapshot, role);
+            if (op.confirmedClears.contains(role)) {
+                // Успешно очищен: новые реквизиты — чужие, не удалять.
+                if (hasCredentials(cur)) {
+                    return changed();
+                }
+            } else if (op.pendingClears.contains(role)) {
+                // Неподтверждённая очистка: исходник или пустой кеш — ок;
+                // иные значения — чужие данные, не удалять.
                 if (!sameCredentials(stored, cur) && hasCredentials(cur)) {
                     return changed();
                 }
@@ -218,22 +239,52 @@ public final class CredentialStore implements AutoCloseable {
                 return r;
             }
             op.pendingClears.remove(role);
+            op.confirmedClears.add(role);
         }
         return finish(Reason.NONE, op.plan);
     }
 
     private Resolution changed() {
-        // Новые реквизиты не затираются старым планом: операция
-        // останавливается, требуется новая проверка. Состояние сохраняется.
+        // Новые реквизиты не затираются и не удаляются старым планом:
+        // операция останавливается, состояние сохраняется.
         return new Resolution(Status.INCOMPLETE, Reason.NONE,
                 Pending.SOURCE_CHANGED, "", 0, 0);
     }
 
-    /** Одна очистка с предварительной проверкой неизменности источника. */
+    /**
+     * Снимок недостоверен: UNAVAILABLE/CORRUPT/ошибочный тип или чужая
+     * роль не доказывают пустоту — зависимые записи и удаления запрещены.
+     */
+    private Resolution unreadable(Source cur, Pending phase) {
+        if (cur == null) {
+            return new Resolution(Status.INCOMPLETE, Reason.SOURCE_CORRUPT,
+                    phase, "", 0, 0);
+        }
+        if (cur.read == Read.UNAVAILABLE) {
+            return new Resolution(Status.INCOMPLETE,
+                    Reason.SOURCE_UNAVAILABLE, phase, "", 0, 0);
+        }
+        if (cur.read == Read.CORRUPT || cur.hasFieldTypeMismatch()) {
+            return new Resolution(Status.INCOMPLETE, Reason.SOURCE_CORRUPT,
+                    phase, "", 0, 0);
+        }
+        return null;
+    }
+
+    /** Одна очистка с проверкой достоверности и неизменности источника. */
     private Resolution clearOnce(PendingOp op, Role role, Reason reason) {
         Source cur = backendSnapshotSafe(role);
+        Resolution bad = unreadable(cur, Pending.UNREADABLE);
+        if (bad != null) {
+            return bad;
+        }
+        if (cur.role != role) {
+            return new Resolution(Status.INCOMPLETE, Reason.SOURCE_CORRUPT,
+                    Pending.SOURCE_CLEAR, "", 0, 0);
+        }
         Source stored = sourceOf(op.snapshot, role);
-        // Если источник успели наполнить новыми реквизитами — не удалять.
+        // Исходные реквизиты или пустой кеш после прошлого отказа — ок;
+        // новые значения — не удалять.
         if (!sameCredentials(stored, cur) && hasCredentials(cur)) {
             return changed();
         }
@@ -259,6 +310,14 @@ public final class CredentialStore implements AutoCloseable {
             coord.pending = null;
             return new Resolution(Status.EMPTY, after.reason, Pending.NONE,
                     "", 0, 0);
+        }
+        if (after.verdict == Verdict.UNAVAILABLE) {
+            return new Resolution(Status.INCOMPLETE, after.reason,
+                    Pending.UNREADABLE, "", 0, 0);
+        }
+        if (after.verdict == Verdict.CORRUPT) {
+            return new Resolution(Status.INCOMPLETE, after.reason,
+                    Pending.UNREADABLE, "", 0, 0);
         }
         // Итог не соответствует завершённой операции — не завершена.
         return new Resolution(Status.INCOMPLETE, after.reason,
@@ -289,20 +348,13 @@ public final class CredentialStore implements AutoCloseable {
     private Source backendSnapshotSafe(Role role) {
         try {
             Source s = backend.snapshot(role);
-            return s == null ? Source.corrupt(role) : s;
+            if (s == null || s.role != role) {
+                return Source.corrupt(role);
+            }
+            return s;
         } catch (RuntimeException e) {
             return Source.corrupt(role);
         }
-    }
-
-    private static Pending pendingOf(PendingOp op) {
-        if (op == null) {
-            return Pending.NONE;
-        }
-        if (op.destinationUnconfirmed) {
-            return Pending.DESTINATION_WRITE;
-        }
-        return Pending.SOURCE_CLEAR;
     }
 
     /** Источник содержит какие-либо ключи реквизитов. */

@@ -12,34 +12,42 @@ import java.util.concurrent.Callable;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
 import java.util.concurrent.Future;
+import java.util.concurrent.ThreadFactory;
 
 /**
  * Процессный координатор операций реквизитов одного процессного
- * хранилища (задание 2Г.3Б.1). Все CredentialStore'ы над backend'ами с
- * одинаковым storageId разделяют:
- * - один рабочий поток — сериализация общая, не на каждый handle;
- * - незавершённую операцию {@link PendingOp} — новый handle/backend не
- *   обходит защиту, потому что состояние живёт здесь, а не в Store.
+ * хранилища (задания 2Г.3Б.1/2Г.3Б.2). Все CredentialStore'ы над
+ * backend'ами с одинаковым storageId разделяют worker и PendingOp.
  *
- * Закрытие handle не уничтожает состояние; worker останавливается
- * мягко (shutdown, без прерывания выполняющегося commit) и
- * пересоздаётся при новом handle. Настоящий новый процесс не видит
- * этот объект — восстановление идёт из содержимого файлов на диске.
+ * Инвариант передачи worker: для одного storageId никогда не
+ * выполняются две операции реквизитов одновременно, включая период
+ * close/open handle. Достигается тем, что worker живёт вместе с
+ * координатором и НЕ останавливается при закрытии последнего handle:
+ * задачи нового handle встают в ту же очередь и ждут завершения
+ * выполняющегося commit — его нельзя прерывать. Daemon-поток не
+ * блокирует завершение процесса. isShutdown() не используется как
+ * доказательство завершения работы.
+ *
+ * Закрытие handle уменьшает счётчик владельцев, но состояние
+ * (PendingOp, очередь) сохраняется до конца процесса. Настоящий новый
+ * процесс не видит этот объект — восстановление из диска.
  */
 final class CredentialCoordinator {
 
     private static final Map<Object, CredentialCoordinator> INSTANCES =
             new HashMap<>();
 
-    /** Незавершённая операция: исходные снимки + неподтверждённые шаги. */
+    /** Незавершённая операция: исходные снимки + раздельные шаги. */
     static final class PendingOp {
         /** Снимки трёх источников на момент начала операции. */
         final Source[] snapshot;
         final Plan plan;
         /** Запись назначения не подтверждена — кеш не доказательство. */
         boolean destinationUnconfirmed;
-        /** Источники, очистка которых не подтверждена commit. */
+        /** Очистка не подтверждена commit — обязан повторить реально. */
         final Set<Role> pendingClears = EnumSet.noneOf(Role.class);
+        /** Очистка подтверждена — источник обязан оставаться пустым. */
+        final Set<Role> confirmedClears = EnumSet.noneOf(Role.class);
 
         PendingOp(Source[] snapshot, Plan plan) {
             this.snapshot = snapshot;
@@ -47,9 +55,20 @@ final class CredentialCoordinator {
         }
     }
 
-    private ExecutorService worker;
+    private final ExecutorService worker;
     private int handles;
     PendingOp pending; // доступ только с рабочего потока
+
+    private CredentialCoordinator() {
+        // Постоянный daemon worker на время жизни хранилища в процессе:
+        // передача handle не создаёт параллельного исполнителя.
+        ThreadFactory daemon = r -> {
+            Thread t = new Thread(r, "credential-store");
+            t.setDaemon(true);
+            return t;
+        };
+        this.worker = Executors.newSingleThreadExecutor(daemon);
+    }
 
     static synchronized CredentialCoordinator acquire(Object storageId) {
         CredentialCoordinator c = INSTANCES.get(storageId);
@@ -61,23 +80,18 @@ final class CredentialCoordinator {
         return c;
     }
 
-    synchronized <T> Future<T> submit(Callable<T> task) {
-        if (worker == null || worker.isShutdown()) {
-            worker = Executors.newSingleThreadExecutor(
-                    r -> new Thread(r, "credential-store"));
-        }
+    Future<CredentialStore.Resolution> submit(
+            Callable<CredentialStore.Resolution> task) {
         return worker.submit(task);
     }
 
     synchronized void release() {
-        if (--handles <= 0) {
-            handles = 0;
-            if (worker != null) {
-                // Мягкое закрытие: поставленные задачи завершаются,
-                // выполняющийся commit не прерывается.
-                worker.shutdown();
-            }
+        // Идемпотентно по владельцу: убывание только от реальных handle.
+        if (handles > 0) {
+            handles--;
         }
+        // worker сознательно не останавливается: он может выполнять
+        // commit или продолжать незавершённую операцию.
     }
 
     /** Для тестов: забыть координатор процессного хранилища. */
