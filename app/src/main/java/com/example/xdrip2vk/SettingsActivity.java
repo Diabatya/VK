@@ -471,15 +471,17 @@ public class SettingsActivity extends AppCompatActivity {
                     .setMessage("Отправлять показания сахара в чат «"
                             + candidate.chatName() + "» (" + candidate.kind() + ")?")
                     .setPositiveButton("Выбрать", (d, w) -> {
-                        if (com.example.xdrip2vk.max.MaxSender.selectCandidate(ctx, candidate)) {
-                            Toast.makeText(ctx, "Выбран чат: «"
-                                    + candidate.chatName() + "»", Toast.LENGTH_LONG).show();
-                        } else {
-                            Toast.makeText(ctx,
-                                    "Кандидат больше не действителен — дождитесь нового уведомления из чата MAX",
-                                    Toast.LENGTH_LONG).show();
-                        }
-                        refreshMaxSummaries();
+                        // Запись адресата — на рабочем исполнителе MAX:
+                        // экран не ждёт подтверждения диска.
+                        com.example.xdrip2vk.max.MaxSender.selectCandidateAsync(
+                                ctx, candidate, ok -> {
+                                    if (!isAdded() || getContext() == null) return;
+                                    Toast.makeText(getContext(),
+                                            ok ? "Выбран чат: «" + candidate.chatName() + "»"
+                                                    : "Кандидат больше не действителен — дождитесь нового уведомления из чата MAX",
+                                            Toast.LENGTH_LONG).show();
+                                    refreshMaxSummaries();
+                                });
                     })
                     .setNegativeButton("Отмена", null)
                     .show();

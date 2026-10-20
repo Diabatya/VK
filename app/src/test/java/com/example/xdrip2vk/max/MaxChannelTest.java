@@ -61,7 +61,14 @@ public class MaxChannelTest {
                 .putBoolean(MaxChannel.PREF_MAX_ENABLED, true)
                 .commit();
         MaxState.resetForTest();
+        MaxChannel.resetForTest();
         MaxState.listenerConnected = true; // слушатель в тесте считается подключённым
+
+        // Детерминизм: события исполняются на вызывающем потоке, повторы
+        // записей — немедленно. Реальный однопоточный исполнитель процесса
+        // проверяется отдельным тестом неблокируемости.
+        MaxSender.workerForTest = Runnable::run;
+        MaxChannel.retrySchedulerForTest = (task, delayMs) -> task.run();
 
         listener = Robolectric.buildService(MaxNotificationListener.class).create().get();
 
@@ -98,6 +105,10 @@ public class MaxChannelTest {
         MaxSender.creatorPackageForTest = null;
         MaxSender.clockForTest = null;
         MaxSender.beforeCommandHookForTest = null;
+        MaxSender.workerForTest = null;
+        MaxChannel.retrySchedulerForTest = null;
+        MaxChannel.storeFactoryForTest = null;
+        MaxChannel.resetForTest();
         MaxState.resetForTest();
     }
 

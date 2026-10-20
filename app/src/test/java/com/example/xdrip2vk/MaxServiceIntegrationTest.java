@@ -63,6 +63,9 @@ public class MaxServiceIntegrationTest {
                 .commit();
         VkSenderService.resetTransmissionFlagsForTest();
         MaxSender.resetRuntimeForTest(context);
+        // Детерминизм: события MAX исполняются синхронно на вызывающем потоке.
+        MaxSender.workerForTest = Runnable::run;
+        MaxChannel.retrySchedulerForTest = (task, delayMs) -> task.run();
 
         // Доступ слушателя уведомлений выдан — R4 требует его для отправки.
         android.provider.Settings.Secure.putString(context.getContentResolver(),
@@ -91,6 +94,9 @@ public class MaxServiceIntegrationTest {
         MaxSender.sendCommandForTest = null;
         MaxSender.creatorPackageForTest = null;
         MaxSender.clockForTest = null;
+        MaxSender.workerForTest = null;
+        MaxChannel.retrySchedulerForTest = null;
+        MaxChannel.storeFactoryForTest = null;
         VkSenderService.resetTransmissionFlagsForTest();
     }
 
