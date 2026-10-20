@@ -72,41 +72,49 @@ public class MaxNotificationListener extends NotificationListenerService {
 
         MaxState.addCandidate(button);
 
-        MaxChannel.Target wanted = MaxChannel.getTarget(this);
-        if (wanted == null) return; // чат не выбран — только пополняем кандидатов
+        // Все решения о выбранном адресате, живой кнопке и блокировке — под
+        // общим монитором отправщика: конфликт, обработанный до начала
+        // внешней команды, обязан её запретить, а не проскочить между
+        // проверкой и PendingIntent.send. Монитор реентерабелен:
+        // onButtonCaptured → trySend отрабатывают внутри того же захвата.
+        synchronized (MaxSender.class) {
+            MaxChannel.Target wanted = MaxChannel.getTarget(this);
+            if (wanted == null) return; // чат не выбран — только пополняем кандидатов
 
-        if (MaxChannel.matches(wanted, button)) {
-            // Подтверждённый чат: кнопка обновляется, блокировка снимается.
-            MaxReplyButton saved = MaxSender.currentButton(this);
-            boolean renewed = saved == null
-                    || !Objects.equals(saved.pendingIntent, button.pendingIntent);
-            MaxState.targetButton = button;
-            if (MaxChannel.getBlockedBy(this) != null) {
-                MaxChannel.clearBlockedBy(this);
-                Logger.i(TAG, "новое сообщение из выбранного чата — блокировка снята");
+            if (MaxChannel.matches(wanted, button)) {
+                // Подтверждённый чат: кнопка обновляется, блокировка снимается.
+                MaxReplyButton saved = MaxSender.currentButton(this);
+                boolean renewed = saved == null
+                        || !Objects.equals(saved.pendingIntent, button.pendingIntent);
+                MaxState.targetButton = button;
+                if (MaxChannel.getBlockedBy(this) != null) {
+                    MaxChannel.clearBlockedBy(this);
+                    Logger.i(TAG, "новое сообщение из выбранного чата — блокировка снята");
+                }
+                if (renewed) MaxReplyBackup.save(this, button);
+                MaxSender.onButtonCaptured(this);
+                return;
             }
-            if (renewed) MaxReplyBackup.save(this, button);
-            MaxSender.onButtonCaptured(this);
-            return;
-        }
 
-        // Чужой чат с той же системной операцией ответа (Objects.equals
-        // сравнивает операцию PendingIntent, а не Java-объект): ответ мог бы
-        // уйти не туда — блокируем до нового уведомления выбранного чата.
-        MaxReplyButton saved = MaxSender.currentButton(this);
-        if (saved != null && Objects.equals(button.pendingIntent, saved.pendingIntent)) {
-            MaxState.targetButton = null;
-            MaxReplyBackup.clear(this);
-            MaxChannel.setBlockedBy(this, MaxChannel.BLOCKED_CONFLICT, chatName);
-            Logger.w(TAG, event + ": у другого чата та же операция ответа — отправка заблокирована");
-            return;
-        }
+            // Чужой чат с той же системной операцией ответа (Objects.equals
+            // сравнивает операцию PendingIntent, а не Java-объект): ответ мог бы
+            // уйти не туда — блокируем до нового уведомления выбранного чата.
+            MaxReplyButton saved = MaxSender.currentButton(this);
+            if (saved != null && Objects.equals(button.pendingIntent, saved.pendingIntent)) {
+                MaxState.targetButton = null;
+                MaxReplyBackup.clear(this);
+                MaxChannel.setBlockedBy(this, MaxChannel.BLOCKED_CONFLICT, chatName);
+                Logger.w(TAG, event + ": у другого чата та же операция ответа — отправка заблокирована");
+                return;
+            }
 
-        // Имя совпадает, но идентичность не подтверждена (другой notificationId):
-        // возможно одноимённый чат — принимать его кнопку за выбранный чат нельзя.
-        if (MaxChannel.isAmbiguous(wanted, button)) {
-            MaxChannel.setBlockedBy(this, MaxChannel.BLOCKED_AMBIGUOUS, chatName);
-            Logger.w(TAG, event + ": одноимённый чат с другим идентификатором — нужен повторный выбор");
+            // Имя совпадает, но идентичность не подтверждена (другой
+            // notificationId или идентификатор не сохранён): возможно
+            // одноимённый чат — принимать его кнопку за выбранный чат нельзя.
+            if (MaxChannel.isAmbiguous(wanted, button)) {
+                MaxChannel.setBlockedBy(this, MaxChannel.BLOCKED_AMBIGUOUS, chatName);
+                Logger.w(TAG, event + ": одноимённый чат с другим идентификатором — нужен повторный выбор");
+            }
         }
     }
 

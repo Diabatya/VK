@@ -37,6 +37,13 @@ public final class MaxSender {
     public static volatile CommandSender sendCommandForTest;
     public static volatile Function<PendingIntent, String> creatorPackageForTest;
     public static volatile LongSupplier clockForTest;
+    /**
+     * Тестовая точка «между проверкой и командой»: вызывается внутри общей
+     * синхронизации непосредственно перед ревалидацией и PendingIntent.send.
+     * Позволяет тесту обработать конфликтное уведомление настоящим listener'ом
+     * в разрыве между первоначальной проверкой и внешней командой.
+     */
+    public static volatile Runnable beforeCommandHookForTest;
 
     private MaxSender() { }
 
@@ -173,7 +180,16 @@ public final class MaxSender {
                 : statusText(app);
     }
 
+    /**
+     * Передача команды. Тело — целиком под монитором MaxSender.class: слушатель
+     * меняет адресата/кнопку/блокировку под тем же монитором, поэтому проверки
+     * и внешняя команда атомарны относительно обновлений состояния. Вызывается
+     * из synchronized-входов (onReading, onButtonCaptured, sendTest) — монитор
+     * реентерабелен. Без сетевой и дисковой работы: только чтение prefs и
+     * binder-вызов PendingIntent.send.
+     */
     private static boolean trySend(Context app, MaxChannel.Pending item, boolean isReading) {
+        synchronized (MaxSender.class) {
         MaxChannel.Target wanted = MaxChannel.getTarget(app);
         if (wanted == null) {
             if (isReading) MaxChannel.clearPending(app);
@@ -218,12 +234,6 @@ public final class MaxSender {
             return false;
         }
 
-        // Финальный запрет непосредственно перед передачей команды.
-        if (!VkSenderService.isTransmissionAllowed(app)) {
-            Logger.i(TAG, "не отправлено: передача остановлена перед командой");
-            return false;
-        }
-
         Bundle results = new Bundle();
         for (RemoteInput ri : button.remoteInputs) {
             results.putCharSequence(ri.getResultKey(), item.text);
@@ -232,6 +242,17 @@ public final class MaxSender {
         RemoteInput.addResultsToIntent(button.remoteInputs, fillIn, results);
         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.P) {
             RemoteInput.setResultsSource(fillIn, RemoteInput.SOURCE_FREE_FORM_INPUT);
+        }
+
+        // Разрыв «после проверки, до команды» — тестовая точка гонки. Затем
+        // полная ревалидация: конфликт/смена адресата/отзыв доступа или Stop,
+        // обработанные к этому моменту под общим монитором, обязаны запретить
+        // команду — одной проверки в начале недостаточно.
+        Runnable barrier = beforeCommandHookForTest;
+        if (barrier != null) barrier.run();
+        if (!stillSendable(app, wanted)) {
+            Logger.w(TAG, "не отправлено: адресат/разрешения изменились перед командой");
+            return false;
         }
 
         try {
@@ -263,6 +284,29 @@ public final class MaxSender {
             Logger.w(TAG, "не отправлено: ошибка передачи команды в MAX");
             return false;
         }
+        }
+    }
+
+    /**
+     * Ревалидация непосредственно перед внешней командой: всё, что могло
+     * измениться с первой проверки — включённость канала, общий Stop, доступ
+     * к уведомлениям, блокировка, выбранный адресат и кнопка этого адресата.
+     * Адресат сравнивается по сохранённой идентичности целиком — нельзя
+     * проверить один снимок, а отправить по другому.
+     */
+    private static boolean stillSendable(Context app, MaxChannel.Target wanted) {
+        if (!MaxChannel.isMaxEnabled(app)) return false;
+        if (!VkSenderService.isTransmissionAllowed(app)) return false;
+        if (!listenerAccessGranted(app)) return false;
+        if (MaxChannel.getBlockedBy(app) != null) return false;
+        MaxChannel.Target now = MaxChannel.getTarget(app);
+        if (now == null || now.notificationId != wanted.notificationId
+                || !now.chatName.equals(wanted.chatName)
+                || !now.channelId.equals(wanted.channelId)) {
+            return false;
+        }
+        MaxReplyButton current = currentButton(app);
+        return current != null && MaxChannel.matches(wanted, current);
     }
 
     /**

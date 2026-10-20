@@ -97,6 +97,7 @@ public class MaxChannelTest {
         MaxSender.sendCommandForTest = null;
         MaxSender.creatorPackageForTest = null;
         MaxSender.clockForTest = null;
+        MaxSender.beforeCommandHookForTest = null;
         MaxState.resetForTest();
     }
 
@@ -151,6 +152,8 @@ public class MaxChannelTest {
      */
     private PendingIntent equalWrapper(PendingIntent original, Intent op) {
         try {
+            int requestCode = org.robolectric.util.ReflectionHelpers.getField(
+                    org.robolectric.shadow.api.Shadow.extract(original), "requestCode");
             Class<?> senderClass = Class.forName("android.content.IIntentSender");
             Object sender = java.lang.reflect.Proxy.newProxyInstance(
                     senderClass.getClassLoader(), new Class[]{senderClass},
@@ -165,7 +168,7 @@ public class MaxChannelTest {
             org.robolectric.util.ReflectionHelpers.setField(
                     shadow, "savedContext", context);
             org.robolectric.util.ReflectionHelpers.setField(
-                    shadow, "requestCode", 77);
+                    shadow, "requestCode", requestCode);
             assertTrue(original.equals(copy));
             assertTrue(copy.equals(original));
             return copy;
@@ -370,6 +373,91 @@ public class MaxChannelTest {
         assertEquals("Папа", t.chatName);
         assertEquals(378, t.notificationId);
         activity.finish();
+    }
+
+    @Test
+    public void zeroNotifIdDoesNotWeakenMatch() {
+        // MAX-1A.1: выбран «Семья»/dialogs/id=0 (ноль — допустимый id). Приходит
+        // другая «Семья», тот же канал, id=2 — соответствие НЕ подтверждено:
+        // имя+общий канал не ослабляют проверку ни при каком значении id.
+        PendingIntent piA = fakePi();
+        PendingIntent piB = fakePi();
+        listener.onNotificationPosted(maxSbn("Семья", "ru.oneme.app.dialogs", 0, piA));
+        assertTrue(MaxSender.selectCandidate(context, MaxSender.candidates().get(0)));
+        assertEquals(0, MaxChannel.getTarget(context).notificationId);
+
+        listener.onNotificationPosted(maxSbn("Семья", "ru.oneme.app.dialogs", 2, piB));
+        assertSame("кнопка выбранного чата не подменена", piA,
+                MaxState.targetButton.pendingIntent);
+        assertEquals(MaxChannel.BLOCKED_AMBIGUOUS, MaxChannel.getBlockedReason(context));
+        MaxSender.onReading(context, "6.0", clock.get());
+        assertEquals("показание не отправлено через вторую кнопку",
+                0, sentCommands.size());
+
+        // Подтверждающее уведомление выбранного чата (тот же id=0) снимает блок.
+        listener.onNotificationPosted(maxSbn("Семья", "ru.oneme.app.dialogs", 0, fakePi()));
+        assertNull(MaxChannel.getBlockedBy(context));
+        assertEquals(1, sentCommands.size());
+    }
+
+    @Test
+    public void missingNotifIdTargetRequiresReselect() {
+        // MAX-1A.1: цель, сохранённая без идентификатора уведомления
+        // (NOTIF_ID_UNKNOWN) — это не «id 0»: соответствие не подтверждается
+        // ни одним уведомлением, отправка запрещена до повторного выбора.
+        maxPrefs.edit()
+                .putString("target_name", "Семья")
+                .putString("target_channel", "ru.oneme.app.dialogs")
+                .commit(); // target_notif_id не записан
+        MaxChannel.Target t = MaxChannel.getTarget(context);
+        assertNotNull(t);
+        assertEquals(MaxChannel.NOTIF_ID_UNKNOWN, t.notificationId);
+
+        listener.onNotificationPosted(maxSbn("Семья", "ru.oneme.app.dialogs", 0, fakePi()));
+        assertEquals(MaxChannel.BLOCKED_AMBIGUOUS, MaxChannel.getBlockedReason(context));
+        MaxSender.onReading(context, "6.0", clock.get());
+        assertEquals(0, sentCommands.size());
+        assertTrue(MaxSender.statusText(context).contains("не подтверждён"));
+    }
+
+    @Test
+    public void restoredZeroIdButtonStillWorks() {
+        // Идентичность согласована на всех путях: выбранная цель с реальным
+        // id=0 восстанавливает кнопку из backup — отправка работает.
+        listener.onNotificationPosted(maxSbn("Семья", "ru.oneme.app.dialogs", 0, fakePi()));
+        assertTrue(MaxSender.selectCandidate(context, MaxSender.candidates().get(0)));
+        MaxState.targetButton = null; // «перезапуск» — живая кнопка утрачена
+        MaxSender.onReading(context, "6.0", clock.get());
+        assertEquals(1, sentCommands.size()); // команда ушла по восстановленной кнопке
+    }
+
+    @Test
+    public void conflictDuringSendBlocksCommand() {
+        // Гонка listener↔send: отправка «остановлена» между первой проверкой
+        // блокировки и внешней командой; настоящий listener в этот разрыв
+        // обрабатывает уведомление чужого чата с равной операцией и ставит
+        // BLOCKED_CONFLICT. Команда запрещена, pending сахара сохранён.
+        Intent op = new Intent("com.example.xdrip2vk.test.RACE_OP");
+        PendingIntent piA = PendingIntent.getBroadcast(context, 88, op, PendingIntent.FLAG_IMMUTABLE);
+        PendingIntent piB = equalWrapper(piA, op); // другой объект, та же операция
+
+        listener.onNotificationPosted(maxSbn("Папа", "ru.oneme.app.dialogs", 378, piA));
+        assertTrue(MaxSender.selectCandidate(context, MaxSender.candidates().get(0)));
+
+        MaxSender.beforeCommandHookForTest = () ->
+                listener.onNotificationPosted(
+                        maxSbn("Мама", "ru.oneme.app.dialogs", 555, piB));
+        MaxSender.onReading(context, "6.4", clock.get());
+        assertEquals("конфликт до начала команды обязан её запретить",
+                0, sentCommands.size());
+        assertNotNull("ожидающее показание сохранено", MaxChannel.getPending(context));
+        assertEquals(MaxChannel.BLOCKED_CONFLICT, MaxChannel.getBlockedReason(context));
+
+        // Новое подтверждающее уведомление выбранного чата — один flush, без дубля.
+        listener.onNotificationPosted(maxSbn("Папа", "ru.oneme.app.dialogs", 378, fakePi()));
+        assertEquals(1, sentCommands.size());
+        assertEquals("6.4", fillInText(sentFillIns.get(0)));
+        assertNull(MaxChannel.getPending(context));
     }
 
     @Test

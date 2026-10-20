@@ -73,7 +73,14 @@ public final class MaxChannel {
 
     // --- Выбранный адресат -------------------------------------------------------
 
-    /** Идентичность выбранного чата: имя + канал уведомления + id уведомления. */
+    /** Идентификатор уведомления не сохранён — адресат не подтверждён. */
+    public static final int NOTIF_ID_UNKNOWN = -1;
+
+    /**
+     * Идентичность выбранного чата: имя + канал уведомления + id уведомления.
+     * notificationId == NOTIF_ID_UNKNOWN означает, что идентификатора нет —
+     * это НЕ то же самое, что сохранённый id 0 (0 — допустимый id уведомления).
+     */
     public static final class Target {
         public final String chatName;
         public final String channelId;
@@ -90,7 +97,8 @@ public final class MaxChannel {
         SharedPreferences p = prefs(context);
         String name = p.getString(KEY_TARGET_NAME, null);
         if (name == null) return null;
-        return new Target(name, p.getString(KEY_TARGET_CHANNEL, ""), p.getInt(KEY_TARGET_NOTIF, 0));
+        return new Target(name, p.getString(KEY_TARGET_CHANNEL, ""),
+                p.getInt(KEY_TARGET_NOTIF, NOTIF_ID_UNKNOWN));
     }
 
     /**
@@ -116,19 +124,20 @@ public final class MaxChannel {
     }
 
     /**
-     * Тот ли это чат: имя и id уведомления совпадают точно. Одного имени и
-     * общего канала недостаточно: два одноимённых чата на одном канале —
-     * разные адресаты. Постоянство notificationId на всех версиях MAX на
-     * устройстве не проверено; при его смене у реального чата соответствие
-     * не подтверждается — пользователь выбирает чат заново (безопасно).
+     * Тот ли это чат: имя, канал и id уведомления совпадают точно. Ослабления
+     * нет ни для какого значения: имя и общий канал без подтверждённого id
+     * не доказывают адресата — два одноимённых чата на одном канале разные.
+     * Сохранённый id 0 — допустимый идентификатор и сравнивается как число;
+     * отсутствие id (NOTIF_ID_UNKNOWN) ни с чем не совпадает — адресат требует
+     * повторного выбора. Постоянство notificationId на всех версиях MAX на
+     * устройстве не проверено; при его смене соответствие не подтверждается
+     * — пользователь выбирает чат заново (безопасно).
      */
     static boolean matches(Target target, MaxReplyButton button) {
-        if (!button.chatName.equals(target.chatName)) return false;
-        if (target.notificationId != 0) {
-            return button.notificationId == target.notificationId;
-        }
-        // Запасной путь для цели без id: имя+канал — самые слабые признаки.
-        return button.channelId.equals(target.channelId);
+        if (target.notificationId == NOTIF_ID_UNKNOWN) return false;
+        return button.chatName.equals(target.chatName)
+                && button.channelId.equals(target.channelId)
+                && button.notificationId == target.notificationId;
     }
 
     /**
