@@ -76,6 +76,47 @@
         android:summary="Нажмите для выбора беседы для тревожных сообщений"
         app:isPreferenceVisible="true" />
 
+    <!-- Каналы отправки: независимые переключатели. VK по умолчанию включён
+         (поведение установленных копий не меняется), MAX выключен. -->
+    <SwitchPreference
+        android:key="send_vk_enabled"
+        android:title="Отправлять в VK"
+        android:summary="Сообщения в выбранную беседу ВКонтакте"
+        android:defaultValue="true"
+        app:isPreferenceVisible="true" />
+
+    <SwitchPreference
+        android:key="send_max_enabled"
+        android:title="Отправлять в MAX"
+        android:summary="Показания «ответом» в один выбранный чат MAX"
+        android:defaultValue="false"
+        app:isPreferenceVisible="true" />
+
+    <!-- Канал MAX -->
+    <Preference
+        android:key="max_notif_access"
+        android:title="Доступ к уведомлениям MAX"
+        android:summary="Открыть системные настройки слушателя уведомлений"
+        app:isPreferenceVisible="true" />
+
+    <Preference
+        android:key="max_select_chat"
+        android:title="Чат MAX"
+        android:summary="Не выбран. Нужно сообщение из чата MAX"
+        app:isPreferenceVisible="true" />
+
+    <Preference
+        android:key="max_status"
+        android:title="Состояние MAX"
+        app:iconSpaceReserved="false"
+        app:isPreferenceVisible="true" />
+
+    <Preference
+        android:key="max_test"
+        android:title="Тестовое сообщение в MAX"
+        android:summary="Отправить проверку в выбранный чат MAX"
+        app:isPreferenceVisible="true" />
+
     <!-- Отображение данных в чате -->
     <SwitchPreference
         android:key="show_iob"
@@ -96,6 +137,14 @@
         android:title="Уведомлять о вводе инсулина/углеводов"
         android:summary="Отправлять отдельные сообщения при вводе терапии"
         android:defaultValue="false"
+        app:isPreferenceVisible="true" />
+
+    <!-- О приложении -->
+    <Preference
+        android:key="about_app"
+        android:title="О приложении"
+        android:summary="xDrip to VK · © 2026 Diabatya · GPL-3.0-only. Канал MAX адаптирован из bg2max (GPL-3.0): https://github.com/s-beaver/bg2max. Разработка — Diabatya с использованием ИИ-инструментов."
+        android:selectable="false"
         app:isPreferenceVisible="true" />
 
 </PreferenceScreen>

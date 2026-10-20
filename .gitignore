@@ -20,3 +20,8 @@ local.properties
 /apk_compare/*.apks
 *.apk
 *.ap_
+*.idsig
+/.devin/
+/caxarok_*_verification.zip
+/max-test-apk/
+/verification-package/

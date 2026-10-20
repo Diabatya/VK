@@ -988,6 +988,13 @@ public class VkSenderService extends Service {
         }
         // Пропущенная из-за невыбранного чата тревога учтена в состоянии
         // coordinator и будет отражена в статусе доставки до истечения срока.
+
+        // Канал MAX получает то же принятое показание тем же форматтером —
+        // независимо от конфигурации VK и его исхода. STALE/FUTURE/DUPLICATE
+        // до MAX не доходят: одно показание — одна команда.
+        if (outcome == DeliveryCoordinator.ReadingOutcome.ACCEPTED) {
+            com.example.xdrip2vk.max.MaxSender.onReading(this, msgs.regular(r), r.timestampMs);
+        }
         drainAndSchedule();
     }
 
@@ -1023,7 +1030,10 @@ public class VkSenderService extends Service {
         AlertThresholds thresholds = AlertThresholds.orDefault(
                 prefs.getString(PREF_ALERT_MIN_BG, AlertThresholds.DEFAULT_MIN_STR),
                 prefs.getString(PREF_ALERT_MAX_BG, AlertThresholds.DEFAULT_MAX_STR));
-        boolean configured = snap.configured();
+        // Канал VK независим от MAX: «Отправлять в VK»=выкл означает, что
+        // сообщения не ставятся и не уходят в VK; MAX работает сам по себе.
+        boolean configured = snap.configured()
+                && com.example.xdrip2vk.max.MaxChannel.isVkEnabled(this);
         // Невыбранный чат — только id==0. Отрицательный peer_id — допустимый
         // адресат VK (сообщество по схеме messages.send), отбрасывать его по
         // знаку нельзя; пустая строка для id<=0 создавала бы ложный статус
@@ -1561,6 +1571,9 @@ public class VkSenderService extends Service {
             updateNotification("Передача остановлена пользователем");
             return; // запрет: ни отправок, ни перепланирования
         }
+        // Канал VK выключен переключателем: очередь сохраняется без отправок,
+        // показания продолжают опрашиваться для MAX.
+        if (!com.example.xdrip2vk.max.MaxChannel.isVkEnabled(this)) return;
         // Токен, оба адресата и статус хранилища — один согласованный
         // снимок. LOADING/BLOCKED/INCOMPLETE/EMPTY/DELETED — не источник
         // отправки, и отсутствие отправки по этой причине не считается
