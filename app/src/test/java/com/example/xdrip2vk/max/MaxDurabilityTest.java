@@ -25,6 +25,7 @@ import org.robolectric.Robolectric;
 import org.robolectric.RobolectricTestRunner;
 import org.robolectric.annotation.Config;
 
+import java.util.ArrayDeque;
 import java.util.ArrayList;
 import java.util.HashMap;
 import java.util.List;
@@ -37,26 +38,32 @@ import java.util.concurrent.atomic.AtomicInteger;
 import java.util.concurrent.atomic.AtomicLong;
 
 /**
- * MAX-1Б: подтверждённое состояние и восстановление после прерывания.
- * Настоящий MaxNotificationListener + MaxSender + MaxChannel под Robolectric;
- * хранилище подменено fake'ом с отдельным «диском»: удержания commit,
- * отказы записи и новые handle'ы над тем же диском.
+ * MAX-1Б/1Б.1: подтверждённое состояние, устаревшие повторы записи и
+ * восстановление после прерывания.
  *
- * «Перезапуск процесса» моделируется сборкой снимка из диска заново
- * (MaxChannel.resetForTest + сброс runtime-состояния) — настоящий kill
- * процесса в тестах не выполнялся. Синхронизация — latch'и, без sleep.
+ * Хранилище — fake с честной моделью SharedPreferences: общий процессный
+ * кеш для всех handle'ов + отдельный подтверждённый диск. commit=false и
+ * исключение происходят ПОСЛЕ изменения кеша, как память SharedPreferences
+ * при неудачной записи. «Новый процесс» моделируется env.newProcess():
+ * кеш пересобирается только из диска, процессные флаги сбрасываются —
+ * настоящий kill процесса в тестах не выполнялся.
+ *
+ * Отложенные повторы записи — управляемый планировщик: задачи складываются
+ * в очередь и запускаются тестом вручную. Синхронизация — latch'и, без sleep.
  */
 @RunWith(RobolectricTestRunner.class)
 @Config(sdk = 34)
 public class MaxDurabilityTest {
 
-    /** «Диск» fake-хранилища — разделяется всеми handle'ами одного процесса. */
-    static final class FakeDisk {
-        final Map<String, Object> data = new HashMap<>();
+    /** Окружение хранилища: диск + процессный кеш + управление отказами. */
+    static final class FakeEnv {
+        final Map<String, Object> disk = new HashMap<>();   // подтверждённое
+        final Map<String, Object> cache = new HashMap<>();  // кеш процесса — общий для handle'ов
         final AtomicInteger commits = new AtomicInteger();
-        volatile boolean failCommits;           // commit() -> false (запись не применяется)
-        volatile Runnable onCommit;             // одноразовый хук внутри commit (на потоке исполнителя)
-        volatile CountDownLatch holdStart;      // commit удерживается между latch'ами
+        volatile int failMode;                  // 0 — ok, 1 — commit=false, 2 — исключение
+        volatile Runnable onCommit;             // одноразовый хук внутри commit
+        volatile int holdOnCommit = -1;         // номер commit, который удержать latch'ем
+        volatile CountDownLatch holdStart;
         volatile CountDownLatch holdRelease;
 
         Runnable takeHook() {
@@ -64,27 +71,33 @@ public class MaxDurabilityTest {
             onCommit = null;
             return h;
         }
+
+        /** «Новый процесс»: кеш уничтожен и пересобран только из диска. */
+        void newProcess() {
+            cache.clear();
+            cache.putAll(disk);
+        }
     }
 
     static final class FakeStore implements MaxStore {
-        final FakeDisk disk;
+        final FakeEnv env;
 
-        FakeStore(FakeDisk disk) {
-            this.disk = disk;
+        FakeStore(FakeEnv env) {
+            this.env = env;
         }
 
         @Override public String getString(String key, String def) {
-            Object v = disk.data.get(key);
+            Object v = env.cache.get(key);
             return v instanceof String ? (String) v : def;
         }
 
         @Override public long getLong(String key, long def) {
-            Object v = disk.data.get(key);
+            Object v = env.cache.get(key);
             return v instanceof Long ? (Long) v : def;
         }
 
         @Override public int getInt(String key, int def) {
-            Object v = disk.data.get(key);
+            Object v = env.cache.get(key);
             return v instanceof Integer ? (Integer) v : def;
         }
 
@@ -99,23 +112,26 @@ public class MaxDurabilityTest {
                 @Override public Editor remove(String k) { removes.add(k); return this; }
 
                 @Override public boolean commit() {
-                    disk.commits.incrementAndGet();
-                    Runnable hook = disk.takeHook();
+                    int n = env.commits.incrementAndGet();
+                    // Кеш процесса меняется до исхода записи — как память
+                    // SharedPreferences: отказ/исключение оставляет кеш грязным.
+                    env.cache.putAll(puts);
+                    for (String k : removes) env.cache.remove(k);
+                    Runnable hook = env.takeHook();
                     if (hook != null) hook.run();
-                    if (disk.holdStart != null) {
-                        disk.holdStart.countDown();
+                    if (n == env.holdOnCommit) {
+                        env.holdOnCommit = -1;
+                        env.holdStart.countDown();
                         try {
-                            disk.holdRelease.await(10, TimeUnit.SECONDS);
+                            env.holdRelease.await(10, TimeUnit.SECONDS);
                         } catch (InterruptedException e) {
                             Thread.currentThread().interrupt();
                         }
                     }
-                    if (disk.failCommits) {
-                        // Запись не применилась — даже если «кеш» редактора грязный.
-                        return false;
-                    }
-                    disk.data.putAll(puts);
-                    for (String k : removes) disk.data.remove(k);
+                    if (env.failMode == 1) return false;
+                    if (env.failMode == 2) throw new RuntimeException("commit failed");
+                    env.disk.putAll(puts);
+                    for (String k : removes) env.disk.remove(k);
                     return true;
                 }
             };
@@ -125,11 +141,13 @@ public class MaxDurabilityTest {
     private Context context;
     private SharedPreferences prefs;
     private MaxNotificationListener listener;
-    private FakeDisk disk;
+    private FakeEnv env;
     private List<PendingIntent> sentCommands;
     private List<Intent> sentFillIns;
     private AtomicLong clock;
     private int piSeq;
+    private final ArrayDeque<Runnable> retryQueue = new ArrayDeque<>();
+    private final List<Long> retryDelays = new ArrayList<>();
 
     @Before
     public void setUp() {
@@ -147,9 +165,13 @@ public class MaxDurabilityTest {
         MaxState.listenerConnected = true;
 
         MaxSender.workerForTest = Runnable::run;
-        MaxChannel.retrySchedulerForTest = (task, delayMs) -> task.run();
-        disk = new FakeDisk();
-        MaxChannel.storeFactoryForTest = c -> new FakeStore(disk);
+        // Управляемый планировщик: повторы не бегут сами — тест запускает их явно.
+        MaxChannel.retrySchedulerForTest = (task, delayMs) -> {
+            retryQueue.add(task);
+            retryDelays.add(delayMs);
+        };
+        env = new FakeEnv();
+        MaxChannel.storeFactoryForTest = c -> new FakeStore(env);
 
         listener = Robolectric.buildService(MaxNotificationListener.class).create().get();
 
@@ -190,13 +212,40 @@ public class MaxDurabilityTest {
         MaxState.resetForTest();
     }
 
-    // --- фабрики -------------------------------------------------------------
+    // --- фабрики ---------------------------------------------------------------
 
     private PendingIntent fakePi() {
         piSeq++;
         return PendingIntent.getBroadcast(context, 2000 + piSeq,
                 new Intent("com.example.xdrip2vk.test.DPI_" + piSeq),
                 PendingIntent.FLAG_IMMUTABLE);
+    }
+
+    /** Вторая обёртка той же операции PendingIntent: equals=true, ==false. */
+    private PendingIntent equalWrapper(PendingIntent original, Intent op) {
+        try {
+            int requestCode = org.robolectric.util.ReflectionHelpers.getField(
+                    org.robolectric.shadow.api.Shadow.extract(original), "requestCode");
+            Class<?> senderClass = Class.forName("android.content.IIntentSender");
+            Object sender = java.lang.reflect.Proxy.newProxyInstance(
+                    senderClass.getClassLoader(), new Class[]{senderClass},
+                    (proxy, method, args) -> null);
+            PendingIntent copy = org.robolectric.util.ReflectionHelpers.callConstructor(
+                    PendingIntent.class,
+                    org.robolectric.util.ReflectionHelpers.ClassParameter.from(
+                            senderClass, sender));
+            Object shadow = org.robolectric.shadow.api.Shadow.extract(copy);
+            org.robolectric.util.ReflectionHelpers.setField(
+                    shadow, "savedIntents", new Intent[]{op});
+            org.robolectric.util.ReflectionHelpers.setField(
+                    shadow, "savedContext", context);
+            org.robolectric.util.ReflectionHelpers.setField(
+                    shadow, "requestCode", requestCode);
+            assertTrue(original.equals(copy));
+            return copy;
+        } catch (Exception e) {
+            throw new AssertionError("вторая обёртка операции не создана", e);
+        }
     }
 
     private StatusBarNotification maxSbn(String chat, String channel,
@@ -225,59 +274,478 @@ public class MaxDurabilityTest {
         assertNotNull(MaxChannel.getTarget(context));
     }
 
-    /** Модель перезапуска процесса: снимок и runtime собираются с диска заново. */
-    private void restartFromDisk() {
-        MaxState.targetButton = null;
-        MaxChannel.resetForTest();
+    private void selectMama() {
+        listener.onNotificationPosted(maxSbn("Мама", "ru.oneme.app.dialogs", 555, fakePi()));
+        for (MaxSender.Candidate c : MaxSender.candidates()) {
+            if (c.chatName().equals("Мама")) {
+                assertTrue(MaxSender.selectCandidate(context, c));
+                return;
+            }
+        }
+        fail("кандидат «Мама» не найден");
     }
 
-    // --- обязательные сценарии -------------------------------------------------
+    /** Модель нового процесса: кеш только из диска, процессные флаги сброшены. */
+    private void restartFromDisk() {
+        env.newProcess();
+        MaxState.targetButton = null;
+        MaxState.resetForTest();
+        MaxChannel.resetForTest();
+        MaxState.listenerConnected = true;
+    }
+
+    private void drainRetries() {
+        while (!retryQueue.isEmpty()) retryQueue.poll().run();
+    }
+
+    private String fillInText(Intent fillIn) {
+        Bundle results = RemoteInput.getResultsFromIntent(fillIn);
+        CharSequence cs = results == null ? null : results.getCharSequence("key_text");
+        return cs == null ? null : cs.toString();
+    }
+
+    private List<String> sentTexts() {
+        List<String> out = new ArrayList<>();
+        for (Intent i : sentFillIns) out.add(fillInText(i));
+        return out;
+    }
+
+    /** Хук именно внутри commit резерва попытки (второй commit цепочки). */
+    private void hookOnReserveCommit(Runnable hook) {
+        env.onCommit = () -> env.onCommit = hook;
+    }
+
+    // --- отказы записи и модель хранилища -------------------------------------
 
     @Test
     public void reserveWriteFails_NoExternalCommand() {
         selectPapa();
-        // Отказ записи перед командой: pending и резерв не подтверждаются.
-        disk.failCommits = true;
+        env.failMode = 1;
         MaxSender.onReading(context, "6.1", clock.get());
+        drainRetries();
         assertEquals(0, sentCommands.size());
         assertTrue(MaxState.storageError);
         assertTrue(MaxSender.statusText(context).contains("Ошибка записи"));
-        // Фиксированный статус — без текста показания.
         assertFalse(MaxSender.statusText(context).contains("6.1"));
     }
 
     @Test
-    public void commitFalseNotBypassedByNewHandle() {
-        selectPapa();
-        disk.failCommits = true;
+    public void targetWriteFails_TargetNotUsed() {
+        listener.onNotificationPosted(maxSbn("Папа", "ru.oneme.app.dialogs", 378, fakePi()));
+        env.failMode = 1;
+        assertFalse(MaxSender.selectCandidate(context, MaxSender.candidates().get(0)));
+        drainRetries();
+        // Неподтверждённая цель не используется: ни команда, ни адресат.
+        assertNull(MaxChannel.getTarget(context));
         MaxSender.onReading(context, "6.2", clock.get());
+        drainRetries();
         assertEquals(0, sentCommands.size());
-
-        // Новый handle того же хранилища — тот же диск, запрет не обходится.
-        MaxChannel.storeFactoryForTest = c -> new FakeStore(disk);
-        restartFromDisk(); // снимок собран с диска — подтверждённой цель всё ещё нет данных попытки
-        MaxSender.onReading(context, "6.2", clock.get());
-        assertEquals(0, sentCommands.size());
-        assertTrue(MaxState.storageError);
     }
 
     @Test
-    public void restoredPendingKeepsTargetTextAndTtl() {
+    public void dirtyCacheNotConfirmedAndNotBypassedByNewHandle() {
         selectPapa();
-        // Кнопки нет — показание ложится в pending и подтверждается записью.
+        env.failMode = 1;
+        MaxSender.onReading(context, "6.2", clock.get());
+        drainRetries();
+        assertEquals(0, sentCommands.size());
+        // Кеш «запачкан» неподтверждённым pending — диск его не содержит.
+        assertTrue(env.cache.containsKey("pending_text"));
+        assertFalse(env.disk.containsKey("pending_text"));
+
+        // Новый handle ТОГО ЖЕ процесса — тот же кеш, запрет не обходит:
+        env.failMode = 0;
+        MaxChannel.storeFactoryForTest = c -> new FakeStore(env);
+        MaxChannel.resetForTest(); // пересборка снимка — процесс тот же, storageError жив
+        assertNull("неподтверждённые данные не считаются состоянием",
+                MaxChannel.getPending(context));
+        assertTrue(MaxState.storageError);
+        MaxSender.onButtonCaptured(context);
+        assertEquals(0, sentCommands.size());
+
+        // «Новый процесс» — только диск: pending неподтверждённого нет.
+        restartFromDisk();
+        assertNull(MaxChannel.getPending(context));
+        assertNotNull(MaxChannel.getTarget(context)); // подтверждённая цель сохранена
+    }
+
+    @Test
+    public void exceptionAfterCacheMutation_NoCommand() {
+        selectPapa();
+        env.failMode = 2; // исключение после изменения кеша
+        MaxSender.onReading(context, "6.3", clock.get());
+        drainRetries();
+        assertEquals(0, sentCommands.size());
+        assertTrue(MaxState.storageError);
+        assertFalse(env.disk.containsKey("pending_text"));
+    }
+
+    // --- устаревшие повторы записи (А–Г) ----------------------------------------
+
+    @Test
+    public void staleTargetRetryKeepsNewerSelection() {
+        // А: выбор «Папы» отказал → повтор отложен → «Мама» подтверждена →
+        // повтор «Папы» устарел и цель не меняет.
+        listener.onNotificationPosted(maxSbn("Папа", "ru.oneme.app.dialogs", 378, fakePi()));
+        listener.onNotificationPosted(maxSbn("Мама", "ru.oneme.app.dialogs", 555, fakePi()));
+        MaxSender.Candidate papa = null;
+        for (MaxSender.Candidate c : MaxSender.candidates()) {
+            if (c.chatName().equals("Папа")) papa = c;
+        }
+        assertNotNull(papa);
+
+        env.failMode = 1;
+        assertFalse(MaxSender.selectCandidate(context, papa));
+        env.failMode = 0;
+        assertEquals("повтор записи цели отложен", 1, retryQueue.size());
+
+        selectMama();
+        long genMama = MaxChannel.getTarget(context).generation;
+        PendingIntent mamaPi = MaxState.targetButton.pendingIntent;
+
+        retryQueue.poll().run(); // устаревший повтор выбора «Папы»
+        assertEquals("Мама", MaxChannel.getTarget(context).chatName);
+        assertEquals(genMama, MaxChannel.getTarget(context).generation);
+        assertSame("кнопка — выбранной «Мамы»", mamaPi,
+                MaxState.targetButton.pendingIntent);
+        assertEquals("Мама", MaxReplyBackup.restore(context).chatName);
+    }
+
+    @Test
+    public void stalePendingRetryKeepsNewerPending() {
+        // Б: запись старого показания отказала → новое подтверждено →
+        // повтор старого не заменяет новое.
+        selectPapa();
+        MaxState.targetButton = null;
+        MaxReplyBackup.clear(context); // команды не будет — проверяем только pending
+
+        env.failMode = 1;
+        MaxSender.onReading(context, "6.1", clock.get());
+        env.failMode = 0;
+        assertEquals(1, retryQueue.size());
+
+        clock.addAndGet(60_000);
+        MaxSender.onReading(context, "6.2", clock.get());
+        assertEquals("6.2", MaxChannel.getPending(context).text);
+
+        retryQueue.poll().run(); // устаревший повтор записи «6.1»
+        assertEquals("новое показание не заменено старым",
+                "6.2", MaxChannel.getPending(context).text);
+    }
+
+    @Test
+    public void staleClearRetryKeepsNewPending() {
+        // В: удаление старого pending отказало → появилось новое →
+        // повтор удаления новое не трогает.
+        selectPapa();
         MaxState.targetButton = null;
         MaxReplyBackup.clear(context);
         MaxSender.onReading(context, "6.3", clock.get());
         assertNotNull(MaxChannel.getPending(context));
 
-        // «Перезапуск»: цель, текст, время и поколение pending восстановлены с диска.
+        env.failMode = 1;
+        clock.addAndGet(MaxChannel.PENDING_MAX_AGE_MS + 60_000);
+        MaxSender.onButtonCaptured(context); // очистка просроченного — отказ
+        env.failMode = 0;
+        assertEquals(1, retryQueue.size());
+        assertNotNull("pending остался — удаление не подтверждено",
+                MaxChannel.getPending(context));
+
+        clock.addAndGet(60_000);
+        MaxSender.onReading(context, "6.4", clock.get());
+        assertEquals("6.4", MaxChannel.getPending(context).text);
+
+        retryQueue.poll().run(); // устаревший повтор удаления
+        assertEquals("новое pending не удалено старым повтором",
+                "6.4", MaxChannel.getPending(context).text);
+    }
+
+    @Test
+    public void staleResultRetryDoesNotTouchNextAttempt() {
+        // Г: итог старой попытки не записался → появилась следующая попытка →
+        // старый повтор не меняет её состояние и не возвращает старый watermark.
+        selectPapa();
+        MaxSender.sendCommandForTest = (ctx, pi, fillIn) -> {
+            sentCommands.add(pi);
+            sentFillIns.add(fillIn);
+            env.failMode = 1; // запись итога первой попытки откажет
+        };
+        long ts1 = clock.get();
+        MaxSender.onReading(context, "6.5", ts1);
+        assertEquals(1, sentCommands.size());
+        env.failMode = 0;
+        MaxSender.sendCommandForTest = (ctx, pi, fillIn) -> {
+            sentCommands.add(pi);
+            sentFillIns.add(fillIn);
+        };
+        assertEquals(1, retryQueue.size());
+        long attempt1 = MaxChannel.getAttempt(context).id;
+
+        // Следующая попытка — обычный путь: первая же подтверждённая запись
+        // (pending) снимает storageError.
+        clock.addAndGet(60_000);
+        long ts2 = clock.get();
+        MaxSender.onReading(context, "6.6", ts2);
+        assertEquals(2, sentCommands.size());
+        long attempt2 = MaxChannel.getAttempt(context).id;
+        assertTrue(attempt2 > attempt1);
+        assertEquals(MaxChannel.Attempt.STATE_HANDED,
+                MaxChannel.getAttempt(context).state);
+
+        retryQueue.poll().run(); // устаревший повтор итога первой попытки
+        assertEquals("состояние следующей попытки не изменено",
+                attempt2, MaxChannel.getAttempt(context).id);
+        assertEquals(MaxChannel.Attempt.STATE_HANDED,
+                MaxChannel.getAttempt(context).state);
+        assertEquals("watermark остался от нового показания",
+                ts2, MaxChannel.getLastHandoffReadingTs(context));
+    }
+
+    @Test
+    public void retryDelaysIncrease() {
+        selectPapa();
+        env.failMode = 1;
+        MaxSender.onReading(context, "6.7", clock.get());
+        // Первая неудача — повтор с базовой задержкой; запускаем его — он
+        // тоже падает и планирует следующий с увеличенной паузой.
+        retryQueue.poll().run();
+        assertEquals(2, retryDelays.size());
+        assertEquals(MaxChannel.RETRY_BASE_MS, (long) retryDelays.get(0));
+        assertEquals(2 * MaxChannel.RETRY_BASE_MS, (long) retryDelays.get(1));
+        // Повторы реально идут через commit — счётчик это подтверждает.
+        assertTrue(env.commits.get() >= 2);
+        env.failMode = 0;
+        drainRetries();
+    }
+
+    // --- тест не отменяет запрет повтора сахара ----------------------------------
+
+    @Test
+    public void unknownSugarThenTestThenNewButton_TNotResent() {
+        selectPapa();
+        // Резерв прошёл, граница команды бросила исключение — исход неизвестен.
+        MaxSender.sendCommandForTest = (ctx, pi, fillIn) -> {
+            sentCommands.add(pi);
+            sentFillIns.add(fillIn);
+            throw new RuntimeException("исход неизвестен");
+        };
+        long ts = clock.get();
+        MaxSender.onReading(context, "6.6", ts);
+        assertEquals(1, sentCommands.size());
+        assertEquals(MaxChannel.Attempt.STATE_UNKNOWN,
+                MaxChannel.getAttempt(context).state);
+        assertNotNull(MaxChannel.getPending(context));
+
+        // Тестовое сообщение успешно — попытка показания не перезаписана.
+        MaxSender.sendCommandForTest = (ctx, pi, fillIn) -> {
+            sentCommands.add(pi);
+            sentFillIns.add(fillIn);
+        };
+        assertTrue(MaxSender.sendTest(context).contains("передано"));
+        assertEquals(2, sentCommands.size());
+        assertEquals(MaxChannel.Attempt.STATE_UNKNOWN,
+                MaxChannel.getAttempt(context).state);
+        assertEquals(MaxChannel.Attempt.STATE_HANDED,
+                MaxChannel.getTestAttempt(context).state);
+
+        // Новая кнопка выбранного чата — старый сахар повторно не уходит.
+        listener.onNotificationPosted(maxSbn("Папа", "ru.oneme.app.dialogs", 378, fakePi()));
+        assertEquals(2, sentCommands.size());
+        assertFalse("текст 6.6 не отправлен повторно",
+                sentTexts().subList(1, sentTexts().size()).contains("6.6"));
+        assertTrue(MaxSender.statusText(context).contains("неизвестен"));
+
+        // Следующее НОВОЕ показание идёт обычным путём — один раз.
+        clock.addAndGet(60_000);
+        MaxSender.onReading(context, "6.7", clock.get());
+        assertEquals(3, sentCommands.size());
+        assertEquals("6.7", fillInText(sentFillIns.get(2)));
+    }
+
+    @Test
+    public void reservedAfterRestartThenTestThenNewButton() {
+        // RESERVED на диске после «перезапуска» + успешный тест + новая кнопка.
+        plantReservedAttempt("6.8");
+        restartFromDisk();
+        assertNotNull(MaxChannel.getPending(context));
+
+        assertTrue(MaxSender.sendTest(context).contains("передано"));
+        assertEquals(1, sentCommands.size());
+        assertTrue(fillInText(sentFillIns.get(0)).startsWith("Тест:"));
+
+        listener.onNotificationPosted(maxSbn("Папа", "ru.oneme.app.dialogs", 378, fakePi()));
+        assertEquals("сахар с неизвестным исходом не повторён",
+                1, sentCommands.size());
+        assertFalse(sentTexts().contains("6.8"));
+    }
+
+    @Test
+    public void testThenRestartKeepsReservedSugarBlocked() {
+        // RESERVED → тест успешен → «перезапуск» → новая кнопка:
+        // независимое доказательство запрета переживает восстановление.
+        plantReservedAttempt("6.9");
+        restartFromDisk();
+        assertTrue(MaxSender.sendTest(context).contains("передано"));
+        assertEquals(1, sentCommands.size());
+        restartFromDisk();
+        listener.onNotificationPosted(maxSbn("Папа", "ru.oneme.app.dialogs", 378, fakePi()));
+        assertEquals(1, sentCommands.size());
+        assertFalse(sentTexts().contains("6.9"));
+        assertEquals(MaxChannel.Attempt.STATE_RESERVED,
+                MaxChannel.getAttempt(context).state);
+        assertEquals(MaxChannel.Attempt.STATE_HANDED,
+                MaxChannel.getTestAttempt(context).state);
+    }
+
+    @Test
+    public void failedTestKeepsCoverOnSugar() {
+        selectPapa();
+        MaxSender.sendCommandForTest = (ctx, pi, fillIn) -> {
+            sentCommands.add(pi);
+            sentFillIns.add(fillIn);
+            throw new RuntimeException("исход неизвестен");
+        };
+        MaxSender.onReading(context, "7.0", clock.get());
+        assertEquals(MaxChannel.Attempt.STATE_UNKNOWN,
+                MaxChannel.getAttempt(context).state);
+
+        // Неуспешный тест — MAX отменил кнопку.
+        MaxSender.sendCommandForTest = (ctx, pi, fillIn) -> {
+            throw new PendingIntent.CanceledException();
+        };
+        String res = MaxSender.sendTest(context);
+        assertFalse(res.contains("передано"));
+
+        // Живая кнопка и новое уведомление — сахар всё ещё покрыт UNKNOWN.
+        MaxSender.sendCommandForTest = (ctx, pi, fillIn) -> {
+            sentCommands.add(pi);
+            sentFillIns.add(fillIn);
+        };
+        listener.onNotificationPosted(maxSbn("Папа", "ru.oneme.app.dialogs", 378, fakePi()));
+        assertEquals("повтор сахара после неуспешного теста запрещён",
+                1, sentCommands.size());
+        assertFalse(sentTexts().subList(1, sentTexts().size()).contains("7.0"));
+    }
+
+    private void plantReservedAttempt(String text) {
+        selectPapa();
+        MaxStore s = MaxChannel.storeFactoryForTest.apply(context);
+        long gen = MaxChannel.getTarget(context).generation;
+        s.edit().putLong("attempt_id", 42)
+                .putString("attempt_kind", MaxChannel.Attempt.KIND_READING)
+                .putLong("attempt_gen", gen)
+                .putString("attempt_chat", "Папа")
+                .putString("attempt_channel", "ru.oneme.app.dialogs")
+                .putInt("attempt_notif_id", 378)
+                .putLong("attempt_reading_ts", clock.get())
+                .putInt("attempt_state", MaxChannel.Attempt.STATE_RESERVED)
+                .putString("pending_text", text)
+                .putLong("pending_reading_ts", clock.get())
+                .putLong("pending_gen", gen)
+                .commit();
+    }
+
+    // --- конфликт на настоящем рабочем исполнителе -------------------------------
+
+    @Test
+    public void conflictOnRealWorkerBlocksCommand() throws Exception {
+        // Настоящая производственная очередь: commit резерва удержан,
+        // настоящий listener принимает конфликт и возвращается сразу —
+        // команда не успевает выполниться до обработки конфликта.
+        ExecutorService real = Executors.newSingleThreadExecutor();
+        MaxSender.workerForTest = real;
+        try {
+            Intent op = new Intent("com.example.xdrip2vk.test.RW_OP");
+            PendingIntent piA = PendingIntent.getBroadcast(context, 91, op,
+                    PendingIntent.FLAG_IMMUTABLE);
+            PendingIntent piB = equalWrapper(piA, op);
+
+            listener.onNotificationPosted(maxSbn("Папа", "ru.oneme.app.dialogs", 378, piA));
+            real.submit(() -> { }).get(10, TimeUnit.SECONDS); // кандидат обработан
+            assertTrue(MaxSender.selectCandidate(context, MaxSender.candidates().get(0)));
+
+            // Удерживаем commit резерва (pending — предыдущий commit).
+            env.holdOnCommit = env.commits.get() + 2;
+            env.holdStart = new CountDownLatch(1);
+            env.holdRelease = new CountDownLatch(1);
+            MaxSender.onReading(context, "7.1", clock.get());
+            assertTrue("рабочий поток удержан в commit резерва",
+                    env.holdStart.await(10, TimeUnit.SECONDS));
+
+            CountDownLatch listenerReturned = new CountDownLatch(1);
+            new Thread(() -> {
+                listener.onNotificationPosted(
+                        maxSbn("Мама", "ru.oneme.app.dialogs", 555, piB));
+                listenerReturned.countDown();
+            }).start();
+            assertTrue("listener вернулся без ожидания",
+                    listenerReturned.await(10, TimeUnit.SECONDS));
+
+            env.holdRelease.countDown();
+            // Ждём полной обработки очереди worker-а.
+            real.submit(() -> { }).get(10, TimeUnit.SECONDS);
+            real.submit(() -> { }).get(10, TimeUnit.SECONDS);
+
+            assertEquals("команда не вызвана — конфликт обработан до неё",
+                    0, sentCommands.size());
+            assertEquals(MaxChannel.BLOCKED_CONFLICT,
+                    MaxChannel.getBlockedReason(context));
+            assertNotNull("ожидающий сахар сохранён", MaxChannel.getPending(context));
+        } finally {
+            real.shutdownNow();
+            MaxSender.workerForTest = Runnable::run;
+        }
+    }
+
+    @Test
+    public void listenerDoesNotWaitForHeldCommit() throws Exception {
+        selectPapa();
+        ExecutorService real = Executors.newSingleThreadExecutor();
+        MaxSender.workerForTest = real;
+        try {
+            env.holdOnCommit = env.commits.get() + 1; // первый commit — запись pending
+            env.holdStart = new CountDownLatch(1);
+            env.holdRelease = new CountDownLatch(1);
+
+            MaxSender.onReading(context, "7.3", clock.get());
+            assertTrue("рабочий поток вошёл в удержанную запись",
+                    env.holdStart.await(10, TimeUnit.SECONDS));
+
+            CountDownLatch listenerReturned = new CountDownLatch(1);
+            new Thread(() -> {
+                listener.onNotificationPosted(
+                        maxSbn("Мама", "ru.oneme.app.dialogs", 555, fakePi()));
+                listenerReturned.countDown();
+            }).start();
+            assertTrue("поток слушателя не ждёт удержанную запись",
+                    listenerReturned.await(10, TimeUnit.SECONDS));
+
+            env.holdRelease.countDown();
+            real.submit(() -> { }).get(10, TimeUnit.SECONDS);
+            real.submit(() -> { }).get(10, TimeUnit.SECONDS);
+            assertEquals(1, sentCommands.size());
+        } finally {
+            real.shutdownNow();
+            MaxSender.workerForTest = Runnable::run;
+        }
+    }
+
+    // --- восстановление и неопределённый исход -----------------------------------
+
+    @Test
+    public void restoredPendingKeepsTargetTextAndTtl() {
+        selectPapa();
+        MaxState.targetButton = null;
+        MaxReplyBackup.clear(context);
+        MaxSender.onReading(context, "6.3", clock.get());
+        assertNotNull(MaxChannel.getPending(context));
+
         restartFromDisk();
         MaxChannel.Pending p = MaxChannel.getPending(context);
         assertNotNull(p);
         assertEquals("6.3", p.text);
         assertEquals(MaxChannel.getTarget(context).generation, p.targetGeneration);
 
-        // Просроченное показание после восстановления не уходит.
         clock.addAndGet(MaxChannel.PENDING_MAX_AGE_MS + 60_000);
         MaxSender.onButtonCaptured(context);
         assertEquals(0, sentCommands.size());
@@ -291,7 +759,6 @@ public class MaxDurabilityTest {
         MaxReplyBackup.clear(context);
         MaxSender.onReading(context, "6.3", clock.get());
         restartFromDisk();
-        // Свежая кнопка выбранного чата — ожидающее уходит ровно один раз.
         listener.onNotificationPosted(maxSbn("Папа", "ru.oneme.app.dialogs", 378, fakePi()));
         assertEquals(1, sentCommands.size());
         assertNull(MaxChannel.getPending(context));
@@ -300,48 +767,38 @@ public class MaxDurabilityTest {
     @Test
     public void resultWriteFailsAfterSend_NoRetryOfCommand() {
         selectPapa();
-        // send успешен, а запись итога отказывает — RESERVED остаётся на диске.
         MaxSender.sendCommandForTest = (ctx, pi, fillIn) -> {
             sentCommands.add(pi);
-            disk.failCommits = true; // следующие commit (итог + повторы) откажут
+            sentFillIns.add(fillIn);
+            env.failMode = 1;
         };
         MaxSender.onReading(context, "6.4", clock.get());
-        assertEquals(1, sentCommands.size()); // команда ушла
-        disk.failCommits = false;
-        disk.onCommit = null;
+        assertEquals(1, sentCommands.size());
+        drainRetries(); // повторы итога тоже отказали — RESERVED остаётся на диске
+        env.failMode = 0;
 
-        // Повторной команды нет — ни от нового события кнопки, ни от того же показания.
         listener.onNotificationPosted(maxSbn("Папа", "ru.oneme.app.dialogs", 378, fakePi()));
         MaxSender.onReading(context, "6.4", clock.get());
         assertEquals(1, sentCommands.size());
-        // RESERVED переживает «перезапуск» — повтор всё ещё запрещён.
         restartFromDisk();
         MaxSender.onButtonCaptured(context);
         assertEquals(1, sentCommands.size());
         assertTrue(MaxState.outcomeUnknown);
-        // Последняя запись отказала — статус ошибки записи показывается первым.
-        assertTrue(MaxSender.statusText(context).contains("Ошибка записи"));
-        // Первая подтверждённая запись после восстановления снимает ошибку —
-        // и статус показывает неизвестный исход зарезервированной попытки.
-        MaxChannel.confirmClearBlocked(context);
         assertTrue(MaxSender.statusText(context).contains("неизвестен"));
 
-        // Следующее НОВОЕ показание идёт обычным путём — ровно один раз.
         clock.addAndGet(60_000);
         MaxSender.onReading(context, "6.5", clock.get());
         assertEquals(2, sentCommands.size());
+        assertEquals("6.5", fillInText(sentFillIns.get(1)));
     }
 
     @Test
     public void reservedAttemptNotRetriedAfterRestart() {
-        // «Процесс умер между резервом и итогом»: на диске RESERVED попытка
-        // и ожидающее того же показания — автоматический повтор запрещён.
         selectPapa();
         long ts = clock.get();
         MaxSender.onReading(context, "6.6", ts);
-        assertEquals(1, sentCommands.size()); // первое показание передано успешно
+        assertEquals(1, sentCommands.size());
 
-        // Моделируем незавершённую попытку: RESERVED + pending того же показания.
         MaxStore s = MaxChannel.storeFactoryForTest.apply(context);
         s.edit().putInt("attempt_state", MaxChannel.Attempt.STATE_RESERVED)
                 .putString("pending_text", "6.6")
@@ -349,11 +806,9 @@ public class MaxDurabilityTest {
                 .putLong("pending_gen", MaxChannel.getTarget(context).generation)
                 .commit();
         restartFromDisk();
-        assertNotNull(MaxChannel.getPending(context)); // триггер загрузки снимка
+        assertNotNull(MaxChannel.getPending(context));
         assertTrue(MaxState.outcomeUnknown);
 
-        // Новая кнопка выбранного чата: pending не повторяет команду с
-        // неизвестным исходом — внешних команд по-прежнему одна.
         MaxState.targetButton = null;
         MaxReplyBackup.clear(context);
         listener.onNotificationPosted(maxSbn("Папа", "ru.oneme.app.dialogs", 378, fakePi()));
@@ -369,22 +824,15 @@ public class MaxDurabilityTest {
         assertNull(MaxChannel.getPending(context));
 
         restartFromDisk();
-        // Подтверждённый handoff сохранился — то же показание не повторяется.
         MaxSender.onReading(context, "6.7", clock.get());
         assertEquals(1, sentCommands.size());
         assertEquals(MaxChannel.Attempt.STATE_HANDED,
                 MaxChannel.getAttempt(context).state);
     }
 
-    /** Хук именно внутри commit резерва попытки (второй commit цепочки). */
-    private void hookOnReserveCommit(Runnable hook) {
-        disk.onCommit = () -> disk.onCommit = hook;
-    }
-
     @Test
     public void expiredDuringCommit_NoCommand() {
         selectPapa();
-        // Внутри commit резерва «истёк срок»: часы прыгают за TTL.
         hookOnReserveCommit(() -> clock.addAndGet(MaxChannel.PENDING_MAX_AGE_MS + 60_000));
         MaxSender.onReading(context, "6.8", clock.get());
         assertEquals(0, sentCommands.size());
@@ -393,7 +841,6 @@ public class MaxDurabilityTest {
     @Test
     public void stopDuringCommit_NoCommand() {
         selectPapa();
-        // Внутри commit резерва пришёл общий Stop.
         hookOnReserveCommit(() ->
                 prefs.edit().putBoolean("transmission_enabled", false).commit());
         MaxSender.onReading(context, "6.9", clock.get());
@@ -403,8 +850,6 @@ public class MaxDurabilityTest {
     @Test
     public void conflictDuringCommit_NoCommand() {
         selectPapa();
-        // Внутри commit резерва настоящий listener обрабатывает чужой чат
-        // с равной операцией ответа — конфликт до начала команды.
         PendingIntent savedPi = MaxState.targetButton.pendingIntent;
         hookOnReserveCommit(() -> listener.onNotificationPosted(
                 maxSbn("Мама", "ru.oneme.app.dialogs", 555, savedPi)));
@@ -422,13 +867,10 @@ public class MaxDurabilityTest {
         MaxSender.onReading(context, "7.1", clock.get());
         assertNotNull(MaxChannel.getPending(context));
 
-        // Смена цели — одна подтверждённая запись: новое поколение + снятие pending.
-        listener.onNotificationPosted(maxSbn("Мама", "ru.oneme.app.dialogs", 555, fakePi()));
-        assertTrue(MaxSender.selectCandidate(context, MaxSender.candidates().get(0)));
+        selectMama();
         assertNull(MaxChannel.getPending(context));
         long genMama = MaxChannel.getTarget(context).generation;
 
-        // «Перезапуск»: старое pending не восстанавливается и новому чату не достаётся.
         restartFromDisk();
         assertNull(MaxChannel.getPending(context));
         assertEquals(genMama, MaxChannel.getTarget(context).generation);
@@ -439,11 +881,9 @@ public class MaxDurabilityTest {
     @Test
     public void newerPendingSurvivesOldAttemptFinish() {
         selectPapa();
-        // В момент «внешней команды» первого показания на диск уже попало более
-        // новое ожидающее — завершение старой попытки удаляет только своё.
         MaxSender.sendCommandForTest = (ctx, pi, fillIn) -> {
             sentCommands.add(pi);
-            // Более новое ожидающее записано прямо на диск между send и итогом.
+            sentFillIns.add(fillIn);
             MaxStore s = MaxChannel.storeFactoryForTest.apply(context);
             s.edit().putString("pending_text", "7.2")
                     .putLong("pending_reading_ts", clock.get() + 60_000)
@@ -452,7 +892,6 @@ public class MaxDurabilityTest {
         };
         MaxSender.onReading(context, "7.1", clock.get());
         assertEquals(1, sentCommands.size());
-        // Старое pending снято, новое осталось на диске — и переживает «перезапуск».
         restartFromDisk();
         MaxChannel.Pending p = MaxChannel.getPending(context);
         assertNotNull(p);
@@ -460,53 +899,15 @@ public class MaxDurabilityTest {
     }
 
     @Test
-    public void listenerDoesNotWaitForHeldCommit() throws Exception {
-        selectPapa();
-        // Настоящий однопоточный исполнитель; commit удержан latch'ем.
-        ExecutorService real = Executors.newSingleThreadExecutor();
-        MaxSender.workerForTest = real;
-        try {
-            disk.holdStart = new CountDownLatch(1);
-            disk.holdRelease = new CountDownLatch(1);
-
-            // Показание → запись pending на рабочем потоке — удержана.
-            MaxSender.onReading(context, "7.3", clock.get());
-            assertTrue("рабочий поток вошёл в удержанную запись",
-                    disk.holdStart.await(10, TimeUnit.SECONDS));
-
-            // Слушатель передаёт событие — вызывающий поток не ждёт commit/send.
-            CountDownLatch listenerReturned = new CountDownLatch(1);
-            new Thread(() -> {
-                listener.onNotificationPosted(
-                        maxSbn("Мама", "ru.oneme.app.dialogs", 555, fakePi()));
-                listenerReturned.countDown();
-            }).start();
-            assertTrue("поток слушателя не ждёт удержанную запись",
-                    listenerReturned.await(10, TimeUnit.SECONDS));
-
-            disk.holdRelease.countDown();
-            // Все задачи worker-а завершились — состояние согласовано.
-            real.submit(() -> { }).get(10, TimeUnit.SECONDS);
-            assertEquals(1, sentCommands.size()); // показание ушло после снятия удержания
-        } finally {
-            real.shutdownNow();
-            MaxSender.workerForTest = Runnable::run;
-        }
-    }
-
-    @Test
     public void retryOfUnconfirmedWriteReallyCommits() {
         selectPapa();
-        int before = disk.commits.get();
-        // Одна отказная запись, затем хранилище «чинится» — повтор реально commit'ит.
-        disk.failCommits = true;
+        int before = env.commits.get();
+        env.failMode = 1;
         MaxSender.onReading(context, "7.4", clock.get());
         assertEquals(0, sentCommands.size());
-        // MAX_WRITE_ATTEMPTS попыток записи pending действительно прошли.
-        assertTrue(disk.commits.get() - before >= MaxChannel.MAX_WRITE_ATTEMPTS);
-        disk.failCommits = false;
-        // После восстановления хранилища новое событие работает обычно —
-        // первая же подтверждённая запись снимает storageError.
+        drainRetries();
+        assertTrue(env.commits.get() - before >= MaxChannel.MAX_WRITE_ATTEMPTS);
+        env.failMode = 0;
         MaxSender.onReading(context, "7.4", clock.get());
         assertEquals(1, sentCommands.size());
     }

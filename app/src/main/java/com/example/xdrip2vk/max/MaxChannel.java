@@ -67,10 +67,16 @@ public final class MaxChannel {
     private static final String KEY_ATTEMPT_NOTIF = "attempt_notif_id";
     private static final String KEY_ATTEMPT_READING_TS = "attempt_reading_ts";
     private static final String KEY_ATTEMPT_STATE = "attempt_state";
+    // Попытка тестового сообщения хранится отдельной записью (ключи
+    // "test_attempt_*") — независимое доказательство: запись/итог теста не
+    // перезаписывает попытку показания и не отменяет запрет его повтора.
 
-    /** Ограниченные автоматические повторы неподтверждённой записи. */
+    /**
+     * Ограниченные автоматические повторы неподтверждённой записи: число
+     * попыток ограничено, интервал нарастает (BASE * номер попытки).
+     */
     static final int MAX_WRITE_ATTEMPTS = 3;
-    static final long RETRY_DELAY_MS = 250;
+    static final long RETRY_BASE_MS = 250;
 
     private static final String TAG = "MaxChannel";
 
@@ -185,19 +191,21 @@ public final class MaxChannel {
         final String blockedBy;
         final String blockedReason;
         final Attempt attempt;
+        final Attempt testAttempt;
         final long nextGen;
         final long lastHandoffMs;
         final long lastHandoffReadingTs;
         final long lastTestHandoffMs;
 
         Snapshot(Target target, Pending pending, String blockedBy, String blockedReason,
-                 Attempt attempt, long nextGen, long lastHandoffMs,
+                 Attempt attempt, Attempt testAttempt, long nextGen, long lastHandoffMs,
                  long lastHandoffReadingTs, long lastTestHandoffMs) {
             this.target = target;
             this.pending = pending;
             this.blockedBy = blockedBy;
             this.blockedReason = blockedReason;
             this.attempt = attempt;
+            this.testAttempt = testAttempt;
             this.nextGen = nextGen;
             this.lastHandoffMs = lastHandoffMs;
             this.lastHandoffReadingTs = lastHandoffReadingTs;
@@ -230,7 +238,18 @@ public final class MaxChannel {
             synchronized (MaxChannel.class) {
                 s = confirmed;
                 if (s == null) {
-                    s = load(store(app));
+                    if (MaxState.storageError) {
+                        // Кеш хранилища мог «запачкаться» неподтверждённой
+                        // записью — в этом процессе снимку доверять нельзя;
+                        // новый handle запрет не обходит. После настоящего
+                        // перезапуска процесса флаг снят и загрузка идёт
+                        // по подтверждённому диску.
+                        s = new Snapshot(null, null, null, null, null, null,
+                                0, 0, -1, 0);
+                        Logger.w(TAG, "снимок не восстановлен — в кеше неподтверждённые данные");
+                    } else {
+                        s = load(store(app));
+                    }
                     confirmed = s;
                     if (s.attempt != null && s.attempt.state == Attempt.STATE_RESERVED) {
                         // Команда резервировалась, результата нет — процесс мог
@@ -256,27 +275,31 @@ public final class MaxChannel {
                 pText,
                 s.getLong(KEY_PENDING_TS, 0),
                 s.getLong(KEY_PENDING_GEN, -1));
-        long attemptId = s.getLong(KEY_ATTEMPT_ID, 0);
-        Attempt attempt = null;
-        if (attemptId != 0) {
-            String kind = s.getString(KEY_ATTEMPT_KIND, Attempt.KIND_READING);
-            attempt = new Attempt(attemptId, kind,
-                    s.getLong(KEY_ATTEMPT_GEN, -1),
-                    new Target(s.getString(KEY_ATTEMPT_CHAT, ""),
-                            s.getString(KEY_ATTEMPT_CHANNEL, ""),
-                            s.getInt(KEY_ATTEMPT_NOTIF, NOTIF_ID_UNKNOWN),
-                            s.getLong(KEY_ATTEMPT_GEN, -1)),
-                    s.getLong(KEY_ATTEMPT_READING_TS, 0),
-                    s.getInt(KEY_ATTEMPT_STATE, Attempt.STATE_UNKNOWN));
-        }
+        Attempt attempt = loadAttempt(s, false);
+        Attempt testAttempt = loadAttempt(s, true);
         return new Snapshot(target, pending,
                 s.getString(KEY_BLOCKED_BY, null),
                 s.getString(KEY_BLOCKED_REASON, null),
-                attempt,
+                attempt, testAttempt,
                 s.getLong(KEY_NEXT_GEN, 0),
                 s.getLong(KEY_HANDOFF_TS, 0),
                 s.getLong(KEY_HANDOFF_READING_TS, -1),
                 s.getLong(KEY_TEST_HANDOFF_TS, 0));
+    }
+
+    private static Attempt loadAttempt(MaxStore s, boolean test) {
+        String p = test ? "test_attempt_" : "attempt_";
+        long id = s.getLong(p + "id", 0);
+        if (id == 0) return null;
+        long gen = s.getLong(p + "gen", -1);
+        return new Attempt(id,
+                s.getString(p + "kind", test ? Attempt.KIND_TEST : Attempt.KIND_READING),
+                gen,
+                new Target(s.getString(p + "chat", ""),
+                        s.getString(p + "channel", ""),
+                        s.getInt(p + "notif_id", NOTIF_ID_UNKNOWN), gen),
+                s.getLong(p + "reading_ts", 0),
+                s.getInt(p + "state", Attempt.STATE_UNKNOWN));
     }
 
     // --- Подтверждённые записи ---------------------------------------------------
@@ -288,6 +311,16 @@ public final class MaxChannel {
 
         /** Новый снимок при подтверждённой записи. */
         Snapshot evolve(Snapshot current);
+
+        /**
+         * Применимость по явной версии состояния (поколение цели, время
+         * показания, id попытки, заблокировавший чат). Отложенный повтор
+         * выполняется только если состояние не ушло вперёд: устаревший повтор
+         * отменяется, а не применяется к чужому состоянию.
+         */
+        default boolean appliesTo(Snapshot current) {
+            return true;
+        }
     }
 
     /**
@@ -300,11 +333,18 @@ public final class MaxChannel {
     }
 
     private static boolean commitAttempt(Context app, Mutation m, int attemptNo) {
+        Snapshot cur = state(app);
+        if (!m.appliesTo(cur)) {
+            // Мир ушёл вперёд (новая цель/показание/попытка): применять эту
+            // мутацию поздно — повтор отменён, это не отказ хранилища.
+            Logger.w(TAG, "запись отменена как устаревшая — состояние изменилось");
+            return false;
+        }
         MaxStore s = store(app);
         MaxStore.Editor e = s.edit();
         boolean ok;
         try {
-            m.apply(s, e, state(app));
+            m.apply(s, e, cur);
             ok = e.commit();
         } catch (Throwable t) {
             ok = false;
@@ -316,11 +356,12 @@ public final class MaxChannel {
             MaxState.storageError = false;
             return true;
         }
-        // Запись не подтверждена — успехом не считается; ограниченный повтор.
+        // Запись не подтверждена — успехом не считается; повтор через
+        // нарастающий интервал проверит применимость к актуальному снимку.
         MaxState.storageError = true;
         if (attemptNo < MAX_WRITE_ATTEMPTS) {
             retryScheduler().schedule(() -> commitAttempt(app, m, attemptNo + 1),
-                    RETRY_DELAY_MS);
+                    RETRY_BASE_MS * attemptNo);
         }
         Logger.w(TAG, "запись состояния не подтверждена (commit=false)");
         return false;
@@ -334,29 +375,52 @@ public final class MaxChannel {
 
     // --- Мутации -------------------------------------------------------------------
 
-    /** Подтверждённый выбор нового чата: новое поколение, сброс pending/блокировки/попытки одной записью. */
-    static boolean confirmTarget(Context app, Target target) {
+    /**
+     * Подтверждённый выбор нового чата: поколение выделяется внутри записи
+     * (nextGen+1), сброс pending/блокировки/попытки — той же записью. Повтор
+     * применим, только если поколения не выделялись после нас: подтверждённый
+     * выбор другого чата делает отложенный повтор устаревшим.
+     */
+    static boolean confirmTarget(Context app, String chatName, String channelId,
+                                 int notificationId) {
+        final long baseNextGen = state(app).nextGen;
         return commitState(app, new Mutation() {
+            @Override public boolean appliesTo(Snapshot cur) {
+                return cur.nextGen == baseNextGen;
+            }
+
             @Override public void apply(MaxStore store, MaxStore.Editor e, Snapshot cur) {
-                e.putString(KEY_TARGET_NAME, target.chatName)
-                        .putString(KEY_TARGET_CHANNEL, target.channelId)
-                        .putInt(KEY_TARGET_NOTIF, target.notificationId)
-                        .putLong(KEY_TARGET_GEN, target.generation)
-                        .putLong(KEY_NEXT_GEN, target.generation)
+                long gen = cur.nextGen + 1;
+                e.putString(KEY_TARGET_NAME, chatName)
+                        .putString(KEY_TARGET_CHANNEL, channelId)
+                        .putInt(KEY_TARGET_NOTIF, notificationId)
+                        .putLong(KEY_TARGET_GEN, gen)
+                        .putLong(KEY_NEXT_GEN, gen)
                         .remove(KEY_PENDING_TEXT).remove(KEY_PENDING_TS).remove(KEY_PENDING_GEN)
                         .remove(KEY_BLOCKED_BY).remove(KEY_BLOCKED_REASON)
                         .remove(KEY_ATTEMPT_ID).remove(KEY_ATTEMPT_STATE);
             }
 
             @Override public Snapshot evolve(Snapshot c) {
-                return new Snapshot(target, null, null, null, null, target.generation,
-                        c.lastHandoffMs, c.lastHandoffReadingTs, c.lastTestHandoffMs);
+                long gen = c.nextGen + 1;
+                Target target = new Target(chatName, channelId, notificationId, gen);
+                return new Snapshot(target, null, null, null, null, c.testAttempt,
+                        gen, c.lastHandoffMs, c.lastHandoffReadingTs, c.lastTestHandoffMs);
             }
         });
     }
 
     static boolean confirmPending(Context app, String text, long readingTs, long gen) {
         return commitState(app, new Mutation() {
+            @Override public boolean appliesTo(Snapshot cur) {
+                // Не заменять более новое показание, не писать pending под
+                // уже сменившуюся цель и не воскрешать показание, более новое
+                // из которых уже передано.
+                if (cur.target == null || cur.target.generation != gen) return false;
+                if (readingTs <= cur.lastHandoffReadingTs) return false;
+                return cur.pending == null || cur.pending.readingTs <= readingTs;
+            }
+
             @Override public void apply(MaxStore store, MaxStore.Editor e, Snapshot cur) {
                 e.putString(KEY_PENDING_TEXT, text)
                         .putLong(KEY_PENDING_TS, readingTs)
@@ -365,22 +429,28 @@ public final class MaxChannel {
 
             @Override public Snapshot evolve(Snapshot c) {
                 return new Snapshot(c.target, new Pending(text, readingTs, gen),
-                        c.blockedBy, c.blockedReason, c.attempt, c.nextGen,
+                        c.blockedBy, c.blockedReason, c.attempt, c.testAttempt, c.nextGen,
                         c.lastHandoffMs, c.lastHandoffReadingTs, c.lastTestHandoffMs);
             }
         });
     }
 
-    /** Удаление pending безусловно (просрочен, цель сменилась). */
-    static boolean confirmClearPending(Context app) {
+    /** Удаление КОНКРЕТНОГО pending: повтор не трогает более новое показание. */
+    static boolean confirmClearPending(Context app, Pending item) {
         return commitState(app, new Mutation() {
+            @Override public boolean appliesTo(Snapshot cur) {
+                return cur.pending == null || cur.pending.readingTs == item.readingTs;
+            }
+
             @Override public void apply(MaxStore store, MaxStore.Editor e, Snapshot cur) {
                 e.remove(KEY_PENDING_TEXT).remove(KEY_PENDING_TS).remove(KEY_PENDING_GEN);
             }
 
             @Override public Snapshot evolve(Snapshot c) {
-                return new Snapshot(c.target, null, c.blockedBy, c.blockedReason,
-                        c.attempt, c.nextGen,
+                Pending pending = c.pending;
+                if (pending != null && pending.readingTs == item.readingTs) pending = null;
+                return new Snapshot(c.target, pending, c.blockedBy, c.blockedReason,
+                        c.attempt, c.testAttempt, c.nextGen,
                         c.lastHandoffMs, c.lastHandoffReadingTs, c.lastTestHandoffMs);
             }
         });
@@ -388,26 +458,40 @@ public final class MaxChannel {
 
     static boolean confirmBlocked(Context app, String reason, String chatName) {
         return commitState(app, new Mutation() {
+            @Override public boolean appliesTo(Snapshot cur) {
+                // Не перезаписывать более свежую блокировку другого чата.
+                return cur.blockedBy == null || cur.blockedBy.equals(chatName);
+            }
+
             @Override public void apply(MaxStore store, MaxStore.Editor e, Snapshot cur) {
                 e.putString(KEY_BLOCKED_BY, chatName).putString(KEY_BLOCKED_REASON, reason);
             }
 
             @Override public Snapshot evolve(Snapshot c) {
                 return new Snapshot(c.target, c.pending, chatName, reason, c.attempt,
-                        c.nextGen, c.lastHandoffMs, c.lastHandoffReadingTs, c.lastTestHandoffMs);
+                        c.testAttempt, c.nextGen, c.lastHandoffMs,
+                        c.lastHandoffReadingTs, c.lastTestHandoffMs);
             }
         });
     }
 
     static boolean confirmClearBlocked(Context app) {
+        final String expected = state(app).blockedBy;
         return commitState(app, new Mutation() {
+            @Override public boolean appliesTo(Snapshot cur) {
+                // Снимаем только ту блокировку, которую видели: новую — нет.
+                return expected == null ? cur.blockedBy == null
+                        : expected.equals(cur.blockedBy);
+            }
+
             @Override public void apply(MaxStore store, MaxStore.Editor e, Snapshot cur) {
                 e.remove(KEY_BLOCKED_BY).remove(KEY_BLOCKED_REASON);
             }
 
             @Override public Snapshot evolve(Snapshot c) {
                 return new Snapshot(c.target, c.pending, null, null, c.attempt,
-                        c.nextGen, c.lastHandoffMs, c.lastHandoffReadingTs, c.lastTestHandoffMs);
+                        c.testAttempt, c.nextGen, c.lastHandoffMs,
+                        c.lastHandoffReadingTs, c.lastTestHandoffMs);
             }
         });
     }
@@ -417,22 +501,37 @@ public final class MaxChannel {
         return commitState(app, attemptWrite(attempt));
     }
 
+    private static String attemptPrefix(Attempt a) {
+        return Attempt.KIND_TEST.equals(a.kind) ? "test_attempt_" : "attempt_";
+    }
+
     private static Mutation attemptWrite(Attempt a) {
+        final String p = attemptPrefix(a);
         return new Mutation() {
+            @Override public boolean appliesTo(Snapshot cur) {
+                // Не перезаписывать более новую попытку (результат старой не
+                // меняет состояние следующей и не возвращает старый watermark).
+                Attempt curAtt = Attempt.KIND_TEST.equals(a.kind)
+                        ? cur.testAttempt : cur.attempt;
+                return curAtt == null || curAtt.id <= a.id;
+            }
+
             @Override public void apply(MaxStore store, MaxStore.Editor e, Snapshot cur) {
-                e.putLong(KEY_ATTEMPT_ID, a.id)
-                        .putString(KEY_ATTEMPT_KIND, a.kind)
-                        .putLong(KEY_ATTEMPT_GEN, a.targetGeneration)
-                        .putString(KEY_ATTEMPT_CHAT, a.chatName)
-                        .putString(KEY_ATTEMPT_CHANNEL, a.channelId)
-                        .putInt(KEY_ATTEMPT_NOTIF, a.notificationId)
-                        .putLong(KEY_ATTEMPT_READING_TS, a.readingTs)
-                        .putInt(KEY_ATTEMPT_STATE, a.state);
+                e.putLong(p + "id", a.id)
+                        .putString(p + "kind", a.kind)
+                        .putLong(p + "gen", a.targetGeneration)
+                        .putString(p + "chat", a.chatName)
+                        .putString(p + "channel", a.channelId)
+                        .putInt(p + "notif_id", a.notificationId)
+                        .putLong(p + "reading_ts", a.readingTs)
+                        .putInt(p + "state", a.state);
             }
 
             @Override public Snapshot evolve(Snapshot c) {
                 return new Snapshot(c.target, c.pending, c.blockedBy, c.blockedReason,
-                        a, c.nextGen, c.lastHandoffMs, c.lastHandoffReadingTs,
+                        Attempt.KIND_TEST.equals(a.kind) ? c.attempt : a,
+                        Attempt.KIND_TEST.equals(a.kind) ? a : c.testAttempt,
+                        c.nextGen, c.lastHandoffMs, c.lastHandoffReadingTs,
                         c.lastTestHandoffMs);
             }
         };
@@ -450,9 +549,15 @@ public final class MaxChannel {
      */
     static boolean confirmHanded(Context app, Attempt handed, Pending sentItem,
                                  boolean isReading, long nowMs) {
+        final String p = attemptPrefix(handed);
         return commitState(app, new Mutation() {
+            @Override public boolean appliesTo(Snapshot cur) {
+                Attempt curAtt = isReading ? cur.attempt : cur.testAttempt;
+                return curAtt == null || curAtt.id <= handed.id;
+            }
+
             @Override public void apply(MaxStore store, MaxStore.Editor e, Snapshot cur) {
-                e.putInt(KEY_ATTEMPT_STATE, handed.state);
+                e.putInt(p + "state", handed.state);
                 if (isReading) {
                     e.putLong(KEY_HANDOFF_TS, nowMs)
                             .putLong(KEY_HANDOFF_READING_TS, sentItem.readingTs);
@@ -477,7 +582,9 @@ public final class MaxChannel {
                     pending = null;
                 }
                 return new Snapshot(c.target, pending, c.blockedBy, c.blockedReason,
-                        handed, c.nextGen,
+                        isReading ? handed : c.attempt,
+                        isReading ? c.testAttempt : handed,
+                        c.nextGen,
                         isReading ? nowMs : c.lastHandoffMs,
                         isReading ? sentItem.readingTs : c.lastHandoffReadingTs,
                         isReading ? c.lastTestHandoffMs : nowMs);
@@ -499,6 +606,10 @@ public final class MaxChannel {
         return state(context.getApplicationContext()).attempt;
     }
 
+    public static Attempt getTestAttempt(Context context) {
+        return state(context.getApplicationContext()).testAttempt;
+    }
+
     public static String getBlockedBy(Context context) {
         return state(context.getApplicationContext()).blockedBy;
     }
@@ -515,10 +626,7 @@ public final class MaxChannel {
         return state(context.getApplicationContext()).lastHandoffReadingTs;
     }
 
-    /** Следующее поколение для подтверждённого выбора адресата. */
-    static long nextGeneration(Context app) {
-        return state(app).nextGen + 1;
-    }
+    /** Следующее поколение выделяется внутри confirmTarget — снаружи не используется. */
 
     // --- Переключатели каналов -------------------------------------------------
 

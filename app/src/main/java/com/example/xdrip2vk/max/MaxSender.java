@@ -66,6 +66,24 @@ public final class MaxSender {
 
     private static volatile ScheduledExecutorService worker;
 
+    /**
+     * Версия входящих событий: каждое переданное владельцу состояние событие
+     * (уведомление, показание, выбор чата, подключение слушателя) наращивает
+     * счётчик на вызывающем потоке — до постановки в очередь исполнителя.
+     * Отправка фиксирует версию в начале и перед внешней командой проверяет,
+     * нет ли в очереди НЕОБРАБОТАННОГО события, способного изменить решение.
+     */
+    private static final java.util.concurrent.atomic.AtomicLong inboundSeq =
+            new java.util.concurrent.atomic.AtomicLong();
+    /** Сколько входящих событий очередь уже обработала (по версии на момент постановки). */
+    private static final java.util.concurrent.atomic.AtomicLong processedSeq =
+            new java.util.concurrent.atomic.AtomicLong();
+
+    /** Вызов на потоке источника события, до dispatch. */
+    static void notifyInboundEvent() {
+        inboundSeq.incrementAndGet();
+    }
+
     private MaxSender() { }
 
     private static long now() {
@@ -108,7 +126,16 @@ public final class MaxSender {
 
     /** Событие для владельца состояния — без ожидания на вызывающем потоке. */
     static void dispatch(Runnable task) {
-        worker().execute(task);
+        // Версия очереди на момент постановки: после выполнения задачи всё,
+        // что поступило ДО неё, считается обработанным (очередь однопоточная).
+        final long seq = inboundSeq.get();
+        worker().execute(() -> {
+            try {
+                task.run();
+            } finally {
+                processedSeq.accumulateAndGet(seq, Math::max);
+            }
+        });
     }
 
     /** Отложенная задача на рабочем исполнителе (повторы записей). */
@@ -171,6 +198,7 @@ public final class MaxSender {
     public static void selectCandidateAsync(Context context, Candidate candidate,
                                             Consumer<Boolean> resultOnMain) {
         Context app = context.getApplicationContext();
+        notifyInboundEvent();
         dispatch(() -> {
             boolean ok = selectCandidateNow(app, candidate);
             new Handler(Looper.getMainLooper()).post(() -> resultOnMain.accept(ok));
@@ -196,10 +224,8 @@ public final class MaxSender {
             return false;
         }
         synchronized (MaxSender.class) {
-            MaxChannel.Target target = new MaxChannel.Target(
-                    candidate.button.chatName, candidate.button.channelId,
-                    candidate.button.notificationId, MaxChannel.nextGeneration(app));
-            if (!MaxChannel.confirmTarget(app, target)) {
+            if (!MaxChannel.confirmTarget(app, candidate.button.chatName,
+                    candidate.button.channelId, candidate.button.notificationId)) {
                 Logger.w(TAG, "выбор чата не подтверждён записью — цель не меняется");
                 return false;
             }
@@ -259,6 +285,7 @@ public final class MaxSender {
 
     /** Событие «уведомление MAX с кнопкой» — слушатель не ждёт диск и send. */
     public static void dispatchNotification(Context app, MaxReplyButton button, String chatName) {
+        notifyInboundEvent();
         dispatch(() -> onChatNotification(app, button, chatName));
     }
 
@@ -268,6 +295,7 @@ public final class MaxSender {
      */
     public static void onReading(Context context, String text, long readingTs) {
         Context app = context.getApplicationContext();
+        notifyInboundEvent();
         dispatch(() -> onReadingNow(app, text, readingTs));
     }
 
@@ -312,7 +340,7 @@ public final class MaxSender {
             // Pending живёт только в поколении своей цели и в сроке 15 минут.
             if (snap.target == null || pending.targetGeneration != snap.target.generation
                     || now() - pending.readingTs > MaxChannel.PENDING_MAX_AGE_MS) {
-                MaxChannel.confirmClearPending(app);
+                MaxChannel.confirmClearPending(app, pending);
                 Logger.i(TAG, "отложенное показание неактуально — снято");
                 return;
             }
@@ -364,10 +392,11 @@ public final class MaxSender {
      * команду; отказ записи итога после send — не повод для повтора.
      */
     private static boolean trySend(Context app, MaxChannel.Pending item, boolean isReading) {
+        final long inboundAtStart = inboundSeq.get();
         MaxChannel.Snapshot snap = MaxChannel.state(app);
         MaxChannel.Target wanted = snap.target;
         if (wanted == null) {
-            if (isReading) MaxChannel.confirmClearPending(app);
+            if (isReading) MaxChannel.confirmClearPending(app, item);
             return false;
         }
         if (!MaxChannel.isMaxEnabled(app)) return false;
@@ -392,13 +421,13 @@ public final class MaxSender {
         }
         // Pending чужого поколения новому адресату не достаётся.
         if (isReading && item.targetGeneration != wanted.generation) {
-            MaxChannel.confirmClearPending(app);
+            MaxChannel.confirmClearPending(app, item);
             Logger.i(TAG, "ожидающее показание относится к прежнему адресату — снято");
             return false;
         }
         // Не повторять команду с неопределённым или подтверждённым исходом:
         // попытка покрывает это показание — повтор возможен только после FAILED.
-        MaxChannel.Attempt covering = coveringAttempt(snap.attempt, item, isReading);
+        MaxChannel.Attempt covering = coveringAttempt(snap, item, isReading);
         if (covering != null) {
             Logger.w(TAG, "не отправлено: исход предыдущей передачи этого показания неизвестен");
             return false;
@@ -420,7 +449,7 @@ public final class MaxSender {
             return false;
         }
         if (isReading && now() - item.readingTs > MaxChannel.PENDING_MAX_AGE_MS) {
-            MaxChannel.confirmClearPending(app);
+            MaxChannel.confirmClearPending(app, item);
             Logger.i(TAG, "показание устарело — не отправляю");
             return false;
         }
@@ -462,6 +491,17 @@ public final class MaxSender {
         if (!stillSendable(app, wanted, item, isReading)) {
             Logger.w(TAG, "не отправлено: адресат/разрешения изменились перед командой");
             markAborted(app, attempt);
+            return false;
+        }
+        if (inboundSeq.get() > inboundAtStart && processedSeq.get() < inboundSeq.get()) {
+            // После начала отправки поступило событие, которое ещё стоит в
+            // очереди исполнителя и способно изменить решение (конфликт, новая
+            // цель, новое показание). Команда не вызывается: после обработки
+            // очереди ожидающее показание пройдёт заново по обычному пути.
+            // События, уже отработанные к этой точке, учтены в снимке выше.
+            Logger.w(TAG, "не отправлено: есть необработанное событие — отправка после очереди");
+            markAborted(app, attempt);
+            if (isReading) dispatch(() -> onButtonCapturedNow(app));
             return false;
         }
 
@@ -521,7 +561,10 @@ public final class MaxSender {
      * запрещён. FAILED (MAX отменил кнопку — не ушла) повтор разрешает.
      */
     private static MaxChannel.Attempt coveringAttempt(
-            MaxChannel.Attempt attempt, MaxChannel.Pending item, boolean isReading) {
+            MaxChannel.Snapshot snap, MaxChannel.Pending item, boolean isReading) {
+        // Запрет повтора показания доказывается попыткой показания — запись
+        // теста хранится отдельно и это доказательство не перезаписывает.
+        MaxChannel.Attempt attempt = isReading ? snap.attempt : snap.testAttempt;
         if (attempt == null || attempt.state == MaxChannel.Attempt.STATE_FAILED) {
             return null;
         }
@@ -548,8 +591,18 @@ public final class MaxSender {
                 || s.target.generation != wanted.generation) {
             return false;
         }
-        if (isReading && now() - item.readingTs > MaxChannel.PENDING_MAX_AGE_MS) {
-            return false;
+        if (isReading) {
+            // Отправляем только то показание, которое сейчас подтверждено как
+            // ожидающее — заменённое/снятое pending команду не вызывает.
+            MaxChannel.Pending cur = s.pending;
+            if (cur == null || cur.readingTs != item.readingTs
+                    || !cur.text.equals(item.text)
+                    || cur.targetGeneration != item.targetGeneration) {
+                return false;
+            }
+            if (now() - item.readingTs > MaxChannel.PENDING_MAX_AGE_MS) {
+                return false;
+            }
         }
         MaxReplyButton current = currentButton(app);
         return current != null && MaxChannel.matches(wanted, current);

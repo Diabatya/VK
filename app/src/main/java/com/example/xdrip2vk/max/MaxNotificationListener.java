@@ -25,6 +25,8 @@ public class MaxNotificationListener extends NotificationListenerService {
 
     @Override
     public void onListenerConnected() {
+        // Флаги ставятся синхронно на этом потоке — отдельного события в
+        // очередь не требуется: ревалидация перед командой читает их напрямую.
         MaxState.listenerConnected = true;
         // После (пере)подключения восстанавливаем кандидатов из активных уведомлений.
         StatusBarNotification[] active;
