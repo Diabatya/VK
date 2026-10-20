@@ -66,6 +66,19 @@ public final class MaxSender {
      * PendingIntent.send.
      */
     public static volatile Runnable beforeCommandHookForTest;
+
+    /**
+     * Тестовый барьер между выдачей номера входящему событию и постановкой его
+     * задачи в очередь — внутри enqueueLock. Только для тестов.
+     */
+    public static volatile Runnable enqueueBarrierForTest;
+
+    /**
+     * Тестовый хук в точке отсрочки отправки (перед постановкой продолжения) —
+     * позволяет доказать, что продолжение ставится, пока событие ещё не в
+     * очереди. Только для тестов.
+     */
+    public static volatile Runnable deferralHookForTest;
     /**
      * Подмена рабочего исполнителя в тестах (прямое исполнение — синхронные
      * утверждения). null — реальный однопоточный исполнитель процесса.
@@ -135,11 +148,16 @@ public final class MaxSender {
 
     /**
      * Внутренняя задача (не входящее событие): выполняется с версией текущей
-     * очереди. Не подтверждает обработку событий, поставленных позже неё.
+     * очереди. Чтение версии и постановка — под тем же enqueueLock, что и у
+     * входящих событий: продолжение не может «вклиниться» между выдачей номера
+     * событию и постановкой его задачи — иначе оно обогнало бы событие,
+     * обязанное быть обработанным до внешней команды. В критической секции
+     * нет ожиданий: только чтение счётчика и execute.
      */
     static void dispatch(SequencedTask task) {
-        final long seq = inboundSeq.get();
-        enqueue(seq, task);
+        synchronized (enqueueLock) {
+            enqueue(inboundSeq.get(), task);
+        }
     }
 
     /**
@@ -149,7 +167,11 @@ public final class MaxSender {
      */
     static void dispatchEvent(SequencedTask task) {
         synchronized (enqueueLock) {
-            enqueue(inboundSeq.incrementAndGet(), task);
+            long seq = inboundSeq.incrementAndGet();
+            // Тестовая точка разрыва «номер выдан — задача ещё не поставлена».
+            Runnable barrier = enqueueBarrierForTest;
+            if (barrier != null) barrier.run();
+            enqueue(seq, task);
         }
     }
 
@@ -535,6 +557,8 @@ public final class MaxSender {
             // обработано» быть не может.
             Logger.w(TAG, "не отправлено: есть необработанное событие — отправка после очереди");
             markAborted(app, attempt);
+            Runnable dh = deferralHookForTest;
+            if (dh != null) dh.run();
             if (isReading) dispatch(seq -> onButtonCapturedNow(app, seq));
             return false;
         }

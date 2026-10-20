@@ -209,6 +209,8 @@ public class MaxDurabilityTest {
         MaxSender.creatorPackageForTest = null;
         MaxSender.clockForTest = null;
         MaxSender.beforeCommandHookForTest = null;
+        MaxSender.enqueueBarrierForTest = null;
+        MaxSender.deferralHookForTest = null;
         MaxSender.workerForTest = null;
         MaxChannel.retrySchedulerForTest = null;
         MaxChannel.storeFactoryForTest = null;
@@ -1091,6 +1093,78 @@ public class MaxDurabilityTest {
             }
 
             assertEquals("команда не вызвана — конфликт обработан до неё",
+                    0, sentCommands.size());
+            assertEquals(MaxChannel.BLOCKED_CONFLICT,
+                    MaxChannel.getBlockedReason(context));
+            assertNotNull("ожидающее показание сохранено",
+                    MaxChannel.getPending(context));
+        } finally {
+            real.shutdownNow();
+            MaxSender.workerForTest = Runnable::run;
+        }
+    }
+
+    @Test
+    public void continuationCannotOvertakeUnpostedConflict() throws Exception {
+        // Двухпоточный детерминированный сценарий: конфликтному событию УЖЕ
+        // выдан номер, но его задача ещё НЕ поставлена (барьер внутри
+        // enqueueLock). Отправка доходит до отсрочки и ставит продолжение —
+        // оно обязано встать в очередь ПОЗАДИ конфликта и не обогнать его.
+        ExecutorService real = Executors.newSingleThreadExecutor();
+        MaxSender.workerForTest = real;
+        try {
+            Intent op = new Intent("com.example.xdrip2vk.test.O_OP");
+            PendingIntent piA = PendingIntent.getBroadcast(context, 93, op,
+                    PendingIntent.FLAG_IMMUTABLE);
+            PendingIntent piB = equalWrapper(piA, op);
+
+            listener.onNotificationPosted(
+                    maxSbn("Папа", "ru.oneme.app.dialogs", 378, piA));
+            real.submit(() -> { }).get(10, TimeUnit.SECONDS);
+            assertTrue(MaxSender.selectCandidate(context,
+                    MaxSender.candidates().get(0)));
+
+            // Удерживаем commit резерва: показание будет внутри trySend.
+            env.holdOnCommit = env.commits.get() + 2;
+            env.holdStart = new CountDownLatch(1);
+            env.holdRelease = new CountDownLatch(1);
+            MaxSender.onReading(context, "7.4", clock.get());
+            assertTrue("worker удержан в commit резерва",
+                    env.holdStart.await(10, TimeUnit.SECONDS));
+
+            // Слушатель получает конфликт: номер присвоен, задача в очередь
+            // ещё не поставлена — барьер держит поток внутри enqueueLock.
+            CountDownLatch seqAssigned = new CountDownLatch(1);
+            CountDownLatch allowEnqueue = new CountDownLatch(1);
+            CountDownLatch deferred = new CountDownLatch(1);
+            MaxSender.enqueueBarrierForTest = () -> {
+                seqAssigned.countDown();
+                try {
+                    allowEnqueue.await(15, TimeUnit.SECONDS);
+                } catch (InterruptedException e) {
+                    Thread.currentThread().interrupt();
+                }
+            };
+            MaxSender.deferralHookForTest = deferred::countDown;
+            new Thread(() -> listener.onNotificationPosted(
+                    maxSbn("Мама", "ru.oneme.app.dialogs", 555, piB))).start();
+            assertTrue("номер конфликта выдан, задача ещё не в очереди",
+                    seqAssigned.await(10, TimeUnit.SECONDS));
+
+            // Освобождаем commit: worker доходит до точки отсрочки, пока
+            // задача конфликта ещё не поставлена.
+            env.holdRelease.countDown();
+            assertTrue("отправка дошла до отсрочки при непоставленном конфликте",
+                    deferred.await(10, TimeUnit.SECONDS));
+
+            // Теперь событию разрешено встать в очередь; продолжение ставится
+            // после него (enqueueLock сериализует «номер+постановку»).
+            allowEnqueue.countDown();
+            for (int i = 0; i < 4; i++) {
+                real.submit(() -> { }).get(10, TimeUnit.SECONDS);
+            }
+
+            assertEquals("внешняя команда не выполнена раньше конфликта",
                     0, sentCommands.size());
             assertEquals(MaxChannel.BLOCKED_CONFLICT,
                     MaxChannel.getBlockedReason(context));
