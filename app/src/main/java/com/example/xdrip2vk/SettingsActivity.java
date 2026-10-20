@@ -235,6 +235,59 @@ public class SettingsActivity extends AppCompatActivity {
                 });
             }
 
+            // --- Канал MAX ------------------------------------------------------
+
+            Preference maxAccess = findPreference("max_notif_access");
+            if (maxAccess != null) {
+                maxAccess.setSummaryProvider(preference ->
+                        com.example.xdrip2vk.max.MaxSender.listenerAccessGranted(getContext())
+                                ? "Доступ есть — приложение видит уведомления MAX"
+                                : "Нет доступа — нажмите и разрешите xDrip2VK читать уведомления");
+                maxAccess.setOnPreferenceClickListener(preference -> {
+                    startActivity(new Intent(
+                            android.provider.Settings.ACTION_NOTIFICATION_LISTENER_SETTINGS));
+                    return true;
+                });
+            }
+
+            Preference maxSelect = findPreference("max_select_chat");
+            if (maxSelect != null) {
+                maxSelect.setSummaryProvider(preference -> {
+                    com.example.xdrip2vk.max.MaxChannel.Target t =
+                            com.example.xdrip2vk.max.MaxChannel.getTarget(getContext());
+                    return t != null ? "Выбран: «" + t.chatName + "»"
+                            : "Не выбран. Нужно сообщение из чата MAX";
+                });
+                maxSelect.setOnPreferenceClickListener(preference -> {
+                    showMaxChatDialog();
+                    return true;
+                });
+            }
+
+            Preference maxStatus = findPreference("max_status");
+            if (maxStatus != null) {
+                maxStatus.setSummaryProvider(preference ->
+                        com.example.xdrip2vk.max.MaxSender.statusText(getContext()));
+            }
+
+            Preference maxTest = findPreference("max_test");
+            if (maxTest != null) {
+                maxTest.setOnPreferenceClickListener(preference -> {
+                    // Отправка команды — вне главного потока; результат — Toast.
+                    new Thread(() -> {
+                        android.content.Context ctx = getContext();
+                        if (ctx == null) return;
+                        String result = com.example.xdrip2vk.max.MaxSender.sendTest(ctx);
+                        mainHandler.post(() -> {
+                            if (isAdded() && getContext() != null) {
+                                Toast.makeText(getContext(), result, Toast.LENGTH_LONG).show();
+                            }
+                        });
+                    }).start();
+                    return true;
+                });
+            }
+
             // Подтверждённое состояние приходит с фона — экран обновляется,
             // если ещё жив; поздний callback уничтоженный экран не трогает.
             creds.resolveOnMain(s -> {
@@ -376,6 +429,69 @@ public class SettingsActivity extends AppCompatActivity {
                             : "Нажмите для выбора беседы для тревожных сообщений";
                 });
             }
+        }
+
+        /**
+         * Выбор чата MAX из уведомлений, пришедших с кнопкой «Ответить».
+         * Список пуст — адресата изобрести нельзя: только явный выбор.
+         */
+        private void showMaxChatDialog() {
+            android.content.Context ctx = requireContext();
+            java.util.List<String> labels =
+                    com.example.xdrip2vk.max.MaxSender.candidateLabels();
+            if (labels.isEmpty()) {
+                new androidx.appcompat.app.AlertDialog.Builder(ctx)
+                        .setTitle("Чат MAX")
+                        .setMessage("Пока нет уведомлений MAX с кнопкой «Ответить». "
+                                + "Напишите любое сообщение из нужного чата MAX — "
+                                + "чат появится в этом списке.")
+                        .setPositiveButton("Понятно", null)
+                        .show();
+                return;
+            }
+            CharSequence[] items = labels.toArray(new CharSequence[0]);
+            new androidx.appcompat.app.AlertDialog.Builder(ctx)
+                    .setTitle("Выберите чат MAX")
+                    .setItems(items, (dialog, which) -> {
+                        if (com.example.xdrip2vk.max.MaxSender.selectCandidate(ctx, which)) {
+                            Toast.makeText(ctx, "Выбран чат: "
+                                            + items[which], Toast.LENGTH_LONG).show();
+                            refreshMaxSummaries();
+                        }
+                    })
+                    .setNegativeButton("Отмена", null)
+                    .show();
+        }
+
+        /** Подсказки блока MAX при возврате на экран (в т.ч. из системных настроек). */
+        private void refreshMaxSummaries() {
+            Preference maxAccess = findPreference("max_notif_access");
+            if (maxAccess != null) {
+                maxAccess.setSummaryProvider(p ->
+                        com.example.xdrip2vk.max.MaxSender.listenerAccessGranted(getContext())
+                                ? "Доступ есть — приложение видит уведомления MAX"
+                                : "Нет доступа — нажмите и разрешите xDrip2VK читать уведомления");
+            }
+            Preference maxSelect = findPreference("max_select_chat");
+            if (maxSelect != null) {
+                maxSelect.setSummaryProvider(p -> {
+                    com.example.xdrip2vk.max.MaxChannel.Target t =
+                            com.example.xdrip2vk.max.MaxChannel.getTarget(getContext());
+                    return t != null ? "Выбран: «" + t.chatName + "»"
+                            : "Не выбран. Нужно сообщение из чата MAX";
+                });
+            }
+            Preference maxStatus = findPreference("max_status");
+            if (maxStatus != null) {
+                maxStatus.setSummaryProvider(p ->
+                        com.example.xdrip2vk.max.MaxSender.statusText(getContext()));
+            }
+        }
+
+        @Override
+        public void onResume() {
+            super.onResume();
+            refreshMaxSummaries();
         }
 
         void onTokenFileSelected(Uri uri) { // package-private — проверка пути импорта в тестах
