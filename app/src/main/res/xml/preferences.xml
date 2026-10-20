@@ -139,4 +139,12 @@
         android:defaultValue="false"
         app:isPreferenceVisible="true" />
 
+    <!-- О приложении -->
+    <Preference
+        android:key="about_app"
+        android:title="О приложении"
+        android:summary="xDrip to VK · © 2026 Diabatya · GPL-3.0-only. Канал MAX адаптирован из bg2max (GPL-3.0): https://github.com/s-beaver/bg2max. Разработка — Diabatya с использованием ИИ-инструментов."
+        android:selectable="false"
+        app:isPreferenceVisible="true" />
+
 </PreferenceScreen>

@@ -1,3 +1,11 @@
+/*
+ * xDrip to VK — канал отправки в MAX. Copyright © 2026 Diabatya.
+ * GPL-3.0-only — см. LICENSE в корне репозитория.
+ *
+ * Реализовано по подходу и с адаптацией элементов проекта bg2max
+ * (GPL-3.0, https://github.com/s-beaver/bg2max, reply-флейвор).
+ * Перечень адаптаций и изменений — THIRD_PARTY_NOTICES.md.
+ */
 package com.example.xdrip2vk.max;
 
 import java.util.ArrayList;
