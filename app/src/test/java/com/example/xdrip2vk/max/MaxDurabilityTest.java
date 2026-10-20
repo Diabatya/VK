@@ -130,8 +130,12 @@ public class MaxDurabilityTest {
                     }
                     if (env.failMode == 1) return false;
                     if (env.failMode == 2) throw new RuntimeException("commit failed");
-                    env.disk.putAll(puts);
-                    for (String k : removes) env.disk.remove(k);
+                    // Android SharedPreferences.commit() сохраняет ВСЮ карту
+                    // памяти файла, а не только правки этого Editor — диск
+                    // становится снимком кеша (включая данные прошлых
+                    // неподтверждённых записей, если они остались в кеше).
+                    env.disk.clear();
+                    env.disk.putAll(env.cache);
                     return true;
                 }
             };
@@ -884,11 +888,10 @@ public class MaxDurabilityTest {
         MaxSender.sendCommandForTest = (ctx, pi, fillIn) -> {
             sentCommands.add(pi);
             sentFillIns.add(fillIn);
-            MaxStore s = MaxChannel.storeFactoryForTest.apply(context);
-            s.edit().putString("pending_text", "7.2")
-                    .putLong("pending_reading_ts", clock.get() + 60_000)
-                    .putLong("pending_gen", MaxChannel.getTarget(context).generation)
-                    .commit();
+            // Новое pending приходит через владельца состояния между send и
+            // записью итога — подтверждённой записью, а не прямой правкой диска.
+            assertTrue(MaxChannel.confirmPending(context, "7.2",
+                    clock.get() + 60_000, MaxChannel.getTarget(context).generation));
         };
         MaxSender.onReading(context, "7.1", clock.get());
         assertEquals(1, sentCommands.size());
@@ -928,5 +931,225 @@ public class MaxDurabilityTest {
         MaxSender.onButtonCaptured(context);
         assertEquals(2, sentCommands.size());
         assertNull(MaxChannel.getPending(context));
+    }
+
+    // --- полная карта SharedPreferences ---------------------------------------
+
+    @Test
+    public void failedSelectNotPersistedByLaterWrite() {
+        // Цель A подтверждена. Выбор B меняет кеш, но commit=false: на диске
+        // пока A. В Android commit() пишет ВСЮ карту памяти — следующая
+        // успешная запись могла бы «привезти» грязную цель B. Полный
+        // согласованный снимок гарантирует: на диске остаётся A.
+        selectPapa();
+        long genA = MaxChannel.getTarget(context).generation;
+        listener.onNotificationPosted(maxSbn("Мама", "ru.oneme.app.dialogs", 555, fakePi()));
+        MaxSender.Candidate mama = null;
+        for (MaxSender.Candidate c : MaxSender.candidates()) {
+            if (c.chatName().equals("Мама")) mama = c;
+        }
+        assertNotNull(mama);
+
+        env.failMode = 1;
+        assertFalse(MaxSender.selectCandidate(context, mama));
+        env.failMode = 0;
+        assertEquals("кеш хранит неподтверждённый выбор",
+                "Мама", env.cache.get("target_name"));
+
+        // Успешная запись pending под A — без кнопки команда не уходит,
+        // pending остаётся для проверки согласованности после восстановления.
+        MaxState.targetButton = null;
+        MaxReplyBackup.clear(context);
+        MaxSender.onReading(context, "6.4", clock.get());
+
+        restartFromDisk();
+        assertEquals("Папа", MaxChannel.getTarget(context).chatName);
+        assertEquals("никакого несогласованного поколения",
+                genA, MaxChannel.getTarget(context).generation);
+        MaxChannel.Pending p = MaxChannel.getPending(context);
+        assertNotNull(p);
+        assertEquals("pending — того же адресата", genA, p.targetGeneration);
+    }
+
+    @Test
+    public void failedPendingNotPersistedByLaterWrite() {
+        // Отказ записи pending → успешная запись другого вида → восстановление:
+        // неподтверждённый pending на диск не «приезжает».
+        selectPapa();
+        env.failMode = 1;
+        MaxSender.onReading(context, "6.5", clock.get());
+        drainRetries();
+        assertTrue(env.cache.containsKey("pending_text"));
+        assertFalse(env.disk.containsKey("pending_text"));
+        env.failMode = 0;
+
+        assertTrue(MaxChannel.confirmBlocked(context, "x", "Чужой"));
+        restartFromDisk();
+        assertNull("неподтверждённый pending не попал на диск",
+                MaxChannel.getPending(context));
+        assertNotNull(MaxChannel.getTarget(context));
+        assertEquals("Чужой", MaxChannel.state(context).blockedBy);
+    }
+
+    @Test
+    public void failedClearNotPersistedByLaterWrite() {
+        // Отказ очистки pending → успешная запись другого вида → диск
+        // согласован со снимком: pending сохраняется, а не исчезает.
+        selectPapa();
+        MaxState.targetButton = null;
+        MaxReplyBackup.clear(context);
+        MaxSender.onReading(context, "6.6", clock.get());
+        MaxChannel.Pending p = MaxChannel.getPending(context);
+        assertNotNull(p);
+
+        env.failMode = 1;
+        assertFalse(MaxChannel.confirmClearPending(context, p));
+        assertFalse("кеш неподтверждённо «снял» pending",
+                env.cache.containsKey("pending_text"));
+        env.failMode = 0;
+
+        assertTrue(MaxChannel.confirmBlocked(context, "x", "Чужой"));
+        restartFromDisk();
+        MaxChannel.Pending restored = MaxChannel.getPending(context);
+        assertNotNull("неподтверждённое снятие не дошло до диска", restored);
+        assertEquals("6.6", restored.text);
+    }
+
+    @Test
+    public void failedResultNotPersistedByLaterWrite() {
+        // send прошёл, запись итога отказала → успешная запись другого вида
+        // пишет полный снимок: на диске RESERVED (подтверждённое), а не
+        // скрытый HANDED — после «перезапуска» исход неизвестен, повтора нет.
+        selectPapa();
+        MaxSender.sendCommandForTest = (ctx, pi, fillIn) -> {
+            sentCommands.add(pi);
+            sentFillIns.add(fillIn);
+            env.failMode = 1;
+        };
+        MaxSender.onReading(context, "6.7", clock.get());
+        assertEquals(1, sentCommands.size());
+        drainRetries();
+        env.failMode = 0;
+
+        assertTrue(MaxChannel.confirmBlocked(context, "x", "Чужой"));
+        restartFromDisk();
+        assertEquals(MaxChannel.Attempt.STATE_RESERVED,
+                MaxChannel.getAttempt(context).state);
+        assertTrue(MaxState.outcomeUnknown);
+        MaxSender.onButtonCaptured(context);
+        assertEquals(1, sentCommands.size());
+    }
+
+    // --- накопленная очередь событий на настоящем worker ------------------------
+
+    @Test
+    public void queuedConflictBehindBusyWorkerBlocksSend() throws Exception {
+        // Настоящий однопоточный worker ЗАНЯТ: показание и конфликт уже в
+        // очереди до старта обработки. Старая проверка «inboundSeq на момент
+        // trySend» этот случай пропускала — конфликт ещё не обработан, но уже
+        // учтён в счётчике. Теперь фиксируется версия события-триггера.
+        ExecutorService real = Executors.newSingleThreadExecutor();
+        MaxSender.workerForTest = real;
+        try {
+            Intent op = new Intent("com.example.xdrip2vk.test.Q_OP");
+            PendingIntent piA = PendingIntent.getBroadcast(context, 92, op,
+                    PendingIntent.FLAG_IMMUTABLE);
+            PendingIntent piB = equalWrapper(piA, op);
+
+            listener.onNotificationPosted(
+                    maxSbn("Папа", "ru.oneme.app.dialogs", 378, piA));
+            real.submit(() -> { }).get(10, TimeUnit.SECONDS);
+            assertTrue(MaxSender.selectCandidate(context,
+                    MaxSender.candidates().get(0)));
+
+            // Worker занят удерживаемой задачей — оба события встанут позади.
+            CountDownLatch busy = new CountDownLatch(1);
+            CountDownLatch release = new CountDownLatch(1);
+            real.execute(() -> {
+                busy.countDown();
+                try {
+                    release.await(10, TimeUnit.SECONDS);
+                } catch (InterruptedException e) {
+                    Thread.currentThread().interrupt();
+                }
+            });
+            assertTrue(busy.await(10, TimeUnit.SECONDS));
+
+            MaxSender.onReading(context, "7.2", clock.get());
+            CountDownLatch listenerReturned = new CountDownLatch(1);
+            new Thread(() -> {
+                listener.onNotificationPosted(
+                        maxSbn("Мама", "ru.oneme.app.dialogs", 555, piB));
+                listenerReturned.countDown();
+            }).start();
+            assertTrue("listener вернулся без ожидания",
+                    listenerReturned.await(10, TimeUnit.SECONDS));
+
+            release.countDown();
+            for (int i = 0; i < 4; i++) { // показание → конфликт → flush-цепочка
+                real.submit(() -> { }).get(10, TimeUnit.SECONDS);
+            }
+
+            assertEquals("команда не вызвана — конфликт обработан до неё",
+                    0, sentCommands.size());
+            assertEquals(MaxChannel.BLOCKED_CONFLICT,
+                    MaxChannel.getBlockedReason(context));
+            assertNotNull("ожидающее показание сохранено",
+                    MaxChannel.getPending(context));
+        } finally {
+            real.shutdownNow();
+            MaxSender.workerForTest = Runnable::run;
+        }
+    }
+
+    // --- полная идентичность отложенных операций --------------------------------
+
+    @Test
+    public void staleClearRetryKeepsPendingOfNewTarget() {
+        // Очистка pending A отказала → выбор B → pending B с ТЕМ ЖЕ временем
+        // показания → устаревший повтор очистки не удаляет pending B:
+        // идентичность — поколение цели + время + текст, а не только время.
+        selectPapa();
+        long genA = MaxChannel.getTarget(context).generation;
+        assertTrue(MaxChannel.confirmPending(context, "6.8", 111L, genA));
+        MaxChannel.Pending pA = MaxChannel.getPending(context);
+
+        env.failMode = 1;
+        assertFalse(MaxChannel.confirmClearPending(context, pA));
+        env.failMode = 0;
+
+        selectMama();
+        long genB = MaxChannel.getTarget(context).generation;
+        assertTrue(MaxChannel.confirmPending(context, "6.8", 111L, genB));
+
+        drainRetries();
+        MaxChannel.Pending p = MaxChannel.getPending(context);
+        assertNotNull("pending нового адресата не удалён устаревшим повтором", p);
+        assertEquals(genB, p.targetGeneration);
+    }
+
+    @Test
+    public void attemptIdsGrowAcrossSameMsAndClockBack() {
+        // id попытки не зависит от уникальности времени: две попытки в одну
+        // миллисекунду и перевод часов назад дают строго возрастающие id —
+        // устаревший результат по appliesTo новую попытку не меняет.
+        selectPapa();
+        long t0 = clock.get();
+        MaxSender.sendCommandForTest = (ctx, pi, fillIn) -> {
+            throw new RuntimeException("исход неизвестен");
+        };
+
+        MaxSender.onReading(context, "6.9", t0);
+        long id1 = MaxChannel.getAttempt(context).id;
+        assertTrue(id1 > 0);
+
+        MaxSender.onReading(context, "7.0", t0 + 60_000); // та же миллисекунда now()
+        long id2 = MaxChannel.getAttempt(context).id;
+        assertTrue("id монотонен в ту же миллисекунду", id2 > id1);
+
+        clock.addAndGet(-120_000); // часы назад
+        MaxSender.onReading(context, "7.1", t0 + 120_000);
+        long id3 = MaxChannel.getAttempt(context).id;
+        assertTrue("перевод часов назад не ломает порядок id", id3 > id2);
     }
 }

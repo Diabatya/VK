@@ -304,16 +304,20 @@ public final class MaxChannel {
 
     // --- Подтверждённые записи ---------------------------------------------------
 
-    /** Одна подтверждаемая запись: правки на диск + обновление снимка при успехе. */
+    /**
+     * Одна подтверждаемая запись: от текущего снимка к следующему.
+     * На диск всегда уходит ПОЛНЫЙ согласованный снимок всех ключей MAX —
+     * SharedPreferences сохраняет всю карту памяти, поэтому частичная запись
+     * могла бы «привезти» с собой грязные данные прошлого неподтверждённого
+     * commit. Полная запись гарантирует: что в снимке confirmed, то и на диске.
+     * Посторонние ключи файла не трогаются — пишутся только наши.
+     */
     interface Mutation {
-        /** store доступен для условных чтений текущего дискового состояния. */
-        void apply(MaxStore store, MaxStore.Editor e, Snapshot current);
-
         /** Новый снимок при подтверждённой записи. */
         Snapshot evolve(Snapshot current);
 
         /**
-         * Применимость по явной версии состояния (поколение цели, время
+         * Применимость по явной версии состояния (поколение цели, время и текст
          * показания, id попытки, заблокировавший чат). Отложенный повтор
          * выполняется только если состояние не ушло вперёд: устаревший повтор
          * отменяется, а не применяется к чужому состоянию.
@@ -340,20 +344,35 @@ public final class MaxChannel {
             Logger.w(TAG, "запись отменена как устаревшая — состояние изменилось");
             return false;
         }
+        Snapshot next = m.evolve(cur);
         MaxStore s = store(app);
         MaxStore.Editor e = s.edit();
         boolean ok;
         try {
-            m.apply(s, e, cur);
+            writeSnapshot(e, next);
             ok = e.commit();
         } catch (Throwable t) {
             ok = false;
         }
         if (ok) {
+            boolean resync;
             synchronized (MaxSender.class) {
-                confirmed = m.evolve(confirmed);
+                Snapshot latest = confirmed;
+                if (latest != cur) {
+                    // Внутри commit (реентерабельная граница — тестовые хуки;
+                    // в проде все мутации сериализованы на worker) состояние
+                    // сдвинулось: итог вычисляется поверх СВЕЖЕГО снимка, а не
+                    // возвращает его назад. Затем диск доводится до
+                    // согласованного снимка отдельной полной записью.
+                    confirmed = m.appliesTo(latest) ? m.evolve(latest) : latest;
+                    resync = true;
+                } else {
+                    confirmed = next;
+                    resync = false;
+                }
             }
             MaxState.storageError = false;
+            if (resync) commitAttempt(app, RESYNC, 1);
             return true;
         }
         // Запись не подтверждена — успехом не считается; повтор через
@@ -366,6 +385,54 @@ public final class MaxChannel {
         Logger.w(TAG, "запись состояния не подтверждена (commit=false)");
         return false;
     }
+
+    /** Полный согласованный снимок всех принадлежащих MAX ключей. */
+    private static void writeSnapshot(MaxStore.Editor e, Snapshot s) {
+        putOrRemove(e, KEY_TARGET_NAME, s.target == null ? null : s.target.chatName);
+        putOrRemove(e, KEY_TARGET_CHANNEL, s.target == null ? null : s.target.channelId);
+        e.putInt(KEY_TARGET_NOTIF, s.target == null ? NOTIF_ID_UNKNOWN : s.target.notificationId);
+        e.putLong(KEY_TARGET_GEN, s.target == null ? 0 : s.target.generation);
+        e.putLong(KEY_NEXT_GEN, s.nextGen);
+        putOrRemove(e, KEY_BLOCKED_BY, s.blockedBy);
+        putOrRemove(e, KEY_BLOCKED_REASON, s.blockedReason);
+        putOrRemove(e, KEY_PENDING_TEXT, s.pending == null ? null : s.pending.text);
+        e.putLong(KEY_PENDING_TS, s.pending == null ? 0 : s.pending.readingTs);
+        e.putLong(KEY_PENDING_GEN, s.pending == null ? -1 : s.pending.targetGeneration);
+        e.putLong(KEY_HANDOFF_TS, s.lastHandoffMs);
+        e.putLong(KEY_HANDOFF_READING_TS, s.lastHandoffReadingTs);
+        e.putLong(KEY_TEST_HANDOFF_TS, s.lastTestHandoffMs);
+        writeAttempt(e, "attempt_", s.attempt);
+        writeAttempt(e, "test_attempt_", s.testAttempt);
+    }
+
+    private static void writeAttempt(MaxStore.Editor e, String p, Attempt a) {
+        if (a == null) {
+            e.remove(p + "id").remove(p + "kind").remove(p + "gen")
+                    .remove(p + "chat").remove(p + "channel").remove(p + "notif_id")
+                    .remove(p + "reading_ts").remove(p + "state");
+            return;
+        }
+        e.putLong(p + "id", a.id)
+                .putString(p + "kind", a.kind)
+                .putLong(p + "gen", a.targetGeneration)
+                .putString(p + "chat", a.chatName)
+                .putString(p + "channel", a.channelId)
+                .putInt(p + "notif_id", a.notificationId)
+                .putLong(p + "reading_ts", a.readingTs)
+                .putInt(p + "state", a.state);
+    }
+
+    private static void putOrRemove(MaxStore.Editor e, String key, String value) {
+        if (value == null) e.remove(key);
+        else e.putString(key, value);
+    }
+
+    /** Доведение диска до текущего confirmed-снимка после сдвига внутри commit. */
+    private static final Mutation RESYNC = new Mutation() {
+        @Override public Snapshot evolve(Snapshot cur) {
+            return cur;
+        }
+    };
 
     private static RetryScheduler retryScheduler() {
         RetryScheduler r = retrySchedulerForTest;
@@ -389,18 +456,6 @@ public final class MaxChannel {
                 return cur.nextGen == baseNextGen;
             }
 
-            @Override public void apply(MaxStore store, MaxStore.Editor e, Snapshot cur) {
-                long gen = cur.nextGen + 1;
-                e.putString(KEY_TARGET_NAME, chatName)
-                        .putString(KEY_TARGET_CHANNEL, channelId)
-                        .putInt(KEY_TARGET_NOTIF, notificationId)
-                        .putLong(KEY_TARGET_GEN, gen)
-                        .putLong(KEY_NEXT_GEN, gen)
-                        .remove(KEY_PENDING_TEXT).remove(KEY_PENDING_TS).remove(KEY_PENDING_GEN)
-                        .remove(KEY_BLOCKED_BY).remove(KEY_BLOCKED_REASON)
-                        .remove(KEY_ATTEMPT_ID).remove(KEY_ATTEMPT_STATE);
-            }
-
             @Override public Snapshot evolve(Snapshot c) {
                 long gen = c.nextGen + 1;
                 Target target = new Target(chatName, channelId, notificationId, gen);
@@ -421,12 +476,6 @@ public final class MaxChannel {
                 return cur.pending == null || cur.pending.readingTs <= readingTs;
             }
 
-            @Override public void apply(MaxStore store, MaxStore.Editor e, Snapshot cur) {
-                e.putString(KEY_PENDING_TEXT, text)
-                        .putLong(KEY_PENDING_TS, readingTs)
-                        .putLong(KEY_PENDING_GEN, gen);
-            }
-
             @Override public Snapshot evolve(Snapshot c) {
                 return new Snapshot(c.target, new Pending(text, readingTs, gen),
                         c.blockedBy, c.blockedReason, c.attempt, c.testAttempt, c.nextGen,
@@ -435,20 +484,26 @@ public final class MaxChannel {
         });
     }
 
-    /** Удаление КОНКРЕТНОГО pending: повтор не трогает более новое показание. */
+    /**
+     * Удаление КОНКРЕТНОГО pending по полной идентичности: поколение цели,
+     * время и текст показания. Повтор не трогает другой pending даже с тем же
+     * временем — у показания другого адресата идентичность иная.
+     */
     static boolean confirmClearPending(Context app, Pending item) {
         return commitState(app, new Mutation() {
-            @Override public boolean appliesTo(Snapshot cur) {
-                return cur.pending == null || cur.pending.readingTs == item.readingTs;
+            private boolean same(Pending p) {
+                return p != null && p.readingTs == item.readingTs
+                        && p.targetGeneration == item.targetGeneration
+                        && p.text.equals(item.text);
             }
 
-            @Override public void apply(MaxStore store, MaxStore.Editor e, Snapshot cur) {
-                e.remove(KEY_PENDING_TEXT).remove(KEY_PENDING_TS).remove(KEY_PENDING_GEN);
+            @Override public boolean appliesTo(Snapshot cur) {
+                return cur.pending == null || same(cur.pending);
             }
 
             @Override public Snapshot evolve(Snapshot c) {
                 Pending pending = c.pending;
-                if (pending != null && pending.readingTs == item.readingTs) pending = null;
+                if (same(pending)) pending = null;
                 return new Snapshot(c.target, pending, c.blockedBy, c.blockedReason,
                         c.attempt, c.testAttempt, c.nextGen,
                         c.lastHandoffMs, c.lastHandoffReadingTs, c.lastTestHandoffMs);
@@ -461,10 +516,6 @@ public final class MaxChannel {
             @Override public boolean appliesTo(Snapshot cur) {
                 // Не перезаписывать более свежую блокировку другого чата.
                 return cur.blockedBy == null || cur.blockedBy.equals(chatName);
-            }
-
-            @Override public void apply(MaxStore store, MaxStore.Editor e, Snapshot cur) {
-                e.putString(KEY_BLOCKED_BY, chatName).putString(KEY_BLOCKED_REASON, reason);
             }
 
             @Override public Snapshot evolve(Snapshot c) {
@@ -484,10 +535,6 @@ public final class MaxChannel {
                         : expected.equals(cur.blockedBy);
             }
 
-            @Override public void apply(MaxStore store, MaxStore.Editor e, Snapshot cur) {
-                e.remove(KEY_BLOCKED_BY).remove(KEY_BLOCKED_REASON);
-            }
-
             @Override public Snapshot evolve(Snapshot c) {
                 return new Snapshot(c.target, c.pending, null, null, c.attempt,
                         c.testAttempt, c.nextGen, c.lastHandoffMs,
@@ -501,12 +548,7 @@ public final class MaxChannel {
         return commitState(app, attemptWrite(attempt));
     }
 
-    private static String attemptPrefix(Attempt a) {
-        return Attempt.KIND_TEST.equals(a.kind) ? "test_attempt_" : "attempt_";
-    }
-
     private static Mutation attemptWrite(Attempt a) {
-        final String p = attemptPrefix(a);
         return new Mutation() {
             @Override public boolean appliesTo(Snapshot cur) {
                 // Не перезаписывать более новую попытку (результат старой не
@@ -514,17 +556,6 @@ public final class MaxChannel {
                 Attempt curAtt = Attempt.KIND_TEST.equals(a.kind)
                         ? cur.testAttempt : cur.attempt;
                 return curAtt == null || curAtt.id <= a.id;
-            }
-
-            @Override public void apply(MaxStore store, MaxStore.Editor e, Snapshot cur) {
-                e.putLong(p + "id", a.id)
-                        .putString(p + "kind", a.kind)
-                        .putLong(p + "gen", a.targetGeneration)
-                        .putString(p + "chat", a.chatName)
-                        .putString(p + "channel", a.channelId)
-                        .putInt(p + "notif_id", a.notificationId)
-                        .putLong(p + "reading_ts", a.readingTs)
-                        .putInt(p + "state", a.state);
             }
 
             @Override public Snapshot evolve(Snapshot c) {
@@ -545,40 +576,22 @@ public final class MaxChannel {
     /**
      * Успешная передача команды: одной записью отметить handoff и убрать
      * только СВОЁ ожидающее показание — более новое pending, записанное
-     * позже, не удаляется (проверка по диску в момент записи).
+     * позже, не удаляется (полная идентичность: текст+время+поколение).
      */
     static boolean confirmHanded(Context app, Attempt handed, Pending sentItem,
                                  boolean isReading, long nowMs) {
-        final String p = attemptPrefix(handed);
         return commitState(app, new Mutation() {
             @Override public boolean appliesTo(Snapshot cur) {
                 Attempt curAtt = isReading ? cur.attempt : cur.testAttempt;
                 return curAtt == null || curAtt.id <= handed.id;
             }
 
-            @Override public void apply(MaxStore store, MaxStore.Editor e, Snapshot cur) {
-                e.putInt(p + "state", handed.state);
-                if (isReading) {
-                    e.putLong(KEY_HANDOFF_TS, nowMs)
-                            .putLong(KEY_HANDOFF_READING_TS, sentItem.readingTs);
-                    // Удаляем pending только если на диске всё ещё наше показание.
-                    boolean stillOurs = sentItem.text.equals(
-                            store.getString(KEY_PENDING_TEXT, null))
-                            && store.getLong(KEY_PENDING_TS, -1) == sentItem.readingTs
-                            && store.getLong(KEY_PENDING_GEN, -1) == sentItem.targetGeneration;
-                    if (stillOurs) {
-                        e.remove(KEY_PENDING_TEXT).remove(KEY_PENDING_TS).remove(KEY_PENDING_GEN);
-                    }
-                } else {
-                    e.putLong(KEY_TEST_HANDOFF_TS, nowMs);
-                }
-            }
-
             @Override public Snapshot evolve(Snapshot c) {
                 Pending pending = c.pending;
                 if (isReading && pending != null
                         && pending.readingTs == sentItem.readingTs
-                        && pending.targetGeneration == sentItem.targetGeneration) {
+                        && pending.targetGeneration == sentItem.targetGeneration
+                        && pending.text.equals(sentItem.text)) {
                     pending = null;
                 }
                 return new Snapshot(c.target, pending, c.blockedBy, c.blockedReason,

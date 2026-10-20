@@ -69,20 +69,16 @@ public final class MaxSender {
     /**
      * Версия входящих событий: каждое переданное владельцу состояние событие
      * (уведомление, показание, выбор чата, подключение слушателя) наращивает
-     * счётчик на вызывающем потоке — до постановки в очередь исполнителя.
-     * Отправка фиксирует версию в начале и перед внешней командой проверяет,
-     * нет ли в очереди НЕОБРАБОТАННОГО события, способного изменить решение.
+     * номер выдаётся атомарно с постановкой в очередь исполнителя.
+     * Отправка проверяет перед внешней командой, не появилось ли после
+     * события-триггера необработанное новое событие, способное изменить решение.
      */
     private static final java.util.concurrent.atomic.AtomicLong inboundSeq =
             new java.util.concurrent.atomic.AtomicLong();
     /** Сколько входящих событий очередь уже обработала (по версии на момент постановки). */
     private static final java.util.concurrent.atomic.AtomicLong processedSeq =
             new java.util.concurrent.atomic.AtomicLong();
-
-    /** Вызов на потоке источника события, до dispatch. */
-    static void notifyInboundEvent() {
-        inboundSeq.incrementAndGet();
-    }
+    private static final Object enqueueLock = new Object();
 
     private MaxSender() { }
 
@@ -125,14 +121,38 @@ public final class MaxSender {
     }
 
     /** Событие для владельца состояния — без ожидания на вызывающем потоке. */
-    static void dispatch(Runnable task) {
-        // Версия очереди на момент постановки: после выполнения задачи всё,
-        // что поступило ДО неё, считается обработанным (очередь однопоточная).
+    interface SequencedTask {
+        void run(long eventSeq);
+    }
+
+    /**
+     * Внутренняя задача (не входящее событие): выполняется с версией текущей
+     * очереди. Не подтверждает обработку событий, поставленных позже неё.
+     */
+    static void dispatch(SequencedTask task) {
         final long seq = inboundSeq.get();
+        enqueue(seq, task);
+    }
+
+    /**
+     * Входящее событие: атомарная пара «новый номер + постановка в очередь»
+     * — при двух вызывающих потоках номера идут в том же порядке, что и
+     * задачи в очереди.
+     */
+    static void dispatchEvent(SequencedTask task) {
+        synchronized (enqueueLock) {
+            enqueue(inboundSeq.incrementAndGet(), task);
+        }
+    }
+
+    private static void enqueue(long seq, SequencedTask task) {
         worker().execute(() -> {
             try {
-                task.run();
+                task.run(seq);
             } finally {
+                // Задача отработала со своей версией: всё поступившее ДО неё
+                // обработано (очередь однопоточная, порядок версий = порядку
+                // постановки). Более поздние события это не покрывает.
                 processedSeq.accumulateAndGet(seq, Math::max);
             }
         });
@@ -198,8 +218,7 @@ public final class MaxSender {
     public static void selectCandidateAsync(Context context, Candidate candidate,
                                             Consumer<Boolean> resultOnMain) {
         Context app = context.getApplicationContext();
-        notifyInboundEvent();
-        dispatch(() -> {
+        dispatchEvent(seq -> {
             boolean ok = selectCandidateNow(app, candidate);
             new Handler(Looper.getMainLooper()).post(() -> resultOnMain.accept(ok));
         });
@@ -241,7 +260,8 @@ public final class MaxSender {
      * Уведомление MAX с кнопкой «Ответить»: слушатель извлёк кнопку и передал
      * событие — дальше всё решает рабочий исполнитель.
      */
-    static void onChatNotification(Context app, MaxReplyButton button, String chatName) {
+    static void onChatNotification(Context app, MaxReplyButton button, String chatName,
+                                   long eventSeq) {
         synchronized (MaxSender.class) {
             MaxChannel.Target wanted = MaxChannel.getTarget(app);
             if (wanted == null) return; // чат не выбран — только пополняем кандидатов
@@ -257,7 +277,7 @@ public final class MaxSender {
                     Logger.i(TAG, "новое сообщение из выбранного чата — блокировка снята");
                 }
                 if (renewed) MaxReplyBackup.save(app, button);
-                onButtonCapturedNow(app);
+                onButtonCapturedNow(app, eventSeq);
                 return;
             }
 
@@ -285,8 +305,7 @@ public final class MaxSender {
 
     /** Событие «уведомление MAX с кнопкой» — слушатель не ждёт диск и send. */
     public static void dispatchNotification(Context app, MaxReplyButton button, String chatName) {
-        notifyInboundEvent();
-        dispatch(() -> onChatNotification(app, button, chatName));
+        dispatchEvent(seq -> onChatNotification(app, button, chatName, seq));
     }
 
     /**
@@ -295,11 +314,10 @@ public final class MaxSender {
      */
     public static void onReading(Context context, String text, long readingTs) {
         Context app = context.getApplicationContext();
-        notifyInboundEvent();
-        dispatch(() -> onReadingNow(app, text, readingTs));
+        dispatchEvent(seq -> onReadingNow(app, text, readingTs, seq));
     }
 
-    static void onReadingNow(Context app, String text, long readingTs) {
+    static void onReadingNow(Context app, String text, long readingTs, long eventSeq) {
         synchronized (MaxSender.class) {
             MaxChannel.Snapshot snap = MaxChannel.state(app);
             if (!MaxChannel.isMaxEnabled(app)) return;
@@ -317,7 +335,7 @@ public final class MaxSender {
             }
             MaxChannel.Pending current = MaxChannel.getPending(app);
             if (current != null) {
-                trySend(app, current, true);
+                trySend(app, current, true, eventSeq);
             }
         }
     }
@@ -328,10 +346,10 @@ public final class MaxSender {
      */
     public static void onButtonCaptured(Context context) {
         Context app = context.getApplicationContext();
-        dispatch(() -> onButtonCapturedNow(app));
+        dispatch(seq -> onButtonCapturedNow(app, seq));
     }
 
-    static void onButtonCapturedNow(Context app) {
+    static void onButtonCapturedNow(Context app, long eventSeq) {
         synchronized (MaxSender.class) {
             if (!MaxChannel.isMaxEnabled(app)) return;
             MaxChannel.Snapshot snap = MaxChannel.state(app);
@@ -344,7 +362,7 @@ public final class MaxSender {
                 Logger.i(TAG, "отложенное показание неактуально — снято");
                 return;
             }
-            trySend(app, pending, true);
+            trySend(app, pending, true, eventSeq);
         }
     }
 
@@ -358,7 +376,7 @@ public final class MaxSender {
     public static String sendTest(Context context) {
         Context app = context.getApplicationContext();
         FutureTask<String> task = new FutureTask<>(() -> sendTestNow(app));
-        dispatch(task);
+        dispatch(seq -> task.run());
         try {
             return task.get();
         } catch (InterruptedException e) {
@@ -375,7 +393,7 @@ public final class MaxSender {
         String text = "Тест: связь xDrip2VK ↔ MAX работает.\nПоказания отправляются в выбранный чат.";
         MaxChannel.Pending item = new MaxChannel.Pending(text, now(),
                 MaxChannel.getTarget(app).generation);
-        boolean sent = trySend(app, item, false);
+        boolean sent = trySend(app, item, false, inboundSeq.get());
         return sent ? "Тестовое сообщение передано в MAX — доставка не подтверждена"
                 : statusText(app);
     }
@@ -391,8 +409,8 @@ public final class MaxSender {
      * PendingIntent.send → подтверждённый итог. Отказ записи запрещает
      * команду; отказ записи итога после send — не повод для повтора.
      */
-    private static boolean trySend(Context app, MaxChannel.Pending item, boolean isReading) {
-        final long inboundAtStart = inboundSeq.get();
+    private static boolean trySend(Context app, MaxChannel.Pending item, boolean isReading,
+                                   long eventSeq) {
         MaxChannel.Snapshot snap = MaxChannel.state(app);
         MaxChannel.Target wanted = snap.target;
         if (wanted == null) {
@@ -457,7 +475,13 @@ public final class MaxSender {
         // Подтверждённая запись резерва попытки — ДО внешней команды. Без неё
         // команду не вызываем: после восстановления RESERVED говорит «команда,
         // возможно, уже ушла» и запрещает автоматический повтор.
-        MaxChannel.Attempt attempt = new MaxChannel.Attempt(now(),
+        // id попытки — монотонный по снимку, не время: две попытки в одну
+        // миллисекунду и перевод часов назад дают строго возрастающие id,
+        // и устаревший результат по appliesTo новую попытку не тронет.
+        long nextAttemptId = Math.max(now(), 1 + Math.max(
+                snap.attempt == null ? 0 : snap.attempt.id,
+                snap.testAttempt == null ? 0 : snap.testAttempt.id));
+        MaxChannel.Attempt attempt = new MaxChannel.Attempt(nextAttemptId,
                 isReading ? MaxChannel.Attempt.KIND_READING : MaxChannel.Attempt.KIND_TEST,
                 wanted.generation, wanted, item.readingTs,
                 MaxChannel.Attempt.STATE_RESERVED);
@@ -493,15 +517,17 @@ public final class MaxSender {
             markAborted(app, attempt);
             return false;
         }
-        if (inboundSeq.get() > inboundAtStart && processedSeq.get() < inboundSeq.get()) {
-            // После начала отправки поступило событие, которое ещё стоит в
+        if (inboundSeq.get() > eventSeq && processedSeq.get() < inboundSeq.get()) {
+            // После события-триггера поступило событие, которое ещё стоит в
             // очереди исполнителя и способно изменить решение (конфликт, новая
             // цель, новое показание). Команда не вызывается: после обработки
             // очереди ожидающее показание пройдёт заново по обычному пути.
-            // События, уже отработанные к этой точке, учтены в снимке выше.
+            // События, уже отработанные к этой точке, учтены в снимке выше;
+            // номера выдаются атомарно с постановкой, поэтому «в очереди, но
+            // обработано» быть не может.
             Logger.w(TAG, "не отправлено: есть необработанное событие — отправка после очереди");
             markAborted(app, attempt);
-            if (isReading) dispatch(() -> onButtonCapturedNow(app));
+            if (isReading) dispatch(seq -> onButtonCapturedNow(app, seq));
             return false;
         }
 
