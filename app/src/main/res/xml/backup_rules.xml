@@ -1,0 +1,19 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!--
+    Правила автоматического резервирования для Android 11 (API 30) и ниже.
+    Токен VK, адресаты, медицинские данные и очередь отправки не должны
+    автоматически восстанавливаться на другом устройстве — исключены все
+    домены целиком. Исключение root не считается покрывающим остальные
+    домены: каждый домен исключён явно. Разрешающих include нет.
+-->
+<full-backup-content>
+    <exclude domain="root" path="." />
+    <exclude domain="file" path="." />
+    <exclude domain="database" path="." />
+    <exclude domain="sharedpref" path="." />
+    <exclude domain="external" path="." />
+    <exclude domain="device_root" path="." />
+    <exclude domain="device_file" path="." />
+    <exclude domain="device_database" path="." />
+    <exclude domain="device_sharedpref" path="." />
+</full-backup-content>

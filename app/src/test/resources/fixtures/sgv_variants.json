@@ -1,0 +1,6 @@
+[
+  {"_id": "fixture-sec-1", "timestamp": 1715336100, "sgv": 110, "direction": "SingleUp"},
+  {"_id": "fixture-iso-1", "dateString": "2024-05-10T10:10:00.000+0000", "sgv": 105},
+  {"_id": "fixture-notime-1", "sgv": 130, "direction": "SingleUp"},
+  {"_id": "fixture-badtime-1", "date": "not-a-time", "sgv": 140}
+]

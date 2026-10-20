@@ -26,6 +26,7 @@ import android.widget.Button;
 import android.widget.TextView;
 import com.google.android.material.chip.Chip;
 import com.google.android.material.floatingactionbutton.FloatingActionButton;
+import com.example.xdrip2vk.core.ReadingGate;
 import java.text.SimpleDateFormat;
 import java.util.Date;
 import java.util.Locale;
@@ -48,7 +49,9 @@ public class MainActivity extends AppCompatActivity {
     private Runnable updateUiRunnable;
     private long lastUpdateTime = 0;
     private long pollInterval = 300000; // 5 минут по умолчанию
-    private static final long MAX_DATA_AGE = 900000; // 15 минут
+    /** «Запустить» нажата, ждём разрешения Android; «Остановить» сбрасывает. */
+    private volatile boolean startRequested;
+
 
     @Override
     protected void onCreate(Bundle savedInstanceState) {
@@ -78,8 +81,14 @@ public class MainActivity extends AppCompatActivity {
             tvVersion.setText("v1.3");
         }
 
-        btnStartService.setOnClickListener(v -> startVkSenderService());
-        btnStopService.setOnClickListener(v -> stopVkSenderService());
+        btnStartService.setOnClickListener(v -> {
+            startRequested = true;
+            startVkSenderService();
+        });
+        btnStopService.setOnClickListener(v -> {
+            startRequested = false; // поздний grant разрешения не включит передачу
+            stopVkSenderService();
+        });
         fabSendNow.setOnClickListener(v -> sendNow());
 
         // Свайп влево → настройки
@@ -118,7 +127,11 @@ public class MainActivity extends AppCompatActivity {
         }
 
         long dataAge = System.currentTimeMillis() - lastTimestamp;
-        boolean hasFreshData = lastBg > 0 && lastTimestamp > 0 && dataAge <= MAX_DATA_AGE;
+        // Допустимость времени и конечность значения: будущее/невалидное
+        // показание не должно выглядеть свежим на экране.
+        boolean hasFreshData = lastBg > 0 && Float.isFinite(lastBg) && lastTimestamp > 0
+                && ReadingGate.check(lastTimestamp, System.currentTimeMillis())
+                        == ReadingGate.Verdict.FRESH;
 
         // Обновляем статус xDrip через Chip
         if (hasFreshData) {
@@ -156,12 +169,18 @@ public class MainActivity extends AppCompatActivity {
 
             lastUpdateTime = lastTimestamp;
 
-            // Цветовая индикация по диапазону
+            // Цветовая индикация по диапазону.
+            // Пороги в настройках — ммоль/л, внутреннее значение — мг/дл:
+            // сравнение всегда в мг/дл независимо от единиц отображения.
             try {
-                double minBg = Double.parseDouble(prefs.getString("alert_min_bg", "4.1"));
-                double maxBg = Double.parseDouble(prefs.getString("alert_max_bg", "12.2"));
-                double bgValue = "mmol".equals(units) ? displayValue : lastBg;
-                if (bgValue < minBg || bgValue > maxBg) {
+                com.example.xdrip2vk.core.AlertThresholds thresholds =
+                        com.example.xdrip2vk.core.AlertThresholds.parseMmol(
+                                prefs.getString("alert_min_bg",
+                                        com.example.xdrip2vk.core.AlertThresholds.DEFAULT_MIN_STR),
+                                prefs.getString("alert_max_bg",
+                                        com.example.xdrip2vk.core.AlertThresholds.DEFAULT_MAX_STR));
+                if (thresholds.classify(lastBg)
+                        != com.example.xdrip2vk.core.AlertThresholds.Level.NORMAL) {
                     bgCardContent.setBackgroundResource(R.drawable.bg_gradient_alert);
                 } else {
                     bgCardContent.setBackgroundResource(R.drawable.bg_gradient);
@@ -212,23 +231,17 @@ public class MainActivity extends AppCompatActivity {
     }
 
     private void sendNow() {
-        SharedPreferences prefs = PreferenceManager.getDefaultSharedPreferences(this);
-        long lastTimestamp = prefs.getLong("last_bg_timestamp", 0);
-        float lastBg = prefs.getFloat("last_bg_value", 0);
-        long dataAge = System.currentTimeMillis() - lastTimestamp;
-        
-        if (lastBg > 0 && lastTimestamp > 0 && dataAge <= MAX_DATA_AGE) {
-            Intent intent = new Intent(this, VkSenderService.class);
-            intent.putExtra("manual_send", true);
-            intent.putExtra("bg_value", lastBg);
-            intent.putExtra("timestamp", lastTimestamp);
-            startService(intent);
-            chipStatus.setText("Отправка...");
-        } else if (lastBg > 0 && lastTimestamp > 0) {
-            chipStatus.setText("Данные устарели");
-        } else {
-            chipStatus.setText("Нет данных для отправки");
+        // Ручная отправка не включает постоянную работу скрытно.
+        if (!VkSenderService.isTransmissionAllowed(this)) {
+            chipStatus.setText("Сначала запустите передачу");
+            return;
         }
+        // Ручная отправка получает актуальное показание из веб-сервиса xDrip
+        // внутри сервиса — кеш неизвестного происхождения не источник данных.
+        Intent intent = new Intent(this, VkSenderService.class);
+        intent.putExtra("manual_send", true);
+        startService(intent);
+        chipStatus.setText("Отправка...");
     }
 
     private void startVkSenderService() {
@@ -254,14 +267,30 @@ public class MainActivity extends AppCompatActivity {
             }
         }
 
-        Intent serviceIntent = new Intent(this, VkSenderService.class);
-        startForegroundService(serviceIntent);
+        // Сервис стартует только после ПОДТВЕРЖДЁННОЙ записи разрешения;
+        // блокирующий commit выполняется вне главного потока.
+        VkSenderService.requestStartTransmission(this, ok -> runOnUiThread(() -> {
+            if (!ok) {
+                Toast.makeText(this,
+                        "Не удалось сохранить разрешение — передача не включена",
+                        Toast.LENGTH_LONG).show();
+            }
+            updateStatus();
+        }));
         updateStatus();
     }
 
     private void stopVkSenderService() {
-        Intent serviceIntent = new Intent(this, VkSenderService.class);
-        stopService(serviceIntent);
+        // Процессный запрет ставится немедленно; подтверждённая запись и
+        // завершение экземпляра — асинхронно, без блокировки главного потока.
+        VkSenderService.requestStopTransmission(this, saved -> runOnUiThread(() -> {
+            if (!saved) {
+                Toast.makeText(this,
+                        "Не удалось сохранить запрет — передача остановлена, но после перезапуска может возобновиться",
+                        Toast.LENGTH_LONG).show();
+            }
+            updateStatus();
+        }));
         updateStatus();
     }
 
@@ -282,11 +311,16 @@ public class MainActivity extends AppCompatActivity {
     }
 
     private void updateStatus() {
-        if (VkSenderService.isRunning()) {
+        // Различаем выбор пользователя и состояние процесса: после аварии
+        // (передача разрешена, процесс мёртв) «Остановлено» не показываем.
+        if (!VkSenderService.isTransmissionAllowed(this)) {
+            chipStatus.setText("Передача остановлена");
+            chipStatus.setChipIconResource(R.drawable.ic_status_off);
+        } else if (VkSenderService.isRunning()) {
             chipStatus.setText("Сервис работает");
             chipStatus.setChipIconResource(R.drawable.ic_status_on);
         } else {
-            chipStatus.setText("Сервис остановлен");
+            chipStatus.setText("Передача включена — сервис не активен");
             chipStatus.setChipIconResource(R.drawable.ic_status_off);
         }
     }
@@ -310,7 +344,11 @@ public class MainActivity extends AppCompatActivity {
     public void onRequestPermissionsResult(int requestCode, String[] permissions, int[] grantResults) {
         super.onRequestPermissionsResult(requestCode, permissions, grantResults);
         if (requestCode == REQUEST_NOTIFICATION_PERMISSION) {
-            if (grantResults.length > 0 && grantResults[0] == PackageManager.PERMISSION_GRANTED) {
+            if (grantResults.length > 0 && grantResults[0] == PackageManager.PERMISSION_GRANTED
+                    && startRequested) {
+                // Устаревший callback: пользователь мог успеть нажать
+                // «Остановить» — тогда startRequested уже false и поздний
+                // grant передачу не включит.
                 startVkSenderService();
             }
         }

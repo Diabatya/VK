@@ -1,5 +1,8 @@
 package com.example.xdrip2vk;
 
+import com.example.xdrip2vk.core.SendResult;
+
+import org.json.JSONArray;
 import org.json.JSONException;
 import org.json.JSONObject;
 import java.io.BufferedReader;
@@ -10,7 +13,6 @@ import java.net.HttpURLConnection;
 import java.net.URL;
 import java.net.URLEncoder;
 import java.nio.charset.StandardCharsets;
-import java.security.SecureRandom;
 import java.util.HashMap;
 import java.util.Map;
 
@@ -22,29 +24,226 @@ public class VkApi {
     private static final int CONNECT_TIMEOUT = 10000;
     private static final int READ_TIMEOUT = 10000;
 
-    public static boolean sendMessage(String token, String chatId, String message) {
+    static final class RawResponse {
+        final int httpCode;
+        final String body;
+
+        RawResponse(int httpCode, String body) {
+            this.httpCode = httpCode;
+            this.body = body;
+        }
+    }
+
+    /**
+     * Отправка сообщения со стабильным random_id.
+     * Один и тот же random_id при повторе не создаёт дубль на стороне VK —
+     * безопасно при потере ответа после принятия сообщения сервером.
+     */
+    public static SendResult sendMessage(String token, String chatId, String message, int randomId) {
         if (token == null || token.isEmpty() || chatId == null || chatId.isEmpty()) {
             Logger.e(TAG, "Токен или ID чата не заданы");
-            return false;
+            return SendResult.PERMANENT;
         }
 
-        SecureRandom random = new SecureRandom();
         Map<String, String> params = new HashMap<>();
         params.put("peer_id", chatId);
         params.put("message", message);
-        params.put("random_id", String.valueOf(random.nextInt()));
+        params.put("random_id", String.valueOf(randomId));
 
-        String response = request("messages.send", token, params);
-        boolean success = isSuccess(response);
-        if (!success) {
-            Logger.e(TAG, "Ошибка отправки сообщения ВК: " + response);
+        RawResponse response = requestRaw("messages.send", token, params);
+        SendResult result = classify(
+                response == null ? -1 : response.httpCode,
+                response == null ? null : response.body);
+        if (result != SendResult.SENT) {
+            // Безопасная диагностика: тело ответа может содержать токен,
+            // текст сообщения и peer_id в request_params — в лог не выводим.
+            int errorCode = extractErrorCode(
+                    response == null ? null : response.body);
+            Logger.e(TAG, "Ошибка отправки сообщения ВК: op=messages.send"
+                    + ", http=" + (response == null ? -1 : response.httpCode)
+                    + ", result=" + result
+                    + (errorCode >= 0 ? ", error_code=" + errorCode : ""));
         }
-        return success;
+        return result;
+    }
+
+    /**
+     * Числовой error_code из тела ответа VK; -1 — не извлечён (битый JSON,
+     * нет объекта error, нецелое значение). Входные данные в лог не пишутся.
+     */
+    static int extractErrorCode(String body) {
+        if (body == null || body.isEmpty()) {
+            return -1;
+        }
+        try {
+            JSONObject error = new JSONObject(body).optJSONObject("error");
+            if (error == null) {
+                return -1;
+            }
+            Object code = error.opt("error_code");
+            if (!(code instanceof Number)) {
+                return -1;
+            }
+            double d = ((Number) code).doubleValue();
+            long l = ((Number) code).longValue();
+            if (d != l || l < 0 || l > Integer.MAX_VALUE) {
+                return -1; // дробный/отрицательный/переполнение — не код
+            }
+            return (int) l;
+        } catch (JSONException e) {
+            return -1;
+        }
+    }
+
+    /** Классификация ответа: сетевая ошибка отличается от ошибки авторизации и ошибки API. */
+    static SendResult classify(int httpCode, String body) {
+        if (httpCode == -1) {
+            return SendResult.RETRYABLE; // исключение/таймаут — временная сетевая ошибка
+        }
+        if (httpCode == 401 || httpCode == 403) {
+            return SendResult.AUTH_FAILED;
+        }
+        if (httpCode >= 500 || httpCode <= 0) {
+            return SendResult.RETRYABLE;
+        }
+        if (body == null || body.isEmpty()) {
+            return SendResult.RETRYABLE;
+        }
+        try {
+            JSONObject json = new JSONObject(body);
+            if (json.has("response")) {
+                return SendResult.SENT;
+            }
+            JSONObject error = json.optJSONObject("error");
+            if (error != null) {
+                int code = error.optInt("error_code", -1);
+                switch (code) {
+                    case 5: // User authorization failed
+                        return SendResult.AUTH_FAILED;
+                    case 1:  // Unknown error — обычно временная
+                    case 6:  // Too many requests per second
+                    case 9:  // Flood control
+                    case 10: // Internal server error
+                    case 29: // Rate limit reached
+                        return SendResult.RETRYABLE;
+                    default:
+                        return SendResult.PERMANENT;
+                }
+            }
+            return SendResult.RETRYABLE; // неожиданное тело — лучше повторить
+        } catch (JSONException e) {
+            return SendResult.RETRYABLE;
+        }
+    }
+
+    /**
+     * Подтверждённый владелец предъявленного токена по официальному контракту
+     * VK API: для пользовательского токена users.get без параметров возвращает
+     * владельца токена, для токена сообщества groups.getById без параметров
+     * возвращает сообщество-владельца (схема vk-api-schema, methods.json).
+     * Владельца определяет только предъявленный токен — никаких user_id/group_id
+     * снаружи не передаётся. Возвращает "user:&lt;id&gt;" или "group:&lt;id&gt;",
+     * либо null при ошибке сети/отказе авторизации/неопределённом ответе —
+     * неопределённый ответ не считается успешной проверкой.
+     */
+    public static String fetchTokenOwner(String token) {
+        return fetchTokenOwner(token, new java.util.function.BiFunction<String, Map<String, String>, String>() {
+            @Override
+            public String apply(String method, Map<String, String> params) {
+                return request(method, token, params);
+            }
+        });
+    }
+
+    /**
+     * Вариант с подменяемым транспортом (тесты без сети). Метод VK и параметры
+     * передаются транспорту как есть; произвольные user_id/group_id для
+     * определения владельца не запрашиваются — только владелец токена.
+     */
+    static String fetchTokenOwner(String token,
+                                  java.util.function.BiFunction<String, Map<String, String>, String> transport) {
+        if (token == null || token.isEmpty()) {
+            return null;
+        }
+        Long id = firstResponseId(transport.apply("users.get", null));
+        if (id != null) {
+            return "user:" + id;
+        }
+        id = firstResponseId(transport.apply("groups.getById", null));
+        if (id != null) {
+            return "group:" + id;
+        }
+        return null;
+    }
+
+    /**
+     * Однозначный владелец из ответа VK. Принимается только массив response
+     * ровно с одним объектом с положительным целочисленным id (учитываем и
+     * форму {groups:[]}). Нуль, отрицательное, дробное, переполнение,
+     * отсутствующий/нечисловой id, несколько объектов или ответ с ошибкой —
+     * не подтверждают владельца.
+     */
+    private static Long firstResponseId(String body) {
+        if (body == null || body.isEmpty()) {
+            return null;
+        }
+        try {
+            JSONObject o = new JSONObject(body);
+            if (o.has("error")) {
+                return null; // ответ с ошибкой — проверка не пройдена
+            }
+            JSONArray arr = o.optJSONArray("response");
+            if (arr == null) {
+                JSONObject resp = o.optJSONObject("response");
+                if (resp != null) {
+                    arr = resp.optJSONArray("groups");
+                }
+            }
+            if (arr == null || arr.length() != 1) {
+                return null; // пусто или неоднозначный владелец
+            }
+            JSONObject item = arr.optJSONObject(0);
+            if (item == null) {
+                return null;
+            }
+            Object idObj = item.opt("id");
+            if (!(idObj instanceof Number)) {
+                return null; // отсутствует, null или не число
+            }
+            double d = ((Number) idObj).doubleValue();
+            long l = ((Number) idObj).longValue();
+            if (d != l || l <= 0 || l > Integer.MAX_VALUE) {
+                return null; // дробный, ноль, отрицательный, переполнение
+            }
+            return l;
+        } catch (JSONException e) {
+            return null; // битый JSON — неопределённый ответ
+        }
     }
 
     public static String request(String method, String token, Map<String, String> params) {
+        RawResponse r = requestRaw(method, token, params);
+        return r == null ? null : r.body;
+    }
+
+    /**
+     * Подменяемый транспорт — только для тестов без сети. Исключение
+     * транспорта проходит тот же путь безопасного журналирования, что и
+     * сетевая ошибка.
+     */
+    interface Transport {
+        RawResponse apply(String method, String token, Map<String, String> params);
+    }
+
+    static volatile Transport transportOverride;
+
+    private static RawResponse requestRaw(String method, String token, Map<String, String> params) {
         HttpURLConnection connection = null;
         try {
+            Transport t = transportOverride;
+            if (t != null) {
+                return t.apply(method, token, params);
+            }
             StringBuilder body = new StringBuilder();
             body.append("access_token=").append(URLEncoder.encode(token, StandardCharsets.UTF_8.name()))
                 .append("&v=").append(API_VERSION);
@@ -77,34 +276,27 @@ public class VkApi {
                     ? connection.getInputStream()
                     : connection.getErrorStream();
 
+            if (stream == null) {
+                return new RawResponse(responseCode, "");
+            }
             try (BufferedReader reader = new BufferedReader(new InputStreamReader(stream, StandardCharsets.UTF_8))) {
                 StringBuilder response = new StringBuilder();
                 String line;
                 while ((line = reader.readLine()) != null) {
                     response.append(line);
                 }
-                return response.toString();
+                return new RawResponse(responseCode, response.toString());
             }
         } catch (Exception e) {
-            Logger.e(TAG, "Исключение при запросе к API ВКонтакте: " + e.getMessage());
+            // e.getMessage() может содержать текст исключения с данными
+            // запроса — фиксированная причина + класс исключения.
+            Logger.e(TAG, "Сбой запроса к API ВКонтакте: "
+                    + e.getClass().getSimpleName());
             return null;
         } finally {
             if (connection != null) {
                 connection.disconnect();
             }
-        }
-    }
-
-    private static boolean isSuccess(String response) {
-        if (response == null || response.isEmpty()) {
-            return false;
-        }
-        try {
-            JSONObject json = new JSONObject(response);
-            return json.has("response");
-        } catch (JSONException e) {
-            Logger.e(TAG, "Не удалось разобрать ответ ВК: " + e.getMessage());
-            return false;
         }
     }
 }

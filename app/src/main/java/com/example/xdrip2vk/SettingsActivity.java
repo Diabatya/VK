@@ -72,11 +72,22 @@ public class SettingsActivity extends AppCompatActivity {
 
     public static class SettingsFragment extends PreferenceFragmentCompat {
 
+        /**
+         * Тестовый сигнал завершения фонового чтения файла импорта:
+         * отсчитывается фоновым потоком после постановки результата в
+         * главный поток — заменяет ожидание по таймеру.
+         */
+        static volatile java.util.concurrent.CountDownLatch importDoneForTest;
+
         private ActivityResultLauncher<String[]> importTokenLauncher;
+        private Credentials creds;
+        private final android.os.Handler mainHandler =
+                new android.os.Handler(android.os.Looper.getMainLooper());
 
         @Override
         public void onCreate(Bundle savedInstanceState) {
             super.onCreate(savedInstanceState);
+            creds = Credentials.get(requireContext());
             importTokenLauncher = registerForActivityResult(
                     new ActivityResultContracts.OpenDocument(),
                     this::onTokenFileSelected);
@@ -85,20 +96,33 @@ public class SettingsActivity extends AppCompatActivity {
         @Override
         public void onCreatePreferences(Bundle savedInstanceState, String rootKey) {
             setPreferencesFromResource(R.xml.preferences, rootKey);
+            // onCreatePreferences вызывается из super.onCreate раньше
+            // присваивания поля — фасад берём лениво.
+            if (creds == null) {
+                creds = Credentials.get(requireContext());
+            }
 
             EditTextPreference tokenPref = findPreference("vk_token");
             if (tokenPref != null) {
                 tokenPref.setPersistent(false);
-                tokenPref.setText(TokenStorage.getToken(getContext()));
+                // Синхронный текст — только опубликованный снимок в памяти
+                // (Keystore здесь не открывается); актуальное состояние
+                // придёт с resolve ниже.
+                Credentials.Snapshot initial = creds.snapshot();
+                if (initial.sendPermitted()) {
+                    tokenPref.setText(initial.token);
+                }
                 tokenPref.setSummaryProvider(preference -> {
-                    String token = TokenStorage.getToken(preference.getContext());
-                    return token.isEmpty() ? "Токен не задан" : "Токен задан";
+                    Credentials.Snapshot s = creds.snapshot();
+                    return tokenSummary(s);
                 });
                 tokenPref.setOnPreferenceChangeListener((preference, newValue) -> {
                     String value = newValue == null ? "" : newValue.toString().trim();
-                    TokenStorage.setToken(preference.getContext(), value);
-                    preference.setSummary(value.isEmpty() ? "Токен не задан" : "Токен задан");
-                    ((EditTextPreference) preference).setText(value);
+                    tokenPref.setSummaryProvider(p -> "Сохранение…");
+                    // Запрос записи уже закрыл отправку старой версией;
+                    // «сохранён» показывается только после подтверждения.
+                    creds.setTokenOnMain(value,
+                            s -> applyTokenResult(s, "Токен сохранён", null));
                     return true;
                 });
             }
@@ -127,6 +151,8 @@ public class SettingsActivity extends AppCompatActivity {
                             .getString("alert_min_bg", "4.1");
                     return "Текущее значение: " + value + " ммоль/л";
                 });
+                alertMinBgPref.setOnPreferenceChangeListener((preference, newValue) ->
+                        applyThreshold(preference, newValue, "alert_max_bg", "12.2", true));
             }
 
             EditTextPreference alertMaxBgPref = findPreference("alert_max_bg");
@@ -136,6 +162,8 @@ public class SettingsActivity extends AppCompatActivity {
                             .getString("alert_max_bg", "12.2");
                     return "Текущее значение: " + value + " ммоль/л";
                 });
+                alertMaxBgPref.setOnPreferenceChangeListener((preference, newValue) ->
+                        applyThreshold(preference, newValue, "alert_min_bg", "4.1", false));
             }
 
             androidx.preference.ListPreference pollIntervalPref = findPreference("poll_interval");
@@ -153,8 +181,9 @@ public class SettingsActivity extends AppCompatActivity {
             Preference selectChat = findPreference("select_chat");
             if (selectChat != null) {
                 selectChat.setSummaryProvider(preference -> {
-                    long chatId = TokenStorage.getChatId(preference.getContext());
-                    return chatId > 0 ? "Выбран чат ID: " + chatId : "Нажмите для выбора беседы из списка";
+                    Credentials.Snapshot s = creds.snapshot();
+                    if (!s.sendPermitted()) return Credentials.describe(s);
+                    return s.chatId > 0 ? "Выбран чат ID: " + s.chatId : "Нажмите для выбора беседы из списка";
                 });
                 selectChat.setOnPreferenceClickListener(preference -> {
                     Intent intent = new Intent(getActivity(), VkConversationsActivity.class);
@@ -167,8 +196,9 @@ public class SettingsActivity extends AppCompatActivity {
             Preference selectAlertChat = findPreference("select_alert_chat");
             if (selectAlertChat != null) {
                 selectAlertChat.setSummaryProvider(preference -> {
-                    long chatId = TokenStorage.getAlertChatId(preference.getContext());
-                    return chatId > 0 ? "Выбран чат ID: " + chatId : "Нажмите для выбора беседы для тревожных сообщений";
+                    Credentials.Snapshot s = creds.snapshot();
+                    if (!s.sendPermitted()) return Credentials.describe(s);
+                    return s.alertChatId != 0 ? "Выбран чат ID: " + s.alertChatId : "Нажмите для выбора беседы для тревожных сообщений";
                 });
                 selectAlertChat.setOnPreferenceClickListener(preference -> {
                     Intent intent = new Intent(getActivity(), VkConversationsActivity.class);
@@ -204,39 +234,205 @@ public class SettingsActivity extends AppCompatActivity {
                     return enabled ? "Будут отправляться разовые уведомления о вводе терапии" : "Уведомления о терапии отключены";
                 });
             }
+
+            // Подтверждённое состояние приходит с фона — экран обновляется,
+            // если ещё жив; поздний callback уничтоженный экран не трогает.
+            creds.resolveOnMain(s -> {
+                if (!isAdded()) {
+                    return;
+                }
+                refreshCredentialViews();
+            });
         }
 
-        private void onTokenFileSelected(Uri uri) {
+        /**
+         * Валидация порога: конечное число в допустимом диапазоне ммоль/л,
+         * нижний строго меньше верхнего. Десятичная запятая нормализуется в точку.
+         */
+        private boolean applyThreshold(androidx.preference.Preference preference, Object newValue,
+                                       String otherKey, String otherDefault, boolean isMin) {
+            try {
+                double v = com.example.xdrip2vk.core.AlertThresholds
+                        .parseMmolValue(String.valueOf(newValue));
+                String otherRaw = androidx.preference.PreferenceManager
+                        .getDefaultSharedPreferences(preference.getContext())
+                        .getString(otherKey, otherDefault);
+                double other = com.example.xdrip2vk.core.AlertThresholds.parseMmolValue(otherRaw);
+                boolean ok = isMin ? v < other : v > other;
+                if (!ok) {
+                    Toast.makeText(preference.getContext(),
+                            "Нижний порог должен быть меньше верхнего", Toast.LENGTH_LONG).show();
+                    return false;
+                }
+                // Сохраняем нормализованное значение (точка вместо запятой)
+                ((EditTextPreference) preference).setText(String.valueOf(v));
+                return false; // значение уже сохранено через setText
+            } catch (IllegalArgumentException e) {
+                Toast.makeText(preference.getContext(),
+                        "Введите конечное число в ммоль/л (0.5–50)", Toast.LENGTH_LONG).show();
+                return false;
+            }
+        }
+
+        /**
+         * Текст подсказки токена по снимку: состояние хранилища не
+         * маскируется под «токен не задан».
+         */
+        private static String tokenSummary(Credentials.Snapshot s) {
+            if (!s.sendPermitted()) {
+                return Credentials.describe(s);
+            }
+            return s.token.isEmpty() ? "Токен не задан" : "Токен задан";
+        }
+
+        /**
+         * Итог команды записи токена на экран: успех — только после
+         * подтверждённого commit; при ошибке — фиксированная причина без
+         * значений и текста исключения. Закрытый экран не обновляется,
+         * подтверждённая операция хранения при этом не теряется.
+         */
+        private void applyTokenResult(Credentials.CommandResult res,
+                                      String readyMessage, String deletedMessage) {
+            if (!isAdded()) {
+                return;
+            }
+            Credentials.Snapshot s = res.outcome;
+            if (res.superseded) {
+                // Запоздавший исход старой записи: экран обновляется по
+                // актуальному снимку, старое значение не заявляется
+                // текущим. Отказ самой команды показываем с её причиной.
+                refreshCredentialViews();
+                if (s.sendPermitted() || s.state == Credentials.State.EMPTY
+                        || s.state == Credentials.State.DELETED) {
+                    Toast.makeText(requireContext(),
+                            Credentials.describe(creds.snapshot()),
+                            Toast.LENGTH_SHORT).show();
+                } else {
+                    Toast.makeText(requireContext(),
+                            "Не удалось сохранить токен: "
+                                    + Credentials.describe(s),
+                            Toast.LENGTH_LONG).show();
+                }
+                return;
+            }
+            switch (s.state) {
+                case READY:
+                    refreshCredentialViews();
+                    VkSenderService.notifyTokenChanged(requireContext());
+                    Toast.makeText(requireContext(), readyMessage, Toast.LENGTH_SHORT).show();
+                    break;
+                case EMPTY:
+                case DELETED:
+                    refreshCredentialViews();
+                    VkSenderService.notifyTokenChanged(requireContext());
+                    if (deletedMessage != null) {
+                        Toast.makeText(requireContext(), deletedMessage, Toast.LENGTH_SHORT).show();
+                    }
+                    break;
+                default:
+                    refreshCredentialViews();
+                    Toast.makeText(requireContext(),
+                            "Не удалось сохранить токен: " + Credentials.describe(s),
+                            Toast.LENGTH_LONG).show();
+                    break;
+            }
+        }
+
+        /**
+         * Перечитать опубликованный снимок во всех подсказках экрана:
+         * SummaryProvider при повторной установке опрашивается заново —
+         * единый источник состояния.
+         */
+        private void refreshCredentialViews() {
+            EditTextPreference tokenPref = findPreference("vk_token");
+            if (tokenPref != null) {
+                Credentials.Snapshot s = creds.snapshot();
+                if (s.sendPermitted() || s.state == Credentials.State.EMPTY
+                        || s.state == Credentials.State.DELETED) {
+                    tokenPref.setText(s.token);
+                }
+                tokenPref.setSummaryProvider(p -> tokenSummary(creds.snapshot()));
+            }
+            refreshChatSummaries();
+        }
+
+        /** Обновить подсказки выбранных чатов после подтверждённого снимка. */
+        private void refreshChatSummaries() {
+            Preference selectChat = findPreference("select_chat");
+            if (selectChat != null) {
+                selectChat.setSummaryProvider(p -> {
+                    Credentials.Snapshot s = creds.snapshot();
+                    if (!s.sendPermitted()) return Credentials.describe(s);
+                    return s.chatId > 0 ? "Выбран чат ID: " + s.chatId
+                            : "Нажмите для выбора беседы из списка";
+                });
+            }
+            Preference selectAlertChat = findPreference("select_alert_chat");
+            if (selectAlertChat != null) {
+                selectAlertChat.setSummaryProvider(p -> {
+                    Credentials.Snapshot s = creds.snapshot();
+                    if (!s.sendPermitted()) return Credentials.describe(s);
+                    return s.alertChatId != 0 ? "Выбран чат ID: " + s.alertChatId
+                            : "Нажмите для выбора беседы для тревожных сообщений";
+                });
+            }
+        }
+
+        void onTokenFileSelected(Uri uri) { // package-private — проверка пути импорта в тестах
             if (uri == null || getContext() == null) {
                 return;
             }
-            try (InputStream is = requireContext().getContentResolver().openInputStream(uri);
-                 BufferedReader reader = new BufferedReader(new InputStreamReader(is))) {
-                StringBuilder sb = new StringBuilder();
-                String line;
-                while ((line = reader.readLine()) != null) {
-                    sb.append(line).append('\n');
+            final Uri fileUri = uri;
+            // Чтение файла — вне главного потока; запись токена — та же
+            // команда фасада, что и ручной ввод.
+            new Thread(() -> {
+                String token = null;
+                String error = null;
+                try (InputStream is = requireContext().getContentResolver().openInputStream(fileUri);
+                     BufferedReader reader = new BufferedReader(new InputStreamReader(is))) {
+                    StringBuilder sb = new StringBuilder();
+                    String line;
+                    while ((line = reader.readLine()) != null) {
+                        sb.append(line).append('\n');
+                    }
+                    String content = sb.toString().trim();
+                    if (content.isEmpty()) {
+                        error = "Файл пустой";
+                    } else {
+                        String candidate = content.split("\\s+")[0];
+                        if (candidate.isEmpty()) {
+                            error = "Не удалось найти токен в файле";
+                        } else {
+                            token = candidate;
+                        }
+                    }
+                } catch (Exception e) {
+                    // getMessage() может содержать фрагмент содержимого файла —
+                    // пользователю показывается только фиксированная причина.
+                    error = "Ошибка чтения файла";
                 }
-                String content = sb.toString().trim();
-                if (content.isEmpty()) {
-                    Toast.makeText(requireContext(), "Файл пустой", Toast.LENGTH_SHORT).show();
-                    return;
+                final String parsed = token;
+                final String err = error;
+                mainHandler.post(() -> {
+                    if (!isAdded()) {
+                        return;
+                    }
+                    if (parsed == null) {
+                        Toast.makeText(requireContext(), err, Toast.LENGTH_LONG).show();
+                        return;
+                    }
+                    EditTextPreference tokenPref = findPreference("vk_token");
+                    if (tokenPref != null) {
+                        tokenPref.setSummaryProvider(p -> "Сохранение…");
+                    }
+                    creds.setTokenOnMain(parsed,
+                            s -> applyTokenResult(s, "Токен импортирован", null));
+                });
+                java.util.concurrent.CountDownLatch l = importDoneForTest;
+                if (l != null) {
+                    l.countDown();
                 }
-                String token = content.split("\\s+")[0];
-                if (token.isEmpty()) {
-                    Toast.makeText(requireContext(), "Не удалось найти токен в файле", Toast.LENGTH_SHORT).show();
-                    return;
-                }
-                TokenStorage.setToken(requireContext(), token);
-                EditTextPreference tokenPref = findPreference("vk_token");
-                if (tokenPref != null) {
-                    tokenPref.setText(token);
-                    tokenPref.setSummary("Токен задан");
-                }
-                Toast.makeText(requireContext(), "Токен импортирован", Toast.LENGTH_SHORT).show();
-            } catch (IOException e) {
-                Toast.makeText(requireContext(), "Ошибка чтения файла: " + e.getMessage(), Toast.LENGTH_LONG).show();
-            }
+            }).start();
         }
     }
 }

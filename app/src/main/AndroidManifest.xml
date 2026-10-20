@@ -9,13 +9,19 @@
     <uses-permission android:name="android.permission.POST_NOTIFICATIONS" />
     <uses-permission android:name="android.permission.WAKE_LOCK" />
     <uses-permission android:name="android.permission.SCHEDULE_EXACT_ALARM" />
+    <!-- Гейт получателя для xDrip broadcast с permission-требованием.
+         Не является проверкой отправителя: ограничивает только то, какие
+         приложения получат broadcast. -->
+    <uses-permission android:name="com.eveningoutpost.dexdrip.permissions.RECEIVE_BG_ESTIMATE" />
 
     <permission
         android:name="com.example.xdrip2vk.permission.RECEIVE_BROADCAST"
         android:protectionLevel="signature" />
 
     <application
-        android:allowBackup="true"
+        android:allowBackup="false"
+        android:fullBackupContent="@xml/backup_rules"
+        android:dataExtractionRules="@xml/data_extraction_rules"
         android:icon="@mipmap/ic_launcher"
         android:label="@string/app_name"
         android:roundIcon="@mipmap/ic_launcher_round"
@@ -71,14 +77,6 @@
             android:exported="true">
             <intent-filter>
                 <action android:name="com.eveningoutpost.dexdrip.BgEstimate" />
-                <action android:name="com.eveningoutpost.dexdrip.BG_ESTIMATE" />
-                <action android:name="com.eveningoutpost.dexdrip.BgReading" />
-                <action android:name="com.eveningoutpost.dexdrip.EGV_ESTIMATE" />
-                <action android:name="com.eveningoutpost.dexdrip.NEW_EGV_ESTIMATE" />
-                <action android:name="com.eveningoutpost.dexdrip.NEW_BG_ESTIMATE" />
-                <action android:name="com.eveningoutpost.dexdrip.EGV" />
-                <action android:name="com.eveningoutpost.dexdrip.NEW_ESTIMATE" />
-                <action android:name="com.eveningoutpost.dexdrip.BgEstimate.BgEstimate" />
             </intent-filter>
         </receiver>
 

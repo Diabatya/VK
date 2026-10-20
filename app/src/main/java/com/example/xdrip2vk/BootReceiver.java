@@ -22,14 +22,51 @@ public class BootReceiver extends BroadcastReceiver {
                 }
             }
 
-            // Запускаем сервис только если настроены токен и chat ID
-            String token = TokenStorage.getToken(context);
-            long chatId = TokenStorage.getChatId(context);
+            // Запускаем сервис только если пользователь разрешил передачу
+            // и настроены токен и chat ID
+            if (!VkSenderService.isTransmissionAllowed(context)) {
+                // Boot случился до подтверждения миграции выбора — без
+                // повторной проверки автозапуск был бы потерян навсегда
+                // (будильники при перезагрузке стираются). При
+                // подтверждённом запрете пользователя будильник не ставим.
+                if (VkSenderService.isConfirmationPending()) {
+                    VkSenderService.scheduleConfirmationRetry(context);
+                }
+                return;
+            }
 
-            if (!token.isEmpty() && chatId > 0) {
-                Intent serviceIntent = new Intent(context, VkSenderService.class);
-                context.startForegroundService(serviceIntent);
+            // Реквизиты читаются только через фасад: на главном потоке
+            // receiver доступен уже опубликованный снимок (без Keystore),
+            // иначе — подтверждение состояния асинхронно, запуск только
+            // после READY-снимка с токеном и чатом.
+            Credentials creds = Credentials.get(context);
+            if (creds.snapshot().configured()) {
+                startServiceIfAllowed(context);
+            } else {
+                final Context app = context.getApplicationContext();
+                creds.resolveOnBackground(s -> {
+                    if (s.configured()) {
+                        startServiceIfAllowed(app);
+                    }
+                });
             }
         }
+    }
+
+    /**
+     * Одно правило запуска по реквизитам для синхронной ветки и
+     * отложенного callback'а: действующее разрешение перепроверяется
+     * непосредственно перед startForegroundService — за время чтения
+     * пользователь мог остановить передачу, и запоздавший READY не
+     * отменяет Stop (включая процессный запрет при отказе записи Stop).
+     * Отказавший запуск не назначает новых попыток подтверждения —
+     * цепочка принадлежит свежим входам, а не устаревшему callback'у.
+     */
+    private static void startServiceIfAllowed(Context context) {
+        if (!VkSenderService.isTransmissionAllowed(context)) {
+            return;
+        }
+        Intent serviceIntent = new Intent(context, VkSenderService.class);
+        context.startForegroundService(serviceIntent);
     }
 }

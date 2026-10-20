@@ -1,6 +1,5 @@
 package com.example.xdrip2vk;
 
-import android.content.Intent;
 import android.os.Bundle;
 import android.view.View;
 import android.widget.AdapterView;
@@ -11,6 +10,8 @@ import android.widget.TextView;
 import android.widget.Toast;
 import androidx.appcompat.app.AppCompatActivity;
 import androidx.appcompat.widget.Toolbar;
+import com.example.xdrip2vk.core.CredentialAudit;
+import com.example.xdrip2vk.core.Fingerprint;
 import org.json.JSONArray;
 import org.json.JSONObject;
 import java.util.ArrayList;
@@ -23,6 +24,9 @@ public class VkConversationsActivity extends AppCompatActivity {
     private ProgressBar progressBar;
     private List<Conversation> conversations;
     private String token;
+    /** Fingerprint токена, с которым загружен список — выбор привязан к версии. */
+    private String tokenFp;
+    private String chatType;
 
     public static class Conversation {
         public String title;
@@ -54,7 +58,7 @@ public class VkConversationsActivity extends AppCompatActivity {
         }
 
         TextView tvChatType = findViewById(R.id.tv_chat_type);
-        String chatType = getIntent().getStringExtra("chat_type");
+        chatType = getIntent().getStringExtra("chat_type");
         if (chatType == null) chatType = "normal";
 
         if ("alert".equals(chatType)) {
@@ -67,35 +71,62 @@ public class VkConversationsActivity extends AppCompatActivity {
         progressBar = findViewById(R.id.progress_bar);
         conversations = new ArrayList<>();
 
-        token = TokenStorage.getToken(this);
-
-        if (token.isEmpty()) {
-            Toast.makeText(this, "Сначала укажите токен VK", Toast.LENGTH_LONG).show();
-            finish();
-            return;
-        }
-
         progressBar.setVisibility(View.VISIBLE);
         listView.setVisibility(View.GONE);
 
-        loadConversations();
-    }
-
-    private void loadConversations() {
-        new Thread(() -> {
-            Map<String, String> params = new HashMap<>();
-            params.put("count", "20");
-            String response = VkApi.request("messages.getConversations", token, params);
-
-            if (response == null) {
+        // Токен читается только из подтверждённого снимка фасада,
+        // асинхронно — Keystore не открывается на главном потоке.
+        Credentials.get(this).resolveOnBackground(s -> {
+            if (!s.configured() && (!s.sendPermitted() || s.token.isEmpty())) {
+                // Нет подтверждённого токена или хранилище заблокировано —
+                // ошибка не выглядит как «токен не задан».
                 runOnUiThread(() -> {
-                    Toast.makeText(this, "Ошибка сети при загрузке бесед", Toast.LENGTH_LONG).show();
-                    finishLoad();
+                    if (!isFinishing() && !isDestroyed()) {
+                        Toast.makeText(this, Credentials.describe(s),
+                                Toast.LENGTH_LONG).show();
+                        finish();
+                    }
                 });
                 return;
             }
+            token = s.token;
+            tokenFp = Fingerprint.of(token);
+            loadConversations();
+        });
+    }
 
-            parseResponse(response);
+    /**
+     * Тестовый сигнал завершения фоновой загрузки: выставляется тестом,
+     * отсчитывается фоновым потоком ПОСЛЕ постановки результата в главный
+     * поток (все пути parseResponse/failure завершаются runOnUiThread-задачей
+     * или возвратом). Заменяет ожидание по таймеру; логику не меняет.
+     */
+    static volatile java.util.concurrent.CountDownLatch loadDoneForTest;
+
+    private void loadConversations() {
+        // Захват сигнала именно этой загрузки при её запуске: завершившийся
+        // поздно поток не отсчитает latch, который выставил следующий тест.
+        final java.util.concurrent.CountDownLatch l = loadDoneForTest;
+        new Thread(() -> {
+            try {
+                Map<String, String> params = new HashMap<>();
+                params.put("count", "20");
+                String response = VkApi.request("messages.getConversations", token, params);
+
+                if (response == null) {
+                    runOnUiThread(() -> {
+                        Toast.makeText(this, "Ошибка сети при загрузке бесед", Toast.LENGTH_LONG).show();
+                        finishLoad();
+                    });
+                    return;
+                }
+
+                parseResponse(response);
+            } finally {
+                if (l != null) {
+                    l.countDown(); // результат уже поставлен в главный поток
+                }
+            }
         }).start();
     }
 
@@ -109,9 +140,12 @@ public class VkConversationsActivity extends AppCompatActivity {
             JSONObject responseObj = new JSONObject(json);
 
             if (responseObj.has("error")) {
-                String errorMsg = responseObj.getJSONObject("error").getString("error_msg");
+                // error_msg/request_params могут содержать токен и данные
+                // запроса — показываем фиксированное сообщение + числовой код.
+                int code = VkApi.extractErrorCode(json);
                 runOnUiThread(() -> {
-                    Toast.makeText(this, "Ошибка VK: " + errorMsg, Toast.LENGTH_LONG).show();
+                    Toast.makeText(this, describeApiError(code),
+                            Toast.LENGTH_LONG).show();
                     finishLoad();
                 });
                 return;
@@ -151,26 +185,80 @@ public class VkConversationsActivity extends AppCompatActivity {
 
                 listView.setOnItemClickListener((AdapterView<?> parent, View view, int position, long id) -> {
                     Conversation selected = conversations.get(position);
-                    String chatType = getIntent().getStringExtra("chat_type");
-                    if (chatType == null) chatType = "normal";
-
-                    if ("alert".equals(chatType)) {
-                        TokenStorage.setAlertChatId(this, selected.peerId);
-                    } else {
-                        TokenStorage.setChatId(this, selected.peerId);
-                    }
-
-                    Toast.makeText(this, "Выбрано: " + selected.title, Toast.LENGTH_SHORT).show();
-                    finish();
+                    onConversationSelected(selected);
                 });
             });
 
         } catch (Exception e) {
-            e.printStackTrace();
+            // getMessage() может включать фрагмент ответа — только фиксированная
+            // причина и класс исключения в журнал, фиксированный текст в Toast.
+            Logger.e("VkConversations", "Некорректный ответ VK при загрузке бесед: "
+                    + e.getClass().getSimpleName());
             runOnUiThread(() -> {
-                Toast.makeText(this, "Ошибка парсинга: " + e.getMessage(), Toast.LENGTH_LONG).show();
+                Toast.makeText(this, "Некорректный ответ VK", Toast.LENGTH_LONG).show();
                 finishLoad();
             });
         }
+    }
+
+    /**
+     * Выбор адресата — через команду хранилища с fingerprint версии токена,
+     * с которой загружен список: выбор по списку старой версии не пишется.
+     * Успех показывается только после подтверждённой записи.
+     */
+    private void onConversationSelected(Conversation selected) {
+        progressBar.setVisibility(View.VISIBLE);
+        if ("alert".equals(chatType)) {
+            Credentials.get(this).setAlertChatIdOnMain(selected.peerId, tokenFp,
+                    s -> onSelectionResult(selected, s));
+        } else {
+            Credentials.get(this).setChatIdOnMain(selected.peerId, tokenFp,
+                    s -> onSelectionResult(selected, s));
+        }
+    }
+
+    private void onSelectionResult(Conversation selected,
+                                   Credentials.CommandResult res) {
+        if (isFinishing() || isDestroyed()) {
+            return;
+        }
+        progressBar.setVisibility(View.GONE);
+        // Исход ЭТОЙ команды: чужой READY не делает отклонённый выбор
+        // успешным. Замещённый более новым изменением успех не
+        // подтверждает старое значение как текущее — статус по
+        // актуальному снимку фасада.
+        Credentials.Snapshot s = res.outcome;
+        if (s.state == Credentials.State.READY && !res.superseded) {
+            Toast.makeText(this, "Выбрано: " + selected.title,
+                    Toast.LENGTH_SHORT).show();
+            finish();
+            return;
+        }
+        if (s.state == Credentials.State.BLOCKED
+                && s.reason == CredentialAudit.Reason.STALE_TOKEN) {
+            Toast.makeText(this,
+                    "Токен изменился, загрузите список бесед заново",
+                    Toast.LENGTH_LONG).show();
+            return;
+        }
+        Toast.makeText(this,
+                res.superseded
+                        ? Credentials.describe(Credentials.get(this).snapshot())
+                        : Credentials.describe(s),
+                Toast.LENGTH_LONG).show();
+    }
+
+    /**
+     * Понятное сообщение по числовому коду ошибки VK без сырого текста ответа.
+     * Код 5 — отказ авторизации (контракт VK API); прочие коды — общий отказ.
+     */
+    private static String describeApiError(int code) {
+        if (code == 5) {
+            return "Ошибка авторизации VK";
+        }
+        if (code >= 0) {
+            return "Не удалось загрузить беседы (код " + code + ")";
+        }
+        return "Не удалось загрузить беседы";
     }
 }

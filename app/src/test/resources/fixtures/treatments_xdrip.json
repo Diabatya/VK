@@ -1,0 +1,5 @@
+[
+  {"_id": "fixture-treat-3", "created_at": 1715336700000, "eventType": "Correction Bolus", "enteredBy": "fixture", "notes": "", "carbs": 0, "insulin": 1.5},
+  {"_id": "fixture-treat-2", "created_at": 1715336400000, "eventType": "Meal Bolus", "enteredBy": "fixture", "notes": "", "carbs": 45, "insulin": 3.0},
+  {"_id": "fixture-treat-1", "created_at": 1715336400000, "eventType": "Carb Correction", "enteredBy": "fixture", "notes": "", "carbs": 15, "insulin": 0}
+]

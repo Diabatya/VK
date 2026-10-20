@@ -10,8 +10,8 @@ android {
         applicationId "com.example.xdrip2vk"
         minSdk 26
         targetSdk 34
-        versionCode 27
-        versionName "4.3"
+        versionCode 28
+        versionName "4.3.1"
     }
 
     buildTypes {
@@ -25,6 +25,17 @@ android {
         sourceCompatibility JavaVersion.VERSION_1_8
         targetCompatibility JavaVersion.VERSION_1_8
     }
+
+    // Имя APK: caxarok_<versionName>.apk — версия подставляется автоматически.
+    applicationVariants.all { variant ->
+        variant.outputs.all { output ->
+            outputFileName = "caxarok_${variant.versionName}.apk"
+        }
+    }
+
+    testOptions {
+        unitTests.includeAndroidResources = true
+    }
 }
 
 dependencies {
@@ -32,6 +43,11 @@ dependencies {
     implementation 'com.google.android.material:material:1.10.0'
     implementation 'androidx.preference:preference:1.2.1'
     implementation 'androidx.security:security-crypto:1.0.0'
+
+    testImplementation 'junit:junit:4.13.2'
+    testImplementation 'org.json:json:20231013'
+    testImplementation 'androidx.test:core:1.5.0'
+    testImplementation 'org.robolectric:robolectric:4.13'
 }
 
 tasks.withType(JavaCompile) {

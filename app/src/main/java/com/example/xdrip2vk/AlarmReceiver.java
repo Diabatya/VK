@@ -13,6 +13,23 @@ public class AlarmReceiver extends BroadcastReceiver {
     public void onReceive(Context context, Intent intent) {
         Logger.d(TAG, "Получен сигнал alarm, запускаем сервис для опроса xDrip+");
 
+        if (intent != null && intent.getBooleanExtra("confirm_retry", false)) {
+            // сработал будильник повторной проверки — слот назначения свободен
+            VkSenderService.confirmationRetryFired();
+        }
+
+        // Передача запрещена пользователем: alarm не возобновляет работу —
+        // выход до WakeLock и запуска сервиса.
+        if (!VkSenderService.isTransmissionAllowed(context)) {
+            // Выбор ещё не подтверждён — повторная проверка через будильник,
+            // чтобы пришедшее в окно инициализации событие не потерялось.
+            if (VkSenderService.isConfirmationPending()) {
+                VkSenderService.scheduleConfirmationRetry(context);
+            }
+            Logger.d(TAG, "Передача сейчас не разрешена — alarm проигнорирован");
+            return;
+        }
+
         PowerManager pm = (PowerManager) context.getSystemService(Context.POWER_SERVICE);
         if (pm == null) {
             Logger.w(TAG, "PowerManager недоступен");
