@@ -30,10 +30,16 @@ public final class MaxChannel {
     private static final String KEY_TARGET_CHANNEL = "target_channel";
     private static final String KEY_TARGET_NOTIF = "target_notif_id";
     private static final String KEY_BLOCKED_BY = "blocked_by";
+    private static final String KEY_BLOCKED_REASON = "blocked_reason";
+    /** Конфликт: у другого чата та же системная операция ответа. */
+    public static final String BLOCKED_CONFLICT = "conflict";
+    /** Неоднозначность: имя совпадает, но идентификатор чата не подтверждён. */
+    public static final String BLOCKED_AMBIGUOUS = "ambiguous";
     private static final String KEY_PENDING_TEXT = "pending_text";
     private static final String KEY_PENDING_TS = "pending_reading_ts";
     private static final String KEY_HANDOFF_TS = "last_handoff_ts";
     private static final String KEY_HANDOFF_READING_TS = "last_handoff_reading_ts";
+    private static final String KEY_TEST_HANDOFF_TS = "last_test_handoff_ts";
 
     private MaxChannel() { }
 
@@ -96,7 +102,7 @@ public final class MaxChannel {
                 .putString(KEY_TARGET_NAME, button.chatName)
                 .putString(KEY_TARGET_CHANNEL, button.channelId)
                 .putInt(KEY_TARGET_NOTIF, button.notificationId)
-                .remove(KEY_BLOCKED_BY)
+                .remove(KEY_BLOCKED_BY).remove(KEY_BLOCKED_REASON)
                 .remove(KEY_PENDING_TEXT).remove(KEY_PENDING_TS)
                 .apply();
     }
@@ -104,20 +110,33 @@ public final class MaxChannel {
     public static void clearTarget(Context context) {
         prefs(context).edit()
                 .remove(KEY_TARGET_NAME).remove(KEY_TARGET_CHANNEL).remove(KEY_TARGET_NOTIF)
-                .remove(KEY_BLOCKED_BY)
+                .remove(KEY_BLOCKED_BY).remove(KEY_BLOCKED_REASON)
                 .remove(KEY_PENDING_TEXT).remove(KEY_PENDING_TS)
                 .apply();
     }
 
     /**
-     * Тот ли это чат: имя совпадает точно, и совпадает канал уведомления.
-     * Канал у одного чата иногда меняется (системные решения MAX) — тогда чат
-     * признаём по id уведомления, у чата он постоянный.
+     * Тот ли это чат: имя и id уведомления совпадают точно. Одного имени и
+     * общего канала недостаточно: два одноимённых чата на одном канале —
+     * разные адресаты. Постоянство notificationId на всех версиях MAX на
+     * устройстве не проверено; при его смене у реального чата соответствие
+     * не подтверждается — пользователь выбирает чат заново (безопасно).
      */
     static boolean matches(Target target, MaxReplyButton button) {
-        return button.chatName.equals(target.chatName)
-                && (button.channelId.equals(target.channelId)
-                    || (target.notificationId != 0 && button.notificationId == target.notificationId));
+        if (!button.chatName.equals(target.chatName)) return false;
+        if (target.notificationId != 0) {
+            return button.notificationId == target.notificationId;
+        }
+        // Запасной путь для цели без id: имя+канал — самые слабые признаки.
+        return button.channelId.equals(target.channelId);
+    }
+
+    /**
+     * Имя совпадает, но идентичность не подтверждена: возможно другой чат с
+     * таким же названием. Такую кнопку нельзя принимать за выбранный чат.
+     */
+    static boolean isAmbiguous(Target target, MaxReplyButton button) {
+        return button.chatName.equals(target.chatName) && !matches(target, button);
     }
 
     // --- Блокировка «чужая кнопка» ----------------------------------------------
@@ -126,12 +145,19 @@ public final class MaxChannel {
         return prefs(context).getString(KEY_BLOCKED_BY, null);
     }
 
-    public static void setBlockedBy(Context context, String chatName) {
-        prefs(context).edit().putString(KEY_BLOCKED_BY, chatName).apply();
+    public static void setBlockedBy(Context context, String reason, String chatName) {
+        prefs(context).edit()
+                .putString(KEY_BLOCKED_BY, chatName)
+                .putString(KEY_BLOCKED_REASON, reason)
+                .apply();
+    }
+
+    public static String getBlockedReason(Context context) {
+        return prefs(context).getString(KEY_BLOCKED_REASON, null);
     }
 
     static void clearBlockedBy(Context context) {
-        prefs(context).edit().remove(KEY_BLOCKED_BY).apply();
+        prefs(context).edit().remove(KEY_BLOCKED_BY).remove(KEY_BLOCKED_REASON).apply();
     }
 
     // --- Ожидающее показание (одно, последнее) -----------------------------------
@@ -166,11 +192,20 @@ public final class MaxChannel {
 
     // --- Факт передачи команды (не доставка!) -------------------------------------
 
-    static void recordHandoff(Context context, long nowMs, long readingTs) {
+    static void recordReadingHandoff(Context context, long nowMs, long readingTs) {
         prefs(context).edit()
                 .putLong(KEY_HANDOFF_TS, nowMs)
                 .putLong(KEY_HANDOFF_READING_TS, readingTs)
                 .apply();
+    }
+
+    /** Факт передачи тестовой команды — отдельно от показаний и их watermark. */
+    static void recordTestHandoff(Context context, long nowMs) {
+        prefs(context).edit().putLong(KEY_TEST_HANDOFF_TS, nowMs).apply();
+    }
+
+    static long getLastTestHandoffMs(Context context) {
+        return prefs(context).getLong(KEY_TEST_HANDOFF_TS, 0);
     }
 
     public static long getLastHandoffMs(Context context) {

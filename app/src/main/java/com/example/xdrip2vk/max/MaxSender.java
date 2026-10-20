@@ -10,6 +10,7 @@ import android.os.Bundle;
 import com.example.xdrip2vk.Logger;
 import com.example.xdrip2vk.VkSenderService;
 
+import java.util.Objects;
 import java.util.function.Function;
 import java.util.function.LongSupplier;
 
@@ -20,9 +21,9 @@ import java.util.function.LongSupplier;
  * передачу команды приложению MAX, а не доставку.
  *
  * Повторов после успешной передачи нет. Если кнопки нет (перезапуск, MAX её
- * отменил, конфликт, Stop), последнее показание лежит в pending и уходит при
- * следующей кнопке выбранного чата — если к тому моменту не устарело
- * (PENDING_MAX_AGE_MS от времени показания).
+ * отменил, конфликт, неоднозначный адресат, отзыв доступа, Stop), последнее
+ * показание лежит в pending и уходит при следующей кнопке выбранного чата —
+ * если к тому моменту не устарело (PENDING_MAX_AGE_MS от времени показания).
  */
 public final class MaxSender {
 
@@ -55,6 +56,69 @@ public final class MaxSender {
         }
     }
 
+    // --- Кандидаты для диалога выбора (неизменяемый снимок) ----------------------
+
+    /**
+     * Строка списка кандидатов: привязана к конкретной захваченной кнопке,
+     * а не к позиции в живом списке — новые уведомления во время открытого
+     * диалога не меняют то, что выберет пользователь.
+     */
+    public static final class Candidate {
+        final MaxReplyButton button;
+
+        Candidate(MaxReplyButton button) {
+            this.button = button;
+        }
+
+        public String chatName() {
+            return button.chatName;
+        }
+
+        public String kind() {
+            return button.kind();
+        }
+
+        public long capturedAtMs() {
+            return button.capturedAtMs;
+        }
+
+        /** Подпись строки: «имя — тип · время уведомления». */
+        public String label() {
+            String t = android.text.format.DateFormat.format("HH:mm", button.capturedAtMs).toString();
+            return button.chatName + " — " + button.kind() + " · " + t;
+        }
+    }
+
+    /** Снимок кандидатов: свежие сверху. Строки диалога строятся из него. */
+    public static java.util.List<Candidate> candidates() {
+        java.util.List<MaxReplyButton> list = MaxState.candidates();
+        java.util.List<Candidate> out = new java.util.ArrayList<>(list.size());
+        for (MaxReplyButton b : list) {
+            out.add(new Candidate(b));
+        }
+        return out;
+    }
+
+    /**
+     * Выбор чата пользователем: записывает адресата и переносит живую кнопку
+     * именно этого кандидата в цель — не «текущую строку под тем же индексом».
+     * Ожидающее старое показание новому чату не передаётся — setTarget очищает.
+     */
+    public static boolean selectCandidate(Context context, Candidate candidate) {
+        if (candidate == null || candidate.button == null
+                || candidate.button.pendingIntent == null) {
+            return false;
+        }
+        synchronized (MaxSender.class) {
+            MaxChannel.setTarget(context, candidate.button);
+            MaxState.targetButton = candidate.button;
+        }
+        MaxReplyBackup.save(context, candidate.button);
+        return true;
+    }
+
+    // --- Приём показаний ---------------------------------------------------------
+
     /**
      * Свежепринятое показание из общего пайплайна (тот же текст, что уходит в VK).
      * Вызов — из рабочего потока VkSenderService после verdict ACCEPTED.
@@ -65,8 +129,15 @@ public final class MaxSender {
         if (MaxChannel.getTarget(app) == null) return;
         // Одно показание — одна команда: уже переданное не повторяем ни автоматом, ни вручную.
         if (readingTs == MaxChannel.getLastHandoffReadingTs(app)) return;
-        MaxChannel.setPending(app, text, readingTs);
-        trySend(app, new MaxChannel.Pending(text, readingTs));
+        // Хранится одно ожидающее: более новое заменяет предыдущее, старое новое не вытесняет.
+        MaxChannel.Pending existing = MaxChannel.getPending(app);
+        if (existing == null || readingTs > existing.readingTs) {
+            MaxChannel.setPending(app, text, readingTs);
+        }
+        MaxChannel.Pending current = MaxChannel.getPending(app);
+        if (current != null) {
+            trySend(app, current, true);
+        }
     }
 
     /**
@@ -83,11 +154,13 @@ public final class MaxSender {
             Logger.i(TAG, "отложенное показание устарело — не отправляю");
             return;
         }
-        trySend(app, pending);
+        trySend(app, pending, true);
     }
 
     /**
      * Тестовое сообщение: не откладывается и не считается показанием.
+     * Ожидающий сахар не трогает: не очищает pending и не двигает watermark
+     * последнего переданного показания — следующий flush отправит его один раз.
      * Синхронный — вызывать с фонового потока. Возвращает понятный итог.
      */
     public static synchronized String sendTest(Context context) {
@@ -95,15 +168,15 @@ public final class MaxSender {
         if (!MaxChannel.isMaxEnabled(app)) return "Канал MAX выключен";
         if (MaxChannel.getTarget(app) == null) return "Чат MAX не выбран";
         String text = "Тест: связь xDrip2VK ↔ MAX работает.\nПоказания отправляются в выбранный чат.";
-        boolean sent = trySend(app, new MaxChannel.Pending(text, now()));
+        boolean sent = trySend(app, new MaxChannel.Pending(text, now()), false);
         return sent ? "Тестовое сообщение передано в MAX — доставка не подтверждена"
                 : statusText(app);
     }
 
-    private static boolean trySend(Context app, MaxChannel.Pending item) {
+    private static boolean trySend(Context app, MaxChannel.Pending item, boolean isReading) {
         MaxChannel.Target wanted = MaxChannel.getTarget(app);
         if (wanted == null) {
-            MaxChannel.clearPending(app);
+            if (isReading) MaxChannel.clearPending(app);
             return false;
         }
         if (!MaxChannel.isMaxEnabled(app)) return false;
@@ -112,9 +185,15 @@ public final class MaxSender {
             Logger.i(TAG, "не отправлено: передача остановлена");
             return false;
         }
+        // Отзыв доступа слушателя запрещает отправку даже по сохранённой кнопке;
+        // временное отключение (listenerConnected=false) запретом не является.
+        if (!listenerAccessGranted(app)) {
+            Logger.w(TAG, "не отправлено: доступ к уведомлениям отозван");
+            return false;
+        }
         String blockedBy = MaxChannel.getBlockedBy(app);
         if (blockedBy != null) {
-            Logger.w(TAG, "не отправлено: конфликт кнопки ответа — нужно новое сообщение из выбранного чата");
+            Logger.w(TAG, "не отправлено: адресат не подтверждён — нужна новая кнопка или повторный выбор");
             return false;
         }
         MaxReplyButton button = currentButton(app);
@@ -122,11 +201,18 @@ public final class MaxSender {
             Logger.w(TAG, "не отправлено: нет кнопки ответа — нужно новое сообщение из выбранного чата");
             return false;
         }
+        // Адресат и кнопка — один снимок: сохранённая/живая кнопка должна
+        // принадлежать именно текущему выбранному чату.
+        if (!MaxChannel.matches(wanted, button)) {
+            Logger.w(TAG, "не отправлено: кнопка не от выбранного чата — нужно новое сообщение");
+            if (MaxState.targetButton == button) MaxState.targetButton = null;
+            return false;
+        }
         if (!MaxChannel.MAX_PACKAGE.equals(creatorPackage(button.pendingIntent))) {
             Logger.w(TAG, "не отправлено: кнопка ответа не принадлежит MAX");
             return false;
         }
-        if (now() - item.readingTs > MaxChannel.PENDING_MAX_AGE_MS) {
+        if (isReading && now() - item.readingTs > MaxChannel.PENDING_MAX_AGE_MS) {
             MaxChannel.clearPending(app);
             Logger.i(TAG, "показание устарело — не отправляю");
             return false;
@@ -155,14 +241,22 @@ public final class MaxSender {
             } else {
                 button.pendingIntent.send(app, 0, fillIn);
             }
-            MaxChannel.clearPending(app);
-            MaxChannel.recordHandoff(app, now(), item.readingTs);
+            if (isReading) {
+                MaxChannel.clearPending(app);
+                MaxChannel.recordReadingHandoff(app, now(), item.readingTs);
+            } else {
+                MaxChannel.recordTestHandoff(app, now());
+            }
             Logger.i(TAG, "передано в MAX — доставка не подтверждена");
             return true;
         } catch (PendingIntent.CanceledException e) {
             // MAX отменил кнопку — до нового уведомления из чата отправлять нечем.
-            MaxState.targetButton = null;
-            MaxReplyBackup.clear(app);
+            // Снимаем только эту кнопку: более свежая, если успела прийти, остаётся.
+            MaxReplyButton current = MaxState.targetButton;
+            if (current == null || Objects.equals(current.pendingIntent, button.pendingIntent)) {
+                MaxState.targetButton = null;
+                MaxReplyBackup.clear(app);
+            }
             Logger.w(TAG, "не отправлено: MAX отменил кнопку ответа");
             return false;
         } catch (Throwable t) {
@@ -186,35 +280,22 @@ public final class MaxSender {
         return b;
     }
 
-    /**
-     * Подписи кандидатов для диалога выбора: «имя — тип · время уведомления».
-     * Имена могут совпадать — тип и момент помогают различить чаты.
-     */
-    public static java.util.List<String> candidateLabels() {
-        java.util.List<MaxReplyButton> list = MaxState.candidates();
-        java.util.List<String> labels = new java.util.ArrayList<>(list.size());
-        java.text.DateFormat tf = java.text.DateFormat.getTimeInstance(java.text.DateFormat.SHORT);
-        for (MaxReplyButton b : list) {
-            labels.add(b.chatName + " — " + b.kind() + " · " + tf.format(new java.util.Date(b.capturedAtMs)));
-        }
-        return labels;
+    /** Полный сброс состояния MAX в памяти и backup-копии — для тестов вне пакета max. */
+    public static void resetRuntimeForTest(Context context) {
+        MaxState.resetForTest();
+        MaxReplyBackup.clear(context);
     }
 
     /**
-     * Выбор чата пользователем: записывает адресата и переносит живую кнопку
-     * этого кандидата в цель. Ожидающее старое показание новому чату не
-     * передаётся — setTarget его очищает.
+     * Подписи кандидатов для совместимости старого вызова — заменено candidates().
      */
-    public static boolean selectCandidate(Context context, int index) {
-        java.util.List<MaxReplyButton> list = MaxState.candidates();
-        if (index < 0 || index >= list.size()) return false;
-        MaxReplyButton b = list.get(index);
-        synchronized (MaxSender.class) {
-            MaxChannel.setTarget(context, b);
-            MaxState.targetButton = b;
+    public static java.util.List<String> candidateLabels() {
+        java.util.List<Candidate> list = candidates();
+        java.util.List<String> labels = new java.util.ArrayList<>(list.size());
+        for (Candidate c : list) {
+            labels.add(c.label());
         }
-        MaxReplyBackup.save(context, b);
-        return true;
+        return labels;
     }
 
     /** Однострочное состояние канала для настроек/диагностики. */
@@ -234,10 +315,17 @@ public final class MaxSender {
         if (!VkSenderService.isTransmissionAllowed(app)) return "Передача остановлена пользователем";
         String blockedBy = MaxChannel.getBlockedBy(app);
         if (blockedBy != null) {
-            return "Отправка заблокирована — нужно новое сообщение из выбранного чата MAX";
+            return MaxChannel.BLOCKED_AMBIGUOUS.equals(MaxChannel.getBlockedReason(app))
+                    ? "Адресат не подтверждён: есть другой чат с таким же именем — выберите чат заново"
+                    : "Отправка заблокирована — нужно новое сообщение из выбранного чата MAX";
         }
         if (currentButton(app) == null) {
             return "Нужно новое сообщение из выбранного чата MAX";
+        }
+        if (!MaxState.listenerConnected) {
+            // Доступ есть, слушатель временно отключён системой — не запрет:
+            // сохранённая кнопка пригодна, новые кнопки появятся после rebind.
+            return "Слушатель уведомлений отключён — ожидание переподключения (кнопка сохранена)";
         }
         long handoff = MaxChannel.getLastHandoffMs(app);
         if (handoff > 0) {

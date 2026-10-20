@@ -433,13 +433,15 @@ public class SettingsActivity extends AppCompatActivity {
 
         /**
          * Выбор чата MAX из уведомлений, пришедших с кнопкой «Ответить».
-         * Список пуст — адресата изобрести нельзя: только явный выбор.
+         * Строки диалога привязаны к снимку кандидатов на момент открытия:
+         * новые уведомления во время диалога не меняют выбранную строку.
+         * Перед записью адресата — подтверждение с фактическим именем чата.
          */
         private void showMaxChatDialog() {
             android.content.Context ctx = requireContext();
-            java.util.List<String> labels =
-                    com.example.xdrip2vk.max.MaxSender.candidateLabels();
-            if (labels.isEmpty()) {
+            java.util.List<com.example.xdrip2vk.max.MaxSender.Candidate> candidates =
+                    com.example.xdrip2vk.max.MaxSender.candidates();
+            if (candidates.isEmpty()) {
                 new androidx.appcompat.app.AlertDialog.Builder(ctx)
                         .setTitle("Чат MAX")
                         .setMessage("Пока нет уведомлений MAX с кнопкой «Ответить». "
@@ -449,15 +451,35 @@ public class SettingsActivity extends AppCompatActivity {
                         .show();
                 return;
             }
-            CharSequence[] items = labels.toArray(new CharSequence[0]);
+            CharSequence[] items = new CharSequence[candidates.size()];
+            for (int i = 0; i < candidates.size(); i++) {
+                items[i] = candidates.get(i).label();
+            }
             new androidx.appcompat.app.AlertDialog.Builder(ctx)
                     .setTitle("Выберите чат MAX")
-                    .setItems(items, (dialog, which) -> {
-                        if (com.example.xdrip2vk.max.MaxSender.selectCandidate(ctx, which)) {
-                            Toast.makeText(ctx, "Выбран чат: "
-                                            + items[which], Toast.LENGTH_LONG).show();
-                            refreshMaxSummaries();
+                    .setItems(items, (dialog, which) ->
+                            confirmMaxChat(ctx, candidates.get(which)))
+                    .setNegativeButton("Отмена", null)
+                    .show();
+        }
+
+        /** Подтверждение адресата с фактическим именем выбранного кандидата. */
+        private void confirmMaxChat(android.content.Context ctx,
+                                    com.example.xdrip2vk.max.MaxSender.Candidate candidate) {
+            new androidx.appcompat.app.AlertDialog.Builder(ctx)
+                    .setTitle("Подтвердите чат")
+                    .setMessage("Отправлять показания сахара в чат «"
+                            + candidate.chatName() + "» (" + candidate.kind() + ")?")
+                    .setPositiveButton("Выбрать", (d, w) -> {
+                        if (com.example.xdrip2vk.max.MaxSender.selectCandidate(ctx, candidate)) {
+                            Toast.makeText(ctx, "Выбран чат: «"
+                                    + candidate.chatName() + "»", Toast.LENGTH_LONG).show();
+                        } else {
+                            Toast.makeText(ctx,
+                                    "Кандидат больше не действителен — дождитесь нового уведомления из чата MAX",
+                                    Toast.LENGTH_LONG).show();
                         }
+                        refreshMaxSummaries();
                     })
                     .setNegativeButton("Отмена", null)
                     .show();

@@ -62,6 +62,13 @@ public class MaxServiceIntegrationTest {
                 .putBoolean(MaxChannel.PREF_MAX_ENABLED, true)
                 .commit();
         VkSenderService.resetTransmissionFlagsForTest();
+        MaxSender.resetRuntimeForTest(context);
+
+        // Доступ слушателя уведомлений выдан — R4 требует его для отправки.
+        android.provider.Settings.Secure.putString(context.getContentResolver(),
+                "enabled_notification_listeners",
+                new android.content.ComponentName(context,
+                        MaxNotificationListener.class).flattenToString());
 
         listener = Robolectric.buildService(MaxNotificationListener.class).create().get();
         vkTexts = new ArrayList<>();
@@ -126,7 +133,7 @@ public class MaxServiceIntegrationTest {
         listener.onNotificationPosted(new StatusBarNotification(
                 MaxChannel.MAX_PACKAGE, MaxChannel.MAX_PACKAGE, 378, null, 0, 0, 0,
                 n, Process.myUserHandle(), clock.get()));
-        assertTrue(MaxSender.selectCandidate(context, 0));
+        assertTrue(MaxSender.selectCandidate(context, MaxSender.candidates().get(0)));
     }
 
     private String fillInText(Intent fillIn) {
