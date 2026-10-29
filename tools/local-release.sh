@@ -94,6 +94,7 @@ UNSIGNED="app/build/outputs/apk/release/caxarok_${VER_NAME}.apk"
 
 # --- 5. Подпись и проверки APK ----------------------------------------------
 
+mkdir -p "$RELEASE_ROOT"
 STAGE="$(mktemp -d "$RELEASE_ROOT/.stage.XXXXXX")"
 trap 'rm -rf "$STAGE"' EXIT
 
