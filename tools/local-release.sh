@@ -49,11 +49,15 @@ fail() { echo "ОШИБКА: $*" >&2; exit 1; }
 export ANDROID_HOME="${ANDROID_HOME:-$HOME/Library/Android/sdk}"
 [ -d "$ANDROID_HOME" ] || fail "не найден Android SDK: $ANDROID_HOME"
 
-STAGE=""; CHECK=""; LOCK=""
+STAGE=""; CHECK=""; LOCK=""; LOCK_OWNED=false
 cleanup() {
     [ -n "$STAGE" ] && rm -rf "$STAGE"
     [ -n "$CHECK" ] && rm -rf "$CHECK"
-    [ -n "$LOCK" ] && rmdir "$LOCK" 2>/dev/null || true
+    # Замок удаляет только владелец: rmdir лишь при LOCK_OWNED=true.
+    # Чужой существующий замок (mkdir отказал) не трогаем.
+    if [ "$LOCK_OWNED" = true ] && [ -n "$LOCK" ]; then
+        rmdir "$LOCK" 2>/dev/null || true
+    fi
 }
 trap cleanup EXIT
 
@@ -103,13 +107,15 @@ LOCK_DIR="$RELEASE_ROOT/.locks"
 mkdir -p "$LOCK_DIR"
 LOCK="$LOCK_DIR/$VER_NAME.lock"
 if ! mkdir "$LOCK" 2>/dev/null; then
+    # Замок чужой — владение не присвоено, удалять его нельзя.
     fail "выпуск версии $VER_NAME уже идёт в другом процессе (замок $LOCK).
-     Если прежний запуск упал — удалите замок вручную и повторите."
+     Перед ручным удалением замка убедитесь, что прежний процесс действительно завершился."
 fi
+LOCK_OWNED=true
 
 # Пока ждали замок, версию мог опубликовать другой процесс.
 if [ -d "$VERSION_DIR" ]; then
-    rmdir "$LOCK"; LOCK=""
+    rmdir "$LOCK"; LOCK_OWNED=false; LOCK=""
     if verify_version_dir "$VERSION_DIR"; then
         echo "== Версию только что опубликовал другой процесс — комплект цел, ничего не меняю"
         exit 0
@@ -282,7 +288,9 @@ if [ -e "$VERSION_DIR" ]; then
 fi
 
 mv "$STAGE/pkg" "$VERSION_DIR"
-STAGE=""
-rmdir "$LOCK"; LOCK=""
+# staging с временными выводами инструментов удаляется целиком —
+# готовый VERSION_DIR не затрагивается.
+rm -rf "$STAGE"; STAGE=""
+rmdir "$LOCK"; LOCK_OWNED=false; LOCK=""
 echo "== Готово: $VERSION_DIR"
 echo "   ZIP: $VERSION_DIR/caxarok_${VER_NAME}_release.zip"
