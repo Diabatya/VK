@@ -168,7 +168,7 @@ PREV_TAG="$(git tag --sort=-creatordate | sed -n '1p' || true)"
 (cd "$STAGE/pkg" && shasum -a 256 caxarok_${VER_NAME}.apk source-${VER_NAME}.tar.gz \
     LICENSE THIRD_PARTY_NOTICES.md RELEASE_NOTES.md BUILD_INFO.md > SHA256SUMS)
 
-(cd "$STAGE/pkg" && zip -q -X "../caxarok_${VER_NAME}_release.zip" .)
+(cd "$STAGE/pkg" && zip -q -r -X "../caxarok_${VER_NAME}_release.zip" . -x '.DS_Store')
 mv "$STAGE/caxarok_${VER_NAME}_release.zip" "$STAGE/pkg/"
 
 # --- 7. Проверка результата и атомарный перенос ------------------------------
