@@ -38,6 +38,10 @@ export VK_KEY_PASS="${VK_KEY_PASS:-$VK_KEYSTORE_PASS}"
 
 fail() { echo "ОШИБКА: $*" >&2; exit 1; }
 
+# Android SDK: по умолчанию стандартное расположение на Mac.
+export ANDROID_HOME="${ANDROID_HOME:-$HOME/Library/Android/sdk}"
+[ -d "$ANDROID_HOME" ] || fail "не найден Android SDK: $ANDROID_HOME"
+
 # --- 1. Версия и ревизия ---------------------------------------------------
 
 GRADLE_FILE=app/build.gradle
