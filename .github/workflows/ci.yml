@@ -1,10 +1,9 @@
 name: Android CI
 
+# Автозапуск отключён: релизы собираются локально (tools/local-release.sh).
+# Ручной запуск оставлен: Actions → Android CI → Run workflow.
 on:
-  push:
-    branches: [main]
-  pull_request:
-    branches: [main]
+  workflow_dispatch:
 
 jobs:
   build-test:
