@@ -110,9 +110,9 @@ fi
     --ks-pass env:VK_KEYSTORE_PASS --key-pass env:VK_KEY_PASS "$APK"
 
 "$APKSIGNER" verify -v "$APK" | grep -q '^Verifies' || fail "apksigner verify не прошёл"
-CERT_SHA="$("$APKSIGNER" verify --print-certs "$APK" | grep -oE 'SHA-256 digest: [0-9a-f]+' | head -1 | awk '{print $3}')"
+CERT_SHA="$("$APKSIGNER" verify --print-certs "$APK" | grep -oE 'SHA-256 digest: [0-9a-f]+' | sed -n '1p' | awk '{print $3}')"
 
-PKG="$("$AAPT2" dump badging "$APK" | head -1)"
+PKG="$("$AAPT2" dump badging "$APK" | sed -n '1p')"
 echo "$PKG" | grep -q "name='$APP_ID'" || fail "applicationId в APK не совпадает: $PKG"
 echo "$PKG" | grep -q "versionCode='$VER_CODE'" || fail "versionCode в APK != $VER_CODE"
 "$AAPT2" dump xmltree --file AndroidManifest.xml "$APK" 2>/dev/null | grep -q debuggable \
@@ -130,7 +130,7 @@ git archive --format=tar.gz --prefix="VK-${VER_NAME}/" \
     -o "$STAGE/pkg/source-${VER_NAME}.tar.gz" "$SOURCE_SHA"
 
 # описание изменений — автоматически из истории с последнего тега
-PREV_TAG="$(git tag --sort=-creatordate | head -1 || true)"
+PREV_TAG="$(git tag --sort=-creatordate | sed -n '1p' || true)"
 {
     echo "## xDrip to VK ${VER_NAME}"
     echo
@@ -155,8 +155,8 @@ PREV_TAG="$(git tag --sort=-creatordate | head -1 || true)"
     echo "| versionName / versionCode | $VER_NAME / $VER_CODE |"
     echo "| SHA исходников | \`$SOURCE_SHA\` (дерево было чистым на момент сборки) |"
     echo "| Вариант | release (assembleRelease, без debuggable) |"
-    echo "| JDK | $(java -version 2>&1 | head -1) |"
-    echo "| Gradle | $(./gradlew --version 2>/dev/null | awk '/Gradle /{print $2; exit}') |"
+    echo "| JDK | $(java -version 2>&1 | sed -n '1p') |"
+    echo "| Gradle | $(./gradlew --version 2>/dev/null | awk '/Gradle /{print $2}' | sed -n '1p') |"
     echo "| build-tools | $(basename "$BT_DIR") |"
     echo "| Подпись | apksigner v2+v3, сертификат SHA-256 \`$CERT_SHA\` |"
     echo "| APK | \`caxarok_${VER_NAME}.apk\` |"
